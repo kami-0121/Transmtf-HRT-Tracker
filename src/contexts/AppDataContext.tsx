@@ -9,7 +9,7 @@ import {
 import { pkWorker, PKWorkerCancelledError } from '../workers/pkWorkerClient';
 import { computeDataHash } from '../utils/dataHash';
 import { GEL_PRODUCTS_KEY, readCustomGelProducts, writeCustomGelProducts } from '../utils/doseForm';
-import { BLOOD_REPORTS_KEY, readBloodReports, sanitizeBloodReports, type BloodReport } from '../utils/bloodTests';
+import { BLOOD_REPORTS_KEY, readBloodReports, sanitizeBloodReports, toCanonical, type BloodReport } from '../utils/bloodTests';
 import { REGIMENS_KEY, readRegimens, sanitizeRegimens, type Regimen } from '../utils/regimens';
 import { backfillEventWeights, eventsNeedWeightMigration, latestEventWeight, DEFAULT_WEIGHT_KG } from '../utils/weight';
 
@@ -229,12 +229,28 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         const v = Number(localStorage.getItem(BASELINE_TESTOSTERONE_KEY));
         return Number.isFinite(v) && v > 0 ? v : null;
     });
+    // Measured total testosterone from blood reports (ng/dL) calibrates the T
+    // model; keyed by content so unrelated report edits don't recompute.
+    const tObservationsKey = useMemo(() => JSON.stringify(
+        bloodReports
+            .map(r => {
+                const v = r.values.testosterone;
+                const ngdL = v ? toCanonical('testosterone', v) : null;
+                return ngdL !== null && ngdL > 0 ? { timeH: r.timeH, ngdL } : null;
+            })
+            .filter((o): o is { timeH: number; ngdL: number } => o !== null)
+            .sort((a, b) => a.timeH - b.timeH)
+    ), [bloodReports]);
     // Stable options object so the compute effects only re-run on real changes.
     const testosteroneOpts = useMemo<TestosteroneModelOptions | null>(
         () => testosteroneModelEnabled
-            ? { baselineNgdL: baselineTestosteroneNgdL ?? TESTOSTERONE_MODEL.baselineNgdL }
+            ? {
+                // Only a fallback: pre-treatment T labs take precedence (pk.ts).
+                baselineNgdL: baselineTestosteroneNgdL ?? undefined,
+                observations: JSON.parse(tObservationsKey),
+            }
             : null,
-        [testosteroneModelEnabled, baselineTestosteroneNgdL]
+        [testosteroneModelEnabled, baselineTestosteroneNgdL, tObservationsKey]
     );
 
     const suppressLocalUpdateRef = useRef({

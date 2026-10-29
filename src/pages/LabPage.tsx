@@ -17,6 +17,7 @@ const LabPage: React.FC = () => {
         setTestosteroneModelEnabled,
         baselineTestosteroneNgdL,
         setBaselineTestosteroneNgdL,
+        simulation,
         calibrationModel,
         setCalibrationModel,
         calibrationMode,
@@ -36,6 +37,7 @@ const LabPage: React.FC = () => {
             onSetTestosteroneModelEnabled={setTestosteroneModelEnabled}
             baselineTestosteroneNgdL={baselineTestosteroneNgdL}
             onSetBaselineTestosteroneNgdL={setBaselineTestosteroneNgdL}
+            testosteroneSeries={simulation?.testosterone}
             calibrationModel={calibrationModel}
             onSetCalibrationModel={setCalibrationModel}
             calibrationMode={calibrationMode}

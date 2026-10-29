@@ -15,6 +15,7 @@ import {
     interpolateTestosterone,
     interpolateCompoundConcentration,
     interpolateConcentration_E2,
+    testosteroneLogCorrection,
 } from './pk';
 import { replayPersonalModel, computeSimulationWithCI } from './personalModel';
 import { fitMipd } from './mipd';
@@ -199,5 +200,57 @@ describe('testosterone model in calibration', () => {
         expect(fit.baselinePGmL).toBe(0); // no pre-dose lab → resolved via context default
         expect(resolveEndogenousE2(fit.baselinePGmL, labH, endo))
             .toBeCloseTo(TESTOSTERONE_MODEL.defaultBaselineE2PGmL * endo!.fractionAt(labH), 9);
+    });
+});
+
+describe('testosterone calibration to measured T', () => {
+    const evDosing: DoseEvent[] = [];
+    for (let w = 0; w < 12; w++) evDosing.push(evInjection(w * 7 * DAY, 5));
+
+    it('GP correction: passes near a measurement and relaxes far away', () => {
+        const corr = testosteroneLogCorrection([0], [Math.log(0.5)], [0, 10 * DAY, 400 * DAY]);
+        expect(Math.exp(corr[0])).toBeLessThan(0.6);
+        expect(Math.exp(corr[0])).toBeGreaterThan(0.45);
+        expect(Math.abs(corr[1])).toBeLessThan(Math.abs(corr[0]));
+        expect(Math.abs(corr[2])).toBeLessThan(0.01);
+        expect(testosteroneLogCorrection([], [], [1, 2])).toEqual([0, 0]);
+    });
+
+    it('pre-treatment T labs set T0; the setting is only a fallback', () => {
+        const fromLab = runSimulation(evDosing, { testosterone: { baselineNgdL: 700, observations: [{ timeH: -10 * DAY, ngdL: 400 }, { timeH: -5 * DAY, ngdL: 400 }] } })!;
+        expect(fromLab.testosterone!.baselineSource).toBe('lab');
+        expect(fromLab.testosterone!.baselineNgdL).toBeCloseTo(400, 6);
+        const fromSetting = runSimulation(evDosing, { testosterone: { baselineNgdL: 700 } })!;
+        expect(fromSetting.testosterone!.baselineSource).toBe('setting');
+        expect(runSimulation(evDosing, { testosterone: {} })!.testosterone!.baselineSource).toBe('population');
+    });
+
+    it('a measured T above the model raises the curve and the endogenous E2 fraction there', () => {
+        const labH = 50 * DAY;
+        const plain = runSimulation(evDosing, { testosterone: {} })!;
+        const modelT = interpolateTestosterone(plain, labH)!;
+        const measured = modelT * 4; // poorly suppressed
+        const cal = runSimulation(evDosing, { testosterone: { observations: [{ timeH: labH, ngdL: measured }] } })!;
+        const calT = interpolateTestosterone(cal, labH)!;
+        expect(calT).toBeGreaterThan(modelT * 3);
+        expect(calT).toBeLessThan(measured * 1.05);
+        expect(cal.testosterone!.observationCount).toBe(1);
+        expect(endogenousFractionAt(cal, labH)).toBeGreaterThan(endogenousFractionAt(plain, labH) * 3);
+        // The uncalibrated curve is kept for display.
+        expect(cal.testosterone!.populationValues).toEqual(plain.testosterone!.values);
+        // Drug E2 is unchanged; only the endogenous part moves.
+        expect(cal.concPGmL_E2).toEqual(plain.concPGmL_E2);
+    });
+
+    it('flows into the personal E2 curve via the endogenous baseline', () => {
+        const labH = 50 * DAY;
+        const plain = runSimulation(evDosing, { testosterone: {} })!;
+        const cal = runSimulation(evDosing, { testosterone: { observations: [{ timeH: labH, ngdL: interpolateTestosterone(plain, labH)! * 4 }] } })!;
+        const state = replayPersonalModel(evDosing, []);
+        const i = cal.timeH.findIndex(t => t >= labH);
+        const a = computeSimulationWithCI(plain, evDosing, state, false, [], 'ekf');
+        const b = computeSimulationWithCI(cal, evDosing, state, false, [], 'ekf');
+        const expected = TESTOSTERONE_MODEL.defaultBaselineE2PGmL * (cal.testosterone!.endogenousFraction[i] - plain.testosterone!.endogenousFraction[i]);
+        expect(b.e2Adjusted[i] - a.e2Adjusted[i]).toBeCloseTo(expected, 6);
     });
 });

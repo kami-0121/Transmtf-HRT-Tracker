@@ -540,10 +540,95 @@ export const TESTOSTERONE_MODEL = {
     minFraction: 0.02,
 };
 
+/** A measured total testosterone value (from a blood report), in ng/dL. */
+export interface TestosteroneObservation {
+    timeH: number;
+    ngdL: number;
+}
+
 /** Options enabling the testosterone model in {@link runSimulation}. */
 export interface TestosteroneModelOptions {
     /** Pre-treatment total testosterone in ng/dL (defaults to the population value). */
     baselineNgdL?: number;
+    /**
+     * Measured total testosterone. Values drawn before the first dose set the
+     * personal T0; every value corrects the curve (see calibrateTestosterone).
+     */
+    observations?: TestosteroneObservation[];
+    /** Time of the first dose (h); observations before it count as pre-treatment. */
+    firstDoseH?: number;
+}
+
+/**
+ * Calibration of the T curve to measured testosterone ("t-gp-v1").
+ *
+ * The model's T response varies a lot between people, so measured values
+ * correct it with a Gaussian-process posterior on the log ratio
+ * r(t) = log(T_measured / T_model): an exponential (OU) kernel with prior SD
+ * `priorSdLog` and correlation length `lengthScaleH`, plus observation noise
+ * `noiseSdLog` (assay + diurnal variation). Near a measurement the curve passes
+ * close to it; far from any measurement the correction relaxes back to the
+ * population model. The corrected T then drives the endogenous E2 fraction,
+ * so measured T directly corrects the estradiol estimate.
+ */
+export const T_CALIBRATION = {
+    priorSdLog: 0.8,
+    lengthScaleH: 45 * 24,
+    noiseSdLog: 0.2,
+    /** Bounds on the multiplicative correction exp(r). */
+    minRatio: 0.05,
+    maxRatio: 20,
+};
+
+/** Solve A x = b for a small symmetric positive-definite A (Cholesky). */
+function solveSPD(A: number[][], b: number[]): number[] {
+    const n = b.length;
+    const L = A.map(row => row.map(() => 0));
+    for (let i = 0; i < n; i++) {
+        for (let j = 0; j <= i; j++) {
+            let sum = A[i][j];
+            for (let k = 0; k < j; k++) sum -= L[i][k] * L[j][k];
+            L[i][j] = i === j ? Math.sqrt(Math.max(sum, 1e-12)) : sum / L[j][j];
+        }
+    }
+    const y = new Array<number>(n).fill(0);
+    for (let i = 0; i < n; i++) {
+        let sum = b[i];
+        for (let k = 0; k < i; k++) sum -= L[i][k] * y[k];
+        y[i] = sum / L[i][i];
+    }
+    const x = new Array<number>(n).fill(0);
+    for (let i = n - 1; i >= 0; i--) {
+        let sum = y[i];
+        for (let k = i + 1; k < n; k++) sum -= L[k][i] * x[k];
+        x[i] = sum / L[i][i];
+    }
+    return x;
+}
+
+/**
+ * Posterior-mean log correction at `times`, given log residuals observed at
+ * `obsTimes`. Exported for tests.
+ */
+export function testosteroneLogCorrection(
+    obsTimes: number[],
+    residuals: number[],
+    times: number[],
+    params = T_CALIBRATION
+): number[] {
+    const n = obsTimes.length;
+    if (n === 0) return times.map(() => 0);
+    const s2 = params.priorSdLog * params.priorSdLog;
+    const k = (a: number, b: number) => s2 * Math.exp(-Math.abs(a - b) / params.lengthScaleH);
+    const K = obsTimes.map((ti, i) => obsTimes.map((tj, j) => k(ti, tj) + (i === j ? params.noiseSdLog * params.noiseSdLog : 0)));
+    const alpha = solveSPD(K, residuals);
+    const lo = Math.log(params.minRatio);
+    const hi = Math.log(params.maxRatio);
+    return times.map(t => {
+        let m = 0;
+        for (let i = 0; i < n; i++) m += k(t, obsTimes[i]) * alpha[i];
+        return Math.min(hi, Math.max(lo, m));
+    });
 }
 
 const hillEffect = (c: number, emax: number, c50: number, n: number): number => {
@@ -580,9 +665,21 @@ export function computeTestosteroneSeries(
     byCompound: SimulationResult['byCompound'],
     opts: TestosteroneModelOptions = {}
 ): TestosteroneSeries {
-    const baselineNgdL = (typeof opts.baselineNgdL === 'number' && Number.isFinite(opts.baselineNgdL) && opts.baselineNgdL > 0)
-        ? opts.baselineNgdL
-        : TESTOSTERONE_MODEL.baselineNgdL;
+    const observations = (opts.observations ?? []).filter(
+        o => Number.isFinite(o.timeH) && Number.isFinite(o.ngdL) && o.ngdL > 0
+    );
+    // T0: pre-treatment T labs (geometric mean) > user setting > population.
+    const firstDoseH = opts.firstDoseH ?? Infinity;
+    const pre = observations.filter(o => o.timeH < firstDoseH);
+    let baselineNgdL = TESTOSTERONE_MODEL.baselineNgdL;
+    let baselineSource: TestosteroneSeries['baselineSource'] = 'population';
+    if (pre.length > 0) {
+        baselineNgdL = Math.exp(pre.reduce((s, o) => s + Math.log(o.ngdL), 0) / pre.length);
+        baselineSource = 'lab';
+    } else if (typeof opts.baselineNgdL === 'number' && Number.isFinite(opts.baselineNgdL) && opts.baselineNgdL > 0) {
+        baselineNgdL = opts.baselineNgdL;
+        baselineSource = 'setting';
+    }
     const n = timeH.length;
     const values = new Array<number>(n);
     const endogenousFraction = new Array<number>(n);
@@ -600,7 +697,20 @@ export function computeTestosteroneSeries(
         endogenousFraction[i] = frac;
         values[i] = frac * baselineNgdL;
     }
-    return { unit: 'ng/dL', baselineNgdL, values, endogenousFraction };
+    const populationValues = values.slice();
+    if (observations.length > 0 && n > 0) {
+        const sorted = [...observations].sort((a, b) => a.timeH - b.timeH);
+        const residuals = sorted.map(o => Math.log(o.ngdL / Math.max(interpolateSeries(timeH, populationValues, o.timeH) ?? baselineNgdL, 1e-6)));
+        const corr = testosteroneLogCorrection(sorted.map(o => o.timeH), residuals, timeH);
+        for (let i = 0; i < n; i++) {
+            values[i] = populationValues[i] * Math.exp(corr[i]);
+            endogenousFraction[i] = values[i] / baselineNgdL;
+        }
+    }
+    return {
+        unit: 'ng/dL', baselineNgdL, baselineSource, values, populationValues, endogenousFraction,
+        observationCount: observations.length,
+    };
 }
 
 /**
@@ -1406,7 +1516,11 @@ export function runSimulation(
 
     const result: SimulationResult = { timeH, concPGmL, concPGmL_E2, concPGmL_CPA, byCompound, auc };
     if (opts?.testosterone) {
-        result.testosterone = computeTestosteroneSeries(timeH, concPGmL_E2, byCompound, opts.testosterone);
+        const firstDose = sortedEvents.find(e => e.route !== Route.patchRemove);
+        result.testosterone = computeTestosteroneSeries(timeH, concPGmL_E2, byCompound, {
+            ...opts.testosterone,
+            firstDoseH: opts.testosterone.firstDoseH ?? firstDose?.timeH,
+        });
     }
     return result;
 }

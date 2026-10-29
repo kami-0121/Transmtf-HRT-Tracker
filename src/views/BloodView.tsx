@@ -5,6 +5,7 @@ import {
 } from 'recharts';
 import { useTranslation } from '../contexts/LanguageContext';
 import { useTheme } from '../contexts/ThemeContext';
+import { useAppData } from '../contexts/AppDataContext';
 import { formatDate, formatTime } from '../utils/helpers';
 import {
     ANALYTES, ANALYTE_CATEGORY_ORDER, analyteSeries, getAnalyte, rangeFlag, toCanonical,
@@ -41,16 +42,46 @@ const BloodView: React.FC<BloodViewProps> = ({ rows, onAdd, onEdit }) => {
         [rows, selected]
     );
 
+    // For testosterone, overlay the (calibrated) model curve and the
+    // uncalibrated population curve so the effect of the labs is visible.
+    const { simulation } = useAppData();
+    const tSeries = selected === 'testosterone' ? simulation?.testosterone : undefined;
+    const xDomain = useMemo<[number, number] | null>(() => {
+        if (series.length === 0) return null;
+        const day = 86400000;
+        const lo = series[0].time;
+        const hi = tSeries ? Math.max(series[series.length - 1].time, Date.now()) : series[series.length - 1].time;
+        const pad = Math.max(day * 2, (hi - lo) * 0.04);
+        return [lo - pad, hi + pad];
+    }, [series, tSeries]);
+    const modelData = useMemo(() => {
+        if (!tSeries || !simulation || !xDomain) return [];
+        const out: { time: number; model: number; pop: number }[] = [];
+        const step = Math.max(1, Math.floor(simulation.timeH.length / 400));
+        for (let i = 0; i < simulation.timeH.length; i += step) {
+            const time = simulation.timeH[i] * 3600000;
+            if (time < xDomain[0] || time > xDomain[1]) continue;
+            out.push({ time, model: tSeries.values[i], pop: tSeries.populationValues[i] });
+        }
+        // Before the simulation grid starts (pre-treatment) T sits at its baseline.
+        const gridStart = simulation.timeH[0] * 3600000;
+        if (out.length > 0 && xDomain[0] < gridStart) {
+            out.unshift({ time: xDomain[0], model: tSeries.values[0], pop: tSeries.populationValues[0] });
+        }
+        return out;
+    }, [tSeries, simulation, xDomain]);
+
     const yDomain = useMemo<[number, number]>(() => {
         if (!spec || series.length === 0) return [0, 1];
         const vals = series.map(p => p.value);
+        for (const m of modelData) vals.push(m.model, m.pop);
         if (spec.refLow !== undefined) vals.push(spec.refLow);
         if (spec.refHigh !== undefined) vals.push(spec.refHigh);
         const max = Math.max(...vals);
         const min = Math.min(...vals);
         const pad = (max - min) * 0.15 || max * 0.2 || 1;
         return [Math.max(0, min - pad), max + pad];
-    }, [spec, series]);
+    }, [spec, series, modelData]);
 
     const grouped = useMemo(() => {
         const groups: { date: string; items: BloodRow[] }[] = [];
@@ -108,11 +139,12 @@ const BloodView: React.FC<BloodViewProps> = ({ rows, onAdd, onEdit }) => {
                     </div>
                     <div className="h-56 w-full">
                         <ResponsiveContainer width="100%" height="100%">
-                            <LineChart data={series} margin={{ top: 8, right: 12, bottom: 0, left: -8 }}>
+                            <LineChart margin={{ top: 8, right: 12, bottom: 0, left: -8 }}>
                                 <CartesianGrid stroke={gridColor} strokeDasharray="3 3" />
                                 <XAxis
                                     dataKey="time" type="number" scale="time"
-                                    domain={series.length > 1 ? ['dataMin', 'dataMax'] : ['dataMin - 86400000', 'dataMax + 86400000']}
+                                    domain={xDomain ?? ['dataMin', 'dataMax']}
+                                    allowDataOverflow
                                     tickFormatter={(ms) => formatDate(new Date(ms), lang)}
                                     tick={{ fontSize: 10, fill: axisColor }} minTickGap={24}
                                 />
@@ -124,14 +156,28 @@ const BloodView: React.FC<BloodViewProps> = ({ rows, onAdd, onEdit }) => {
                                 {spec.refHigh !== undefined && <ReferenceLine y={spec.refHigh} stroke="#10b981" strokeDasharray="4 3" />}
                                 <Tooltip
                                     labelFormatter={(ms) => `${formatDate(new Date(ms as number), lang)} ${formatTime(new Date(ms as number))}`}
-                                    formatter={(v: number) => [`${fmtNum(v)} ${spec.units[0].unit}`, spec.short]}
+                                    formatter={(v: number, name: string) => [
+                                        `${fmtNum(v)} ${spec.units[0].unit}`,
+                                        name === 'model' ? t('blood.t_model') : name === 'pop' ? t('blood.t_population') : spec.short,
+                                    ]}
                                     contentStyle={{ borderRadius: 12, fontSize: 12, background: 'var(--bg-card)', border: '1px solid var(--border-primary)', color: 'var(--text-primary)' }}
                                 />
-                                <Line type="monotone" dataKey="value" stroke={spec.color} strokeWidth={2.5}
+                                {modelData.length > 0 && (
+                                    <Line data={modelData} type="monotone" dataKey="pop" stroke={axisColor} strokeWidth={1.2}
+                                        strokeDasharray="4 4" dot={false} activeDot={false} isAnimationActive={false} />
+                                )}
+                                {modelData.length > 0 && (
+                                    <Line data={modelData} type="monotone" dataKey="model" stroke={spec.color} strokeOpacity={0.45} strokeWidth={2}
+                                        dot={false} activeDot={false} isAnimationActive={false} />
+                                )}
+                                <Line data={series} type="linear" dataKey="value" stroke={spec.color} strokeWidth={modelData.length > 0 ? 0 : 2.5}
                                     dot={{ r: 4, fill: spec.color, stroke: '#fff', strokeWidth: 1.5 }} activeDot={{ r: 6 }} isAnimationActive={false} />
                             </LineChart>
                         </ResponsiveContainer>
                     </div>
+                    {modelData.length > 0 && (
+                        <p className="text-[10px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>{t('blood.t_overlay_note')}</p>
+                    )}
                     <p className="text-[10px] leading-relaxed" style={{ color: 'var(--text-tertiary)' }}>{t('blood.ref_disclaimer')}</p>
                 </div>
             )}

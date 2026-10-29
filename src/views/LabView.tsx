@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { FlaskConical, Brain, AlertTriangle, ChevronDown, ChevronUp, ChevronLeft, CheckCircle2, Cpu, Waves, Clock, History, Sparkles, Info } from 'lucide-react';
 import { useTranslation } from '../contexts/LanguageContext';
 import { formatDate, formatTime } from '../utils/helpers';
-import { LabResult, PersonalModelState, EKFDiagnostics, CalibrationModel, CalibrationMode, TESTOSTERONE_MODEL } from '../../logic';
+import { LabResult, PersonalModelState, EKFDiagnostics, CalibrationModel, CalibrationMode, TESTOSTERONE_MODEL, type TestosteroneSeries } from '../../logic';
 
 interface LabViewProps {
   labResults: LabResult[];
@@ -15,6 +15,8 @@ interface LabViewProps {
   onSetTestosteroneModelEnabled: (v: boolean) => void;
   baselineTestosteroneNgdL: number | null;
   onSetBaselineTestosteroneNgdL: (v: number | null) => void;
+  /** Current simulated testosterone series (calibration status display). */
+  testosteroneSeries?: TestosteroneSeries;
   onSetApplyCPAInhibitionToE2: (enabled: boolean) => void;
   calibrationModel: CalibrationModel;
   onSetCalibrationModel: (model: CalibrationModel) => void;
@@ -295,6 +297,7 @@ const LabView: React.FC<LabViewProps> = ({
   onSetTestosteroneModelEnabled,
   baselineTestosteroneNgdL,
   onSetBaselineTestosteroneNgdL,
+  testosteroneSeries,
   calibrationModel,
   onSetCalibrationModel,
   calibrationMode,
@@ -516,6 +519,20 @@ const LabView: React.FC<LabViewProps> = ({
               <span className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>ng/dL</span>
             </span>
           </label>
+        )}
+        {testosteroneModelEnabled && testosteroneSeries && (
+          <div className="mt-3 rounded-xl px-3 py-2 text-[11px] leading-relaxed space-y-0.5"
+            style={{ background: 'var(--bg-card-hover)', color: 'var(--text-secondary)' }}>
+            <p>
+              {t('lab.testosterone_t0')}: <span className="font-bold" style={{ color: 'var(--text-primary)' }}>{testosteroneSeries.baselineNgdL.toFixed(0)} ng/dL</span>
+              {' '}（{t(`lab.testosterone_t0_${testosteroneSeries.baselineSource}`)}）
+            </p>
+            <p>
+              {testosteroneSeries.observationCount > 0
+                ? t('lab.testosterone_calibrated').replace('{n}', String(testosteroneSeries.observationCount))
+                : t('lab.testosterone_uncalibrated')}
+            </p>
+          </div>
         )}
         <p className="mt-2 text-[10px] font-semibold" style={{ color: 'var(--text-tertiary)' }}>
           {testosteroneModelEnabled ? t('lab.testosterone_model_on') : t('lab.testosterone_model_off')}

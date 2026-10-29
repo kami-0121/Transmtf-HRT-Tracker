@@ -572,6 +572,11 @@ const OverviewView: React.FC<OverviewViewProps> = ({
                     <span className="text-[10px] font-semibold whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>
                       {testosteroneNow.toFixed(0)} ng/dL
                     </span>
+                    {(simulation?.testosterone?.observationCount ?? 0) > 0 && (
+                      <span className="text-[9px] font-semibold whitespace-nowrap" style={{ color: 'var(--accent-400)' }}>
+                        {t('overview.testosterone_calibrated').replace('{n}', String(simulation!.testosterone!.observationCount))}
+                      </span>
+                    )}
                   </div>
                 )}
                 {currentStatus && (

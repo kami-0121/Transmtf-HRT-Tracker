@@ -166,8 +166,16 @@ export interface TestosteroneSeries {
     unit: 'ng/dL';
     /** Pre-treatment (baseline) total testosterone used for scaling, ng/dL. */
     baselineNgdL: number;
+    /** Where T0 came from: pre-treatment T lab(s), the user's setting, or the population default. */
+    baselineSource: 'lab' | 'setting' | 'population';
+    /** Model T curve after calibration to measured T (== populationValues when uncalibrated). */
     values: number[];
+    /** Uncalibrated model T curve (population response, scaled by T0). */
+    populationValues: number[];
+    /** values / T0 — scales the pre-treatment endogenous E2 baseline. */
     endogenousFraction: number[];
+    /** Number of measured T values that informed the calibration. */
+    observationCount: number;
 }
 
 /**
