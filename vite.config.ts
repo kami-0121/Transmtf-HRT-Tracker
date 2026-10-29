@@ -22,8 +22,8 @@ export default defineConfig(({ mode }) => {
           registerType: 'autoUpdate',
           includeAssets: ['favicon.ico', 'icon.svg'],
           manifest: {
-            name: 'AtDo HRT',
-            short_name: 'AtDo HRT',
+            name: 'AtDoHRT',
+            short_name: 'AtDoHRT',
             description: 'Track your HRT dosage and simulate E2 levels',
             theme_color: '#ffffff',
             background_color: '#ffffff',
