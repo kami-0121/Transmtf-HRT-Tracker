@@ -106,7 +106,7 @@ const AccountDevices: React.FC = () => {
       <div className="sticky top-0 z-10 border-b" style={{ background: 'var(--bg-card)', borderColor: 'var(--border-primary)' }}>
         <div className="max-w-2xl mx-auto px-4 py-4">
           <div className="flex items-center gap-4">
-            <Link to="/profile" style={{ color: 'var(--text-secondary)' }}>
+            <Link to="/settings" style={{ color: 'var(--text-secondary)' }}>
               <ArrowLeft size={24} />
             </Link>
             <h1 className="text-2xl font-bold flex items-center gap-2" style={{ color: 'var(--text-primary)' }}>

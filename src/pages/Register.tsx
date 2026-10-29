@@ -29,7 +29,7 @@ const Register: React.FC = () => {
   useEffect(() => {
     if (isAuthenticated && !hasNavigatedRef.current) {
       hasNavigatedRef.current = true;
-      navigate('/profile', { replace: true });
+      navigate('/settings', { replace: true });
     }
   }, [isAuthenticated, navigate]);
 

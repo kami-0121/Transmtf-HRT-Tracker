@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { useLocation, useNavigate, Outlet } from 'react-router-dom';
-import { Settings, Plus, Activity, Calendar, FlaskConical, User } from 'lucide-react';
+import { Settings, Activity, Calendar, User } from 'lucide-react';
 import { useTranslation } from '../contexts/LanguageContext';
 import { useDialog } from '../contexts/DialogContext';
 import { useAuth } from '../contexts/AuthContext';
@@ -8,13 +8,18 @@ import { API_ORIGIN } from '../api/config';
 import { useAppData, PER_DOSE_WEIGHT_MIGRATION_EVENT } from '../contexts/AppDataContext';
 import { formatDate, formatTime } from '../utils/helpers';
 import { clearAllLocalMedicalData } from '../utils/localDataCleanup';
-import { DoseEvent, LabResult } from '../../logic';
+import { DoseEvent } from '../../logic';
+import { E2_ANALYTE_ID, bloodValueToLabResult, type BloodRow } from '../utils/bloodTests';
+import { regimenToEvent, eventToRegimen, type Regimen } from '../utils/regimens';
+import { regimenDisplayName, formatRegimenDose } from '../utils/regimenDisplay';
+import { prefillWeightKG } from '../utils/weight';
 
 import DoseFormModal from './DoseFormModal';
 import BatchDoseModal from './BatchDoseModal';
-import LabResultModal from './LabResultModal';
+import BloodReportModal, { type BloodReportDraft } from './BloodReportModal';
+import AddDoseMenu from './AddDoseMenu';
 
-type ViewKey = 'home' | 'history' | 'lab' | 'settings' | 'profile';
+type ViewKey = 'home' | 'history' | 'settings';
 
 const MainLayout: React.FC = () => {
     const { t, lang } = useTranslation();
@@ -22,12 +27,14 @@ const MainLayout: React.FC = () => {
     const navigate = useNavigate();
     const location = useLocation();
     const { isAuthenticated, user } = useAuth();
-    const { events, setEvents, labResults, setLabResults, currentTime, isComputing } = useAppData();
+    const { events, setEvents, setLabResults, setBloodReports, regimens, setRegimens, gelProducts, currentTime, isComputing } = useAppData();
 
     const [isFormOpen, setIsFormOpen] = useState(false);
     const [editingEvent, setEditingEvent] = useState<DoseEvent | null>(null);
-    const [isLabModalOpen, setIsLabModalOpen] = useState(false);
-    const [editingLab, setEditingLab] = useState<LabResult | null>(null);
+    const [isBloodModalOpen, setIsBloodModalOpen] = useState(false);
+    const [editingBloodRow, setEditingBloodRow] = useState<BloodRow | null>(null);
+    const [isRegimenFormOpen, setIsRegimenFormOpen] = useState(false);
+    const [editingRegimen, setEditingRegimen] = useState<Regimen | null>(null);
     const [isBatchOpen, setIsBatchOpen] = useState(false);
 
     const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
@@ -38,9 +45,9 @@ const MainLayout: React.FC = () => {
         const { pathname } = location;
         if (pathname === '/') return 'home';
         if (pathname.startsWith('/history')) return 'history';
-        if (pathname.startsWith('/lab')) return 'lab';
-        if (pathname.startsWith('/settings')) return 'settings';
-        if (pathname === '/profile' || pathname === '/account' || pathname.startsWith('/account/')) return 'profile';
+        // Settings now also hosts the account ("我的") and calibration pages.
+        if (pathname.startsWith('/settings') || pathname.startsWith('/lab')) return 'settings';
+        if (pathname === '/profile' || pathname === '/account' || pathname.startsWith('/account/')) return 'settings';
         return null;
     }, [location.pathname]);
 
@@ -48,9 +55,7 @@ const MainLayout: React.FC = () => {
         const routes: Record<ViewKey, string> = {
             home: '/',
             history: '/history',
-            lab: '/lab',
             settings: '/settings',
-            profile: '/profile',
         };
         navigate(routes[view]);
     };
@@ -63,10 +68,10 @@ const MainLayout: React.FC = () => {
     }, [showDialog, t]);
 
     useEffect(() => {
-        const shouldLock = isFormOpen || isLabModalOpen || isBatchOpen;
+        const shouldLock = isFormOpen || isBloodModalOpen || isBatchOpen || isRegimenFormOpen;
         document.body.style.overflow = shouldLock ? 'hidden' : '';
         return () => { document.body.style.overflow = ''; };
-    }, [isFormOpen, isLabModalOpen, isBatchOpen]);
+    }, [isFormOpen, isBloodModalOpen, isBatchOpen, isRegimenFormOpen]);
 
     useEffect(() => {
         const el = mainScrollRef.current;
@@ -132,18 +137,54 @@ const MainLayout: React.FC = () => {
     const navItems = useMemo(() => [
         { id: 'home' as ViewKey, label: t('nav.home'), icon: Activity },
         { id: 'history' as ViewKey, label: t('nav.history'), icon: Calendar },
-        { id: 'lab' as ViewKey, label: t('nav.lab'), icon: FlaskConical },
         { id: 'settings' as ViewKey, label: t('nav.settings'), icon: Settings },
-        { id: 'profile' as ViewKey, label: t('nav.account') || 'Profile', icon: User },
     ], [t]);
 
     const handleAddEvent = () => { setEditingEvent(null); setIsFormOpen(true); };
     const handleEditEvent = (e: DoseEvent) => { setEditingEvent(e); setIsFormOpen(true); };
-    const handleAddLabResult = () => { setEditingLab(null); setIsLabModalOpen(true); };
-    const handleEditLabResult = (r: LabResult) => { setEditingLab(r); setIsLabModalOpen(true); };
-    const handleClearLabResults = () => {
-        if (!labResults.length) return;
-        showDialog('confirm', t('lab.clear_confirm'), () => setLabResults([]));
+    const handleAddBloodReport = () => { setEditingBloodRow(null); setIsBloodModalOpen(true); };
+    const handleEditBloodRow = (row: BloodRow) => { setEditingBloodRow(row); setIsBloodModalOpen(true); };
+    // A report's E2 value is written to labResults under the report id (the
+    // calibration source); every other analyte goes to bloodReports.
+    const handleSaveBloodReport = (draft: BloodReportDraft) => {
+        const { [E2_ANALYTE_ID]: e2, ...rest } = draft.values;
+        const hasReport = Object.keys(rest).length > 0 || !!draft.note;
+        setBloodReports(prev => {
+            const others = prev.filter(r => r.id !== draft.id);
+            return hasReport ? [...others, { id: draft.id, timeH: draft.timeH, values: rest, ...(draft.note ? { note: draft.note } : {}) }] : others;
+        });
+        setLabResults(prev => {
+            const others = prev.filter(r => r.id !== draft.id);
+            return e2 ? [...others, bloodValueToLabResult(draft.id, draft.timeH, e2)] : others;
+        });
+    };
+    const handleDeleteBloodRow = (id: string) => {
+        showDialog('confirm', t('blood.delete_confirm'), () => {
+            setBloodReports(prev => prev.filter(r => r.id !== id));
+            setLabResults(prev => prev.filter(r => r.id !== id));
+        });
+    };
+
+    // ── Medication regimens ──
+    const handleAddRegimenDose = async (r: Regimen) => {
+        const label = `${regimenDisplayName(r, t, gelProducts)}\n${formatRegimenDose(r, t, gelProducts)}`;
+        const choice = await showDialog('confirm', t('regimen.log_confirm').replace('{regimen}', label));
+        if (choice !== 'confirm') return;
+        const nowH = Date.now() / 3600000;
+        setEvents(prev => [...prev, regimenToEvent(r, nowH, prefillWeightKG(prev))]);
+    };
+    const openRegimenForm = (r: Regimen | null) => { setEditingRegimen(r); setIsRegimenFormOpen(true); };
+    const handleSaveRegimen = (e: DoseEvent, name: string) => {
+        const regimen = eventToRegimen(e, editingRegimen?.id ?? e.id, name);
+        setRegimens(prev => {
+            const exists = prev.some(p => p.id === regimen.id);
+            return exists ? prev.map(p => (p.id === regimen.id ? regimen : p)) : [...prev, regimen];
+        });
+    };
+    const handleDeleteRegimen = (id: string) => {
+        showDialog('confirm', t('regimen.delete_confirm'), () => {
+            setRegimens(prev => prev.filter(r => r.id !== id));
+        });
     };
     const handleSaveEvent = (e: DoseEvent) => {
         setEvents(prev => {
@@ -234,15 +275,9 @@ const MainLayout: React.FC = () => {
                             <span className="font-mono">{formatTime(currentTime)}</span>
                         </div>
                     )}
+                    <AddDoseMenu onAddCustom={handleAddEvent} onAddRegimen={handleAddRegimenDose} />
                     <button
-                        onClick={handleAddEvent}
-                        className="flex items-center gap-2 rounded-xl px-3.5 py-2 text-sm font-bold text-white whitespace-nowrap glass-btn-primary btn-press-glass transition"
-                    >
-                        <Plus size={15} />
-                        <span>{t('btn.add')}</span>
-                    </button>
-                    <button
-                        onClick={() => navigate('/profile')}
+                        onClick={() => navigate('/settings')}
                         aria-label={t('nav.account') || 'Profile'}
                         className="h-9 w-9 rounded-full border-2 overflow-hidden transition"
                         style={{ borderColor: 'var(--border-primary)' }}
@@ -276,9 +311,11 @@ const MainLayout: React.FC = () => {
                         onEditEvent: handleEditEvent,
                         onAddEvent: handleAddEvent,
                         onBatchAdd: () => setIsBatchOpen(true),
-                        onAddLabResult: handleAddLabResult,
-                        onEditLabResult: handleEditLabResult,
-                        onClearLabResults: handleClearLabResults,
+                        onAddRegimenDose: handleAddRegimenDose,
+                        onAddBloodReport: handleAddBloodReport,
+                        onEditBloodRow: handleEditBloodRow,
+                        onAddRegimen: () => openRegimenForm(null),
+                        onEditRegimen: (r: Regimen) => openRegimenForm(r),
                     }} />
                     {/* bottom padding so content isn't hidden behind the mobile nav */}
                     <div className="h-24 md:h-4" />
@@ -294,7 +331,7 @@ const MainLayout: React.FC = () => {
                         boxShadow: 'var(--shadow-md)',
                     }}
                 >
-                    <div className="grid grid-cols-5">
+                    <div className="grid grid-cols-3">
                         {navItems.map(({ id, label, icon: Icon }) => {
                             const active = currentView === id;
                             return (
@@ -344,21 +381,21 @@ const MainLayout: React.FC = () => {
                 onSave={handleSaveEvent}
                 onDelete={handleDeleteEvent}
             />
-            <LabResultModal
-                isOpen={isLabModalOpen}
-                onClose={() => setIsLabModalOpen(false)}
-                onSave={(result) => {
-                    setLabResults(prev => {
-                        const exists = prev.find(r => r.id === result.id);
-                        return exists ? prev.map(r => r.id === result.id ? result : r) : [...prev, result];
-                    });
-                }}
-                onDelete={(id) => {
-                    showDialog('confirm', t('lab.delete_confirm'), () => {
-                        setLabResults(prev => prev.filter(r => r.id !== id));
-                    });
-                }}
-                resultToEdit={editingLab}
+            <BloodReportModal
+                isOpen={isBloodModalOpen}
+                onClose={() => setIsBloodModalOpen(false)}
+                onSave={handleSaveBloodReport}
+                onDelete={handleDeleteBloodRow}
+                rowToEdit={editingBloodRow}
+            />
+            <DoseFormModal
+                isOpen={isRegimenFormOpen}
+                onClose={() => setIsRegimenFormOpen(false)}
+                regimenMode
+                regimenToEdit={editingRegimen}
+                onSave={() => { /* regimen mode saves through onSaveRegimen */ }}
+                onSaveRegimen={handleSaveRegimen}
+                onDelete={handleDeleteRegimen}
             />
             <BatchDoseModal
                 isOpen={isBatchOpen}

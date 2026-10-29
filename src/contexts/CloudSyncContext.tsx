@@ -57,7 +57,7 @@ const SYNC_FIELDS = [
   'events', 'weight', 'labResults', 'lang',
   'calibrationModel', 'calibrationMode', 'applyE2LearningToCPA',
   'applyCPAInhibitionToE2', 'themeColor', 'themeMode',
-  'gelProducts',
+  'gelProducts', 'bloodReports', 'regimens',
 ] as const;
 
 function computeFieldDiffs(localData: Record<string, any>, cloudData: Record<string, any>): FieldDiff[] {
@@ -77,7 +77,7 @@ function computeFieldDiffs(localData: Record<string, any>, cloudData: Record<str
 
 // Synced lists we refuse to clear silently: pulling an empty/absent cloud copy
 // over a non-empty local list is treated as a conflict, not an auto-overwrite.
-const PROTECTED_LIST_FIELDS = ['events', 'labResults', 'gelProducts'] as const;
+const PROTECTED_LIST_FIELDS = ['events', 'labResults', 'gelProducts', 'bloodReports', 'regimens'] as const;
 
 function pullWouldClearLocalList(localData: Record<string, any>, cloudData: Record<string, any>): boolean {
   return PROTECTED_LIST_FIELDS.some((f) => {
@@ -141,6 +141,8 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const savedThemeMode = localStorage.getItem('hrt-theme-mode');
     const darkModeRaw = localStorage.getItem('hrt-dark-mode');
     const gelProductsRaw = localStorage.getItem('hrt-gel-products');
+    const bloodReportsRaw = localStorage.getItem('hrt-blood-reports');
+    const regimensRaw = localStorage.getItem('hrt-regimens');
 
     const storedLastModified = localStorage.getItem('hrt-last-modified');
     const storedLastDataUpdated = localStorage.getItem(LAST_DATA_UPDATED_KEY);
@@ -168,6 +170,8 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const darkMode = darkModeRaw === '1' || darkModeRaw === 'true';
     const themeMode = resolveThemeMode({ themeMode: savedThemeMode ?? undefined, darkMode });
     const gelProducts = safeParseArray(gelProductsRaw);
+    const bloodReports = safeParseArray(bloodReportsRaw);
+    const regimens = safeParseArray(regimensRaw);
     const dataHash = computeDataHash({
       events: parsedEvents,
       weight: parsedWeight,
@@ -181,6 +185,8 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       themeMode,
       darkMode,
       gelProducts,
+      bloodReports,
+      regimens,
     });
     localStorage.setItem('hrt-data-hash', dataHash);
 
@@ -197,6 +203,8 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       themeMode,
       darkMode,
       gelProducts,
+      bloodReports,
+      regimens,
       lastModified: storedLastModified,
       lastDataUpdated: storedLastDataUpdated,
       dataHash,
@@ -217,6 +225,8 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     themeMode?: string;
     darkMode?: boolean;
     gelProducts?: any[];
+    bloodReports?: any[];
+    regimens?: any[];
     lastModified: string;
     lastDataUpdated?: string | null;
   }) => {
@@ -252,6 +262,8 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         themeMode: localData.themeMode,
         darkMode: localData.darkMode,
         gelProducts: localData.gelProducts,
+        bloodReports: localData.bloodReports,
+        regimens: localData.regimens,
       });
       setLastSyncTime(now);
       localStorage.setItem(LAST_SYNC_TIME_KEY, now.toISOString());
@@ -331,6 +343,8 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       localStorage.setItem('hrt-dark-mode', mirrorsDark ? '1' : '0');
     }
     if (data?.gelProducts !== undefined) localStorage.setItem('hrt-gel-products', JSON.stringify(data.gelProducts));
+    if (data?.bloodReports !== undefined) localStorage.setItem('hrt-blood-reports', JSON.stringify(data.bloodReports));
+    if (data?.regimens !== undefined) localStorage.setItem('hrt-regimens', JSON.stringify(data.regimens));
     if (data?.lastModified || fallbackTimestamp) localStorage.setItem('hrt-last-modified', data?.lastModified || fallbackTimestamp || '');
     if (data?.lastDataUpdated || fallbackTimestamp) localStorage.setItem(LAST_DATA_UPDATED_KEY, data?.lastDataUpdated || fallbackTimestamp || '');
     const dataHash = computeDataHash({
@@ -346,6 +360,8 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       themeMode: resolvedThemeMode,
       darkMode: data?.darkMode ?? localData.darkMode,
       gelProducts: data?.gelProducts ?? localData.gelProducts,
+      bloodReports: data?.bloodReports ?? localData.bloodReports,
+      regimens: data?.regimens ?? localData.regimens,
     });
     localStorage.setItem('hrt-data-hash', dataHash);
     // After applying cloud data locally, our local state == cloud state,
@@ -376,6 +392,8 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     localStorage.setItem('hrt-theme-mode', snapshot.themeMode);
     localStorage.setItem('hrt-dark-mode', snapshot.darkMode ? '1' : '0');
     localStorage.setItem('hrt-gel-products', JSON.stringify(snapshot.gelProducts ?? []));
+    localStorage.setItem('hrt-blood-reports', JSON.stringify(snapshot.bloodReports ?? []));
+    localStorage.setItem('hrt-regimens', JSON.stringify(snapshot.regimens ?? []));
     // Final-review follow-up: restore must also REMOVE keys the pre-apply
     // snapshot lacked — otherwise a failed cloud/merge resolution leaves the
     // applied cloud timestamps behind and retries use stale freshness state.
@@ -473,6 +491,8 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           : localData.themeMode,
         darkMode: cloudData.darkMode ?? localData.darkMode,
         gelProducts: cloudData.gelProducts || [],
+        bloodReports: cloudData.bloodReports || [],
+        regimens: cloudData.regimens || [],
       });
 
       if (cloudHash === localData.dataHash) {
@@ -744,7 +764,7 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     const handleStorageChange = (e: StorageEvent) => {
       if (e.storageArea !== localStorage) return;
-      const syncKeys = ['hrt-events', 'hrt-weight', 'hrt-lab-results', 'hrt-lang', 'hrt-calibration-model', 'hrt-calibration-mode', 'hrt-apply-e2-learning-to-cpa', 'hrt-apply-cpa-inhibition-to-e2', 'hrt-theme-color', 'hrt-theme-mode', 'hrt-dark-mode', 'hrt-gel-products'];
+      const syncKeys = ['hrt-events', 'hrt-weight', 'hrt-lab-results', 'hrt-lang', 'hrt-calibration-model', 'hrt-calibration-mode', 'hrt-apply-e2-learning-to-cpa', 'hrt-apply-cpa-inhibition-to-e2', 'hrt-theme-color', 'hrt-theme-mode', 'hrt-dark-mode', 'hrt-gel-products', 'hrt-blood-reports', 'hrt-regimens'];
       if (e.key && syncKeys.includes(e.key)) performSync();
     };
 

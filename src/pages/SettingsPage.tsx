@@ -1,4 +1,5 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
 import { useTranslation } from '../contexts/LanguageContext';
 import { useDialog } from '../contexts/DialogContext';
 import { useAuth } from '../contexts/AuthContext';
@@ -20,10 +21,17 @@ import {
     Moon,
     Sun,
     Monitor,
+    Brain,
+    ChevronRight,
 } from 'lucide-react';
+import Account from './Account';
+import RegimenManager from '../components/RegimenManager';
+import type { Regimen } from '../utils/regimens';
 
 import { decryptData } from '../../logic';
 import { computeDataHash } from '../utils/dataHash';
+import { readBloodReports, sanitizeBloodReports, BLOOD_REPORTS_KEY } from '../utils/bloodTests';
+import { readRegimens, sanitizeRegimens, REGIMENS_KEY } from '../utils/regimens';
 import { writeCustomGelProducts } from '../utils/doseForm';
 import { isRecord, precheckImportedBackup, importHasContent, importFallbackWeight, buildRepairedBackup, type ImportPrecheck } from '../utils/importData';
 import type { DoseEvent, LabResult } from '../../types';
@@ -59,6 +67,8 @@ const readExtraSyncFields = () => {
         themeColor: localStorage.getItem('hrt-theme-color') || 'sakura',
         themeMode: localStorage.getItem('hrt-theme-mode') || (darkRaw === '1' || darkRaw === 'true' ? 'dark' : 'light'),
         darkMode: darkRaw === '1' || darkRaw === 'true',
+        bloodReports: readBloodReports(),
+        regimens: readRegimens(),
     };
 };
 
@@ -72,8 +82,17 @@ const SettingsPage: React.FC = () => {
     const { t, lang, setLang } = useTranslation();
     const { showDialog } = useDialog();
     const { isAuthenticated, isLoading: isAuthLoading } = useAuth();
-    const { events, setEvents, labResults, setLabResults, gelProducts, setGelProducts } = useAppData();
+    const { events, setEvents, labResults, setLabResults, gelProducts, setGelProducts, bloodReports, setBloodReports, regimens, setRegimens } = useAppData();
     const { themeMode, setThemeMode } = useTheme();
+    const navigate = useNavigate();
+    const location = useLocation();
+    const { onAddRegimen, onEditRegimen } = useOutletContext<{ onAddRegimen: () => void; onEditRegimen: (r: Regimen) => void }>();
+    // Deep link from the add-dose menu ("管理方案") → scroll to the regimens card.
+    useEffect(() => {
+        if (location.hash === '#regimens') {
+            document.getElementById('regimens')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+    }, [location.hash]);
     const themeModeRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
     // APG radio-group keys: arrows move selection and focus together, Home/End
@@ -102,7 +121,7 @@ const SettingsPage: React.FC = () => {
 
     const languageOptions = useMemo(() => ([
         { value: 'zh', label: '简体中文', icon: <img src={flagCN} alt="CN" className="w-5 h-5 rounded-sm object-contain" /> },
-        { value: 'zh-TW', label: '正體中文（台湾）', icon: <img src={flagTW} alt="TW" className="w-5 h-5 rounded-sm object-contain" /> },
+        { value: 'zh-TW', label: '正體中文（台灣）', icon: <img src={flagTW} alt="TW" className="w-5 h-5 rounded-sm object-contain" /> },
         { value: 'en', label: 'English', icon: <img src={flagUS} alt="US" className="w-5 h-5 rounded-sm object-contain" /> },
         { value: 'ja', label: '日本語', icon: <img src={flagJP} alt="JP" className="w-5 h-5 rounded-sm object-contain" /> },
     ]), []);
@@ -118,6 +137,8 @@ const SettingsPage: React.FC = () => {
                 events?: unknown;
                 labResults?: unknown;
                 gelProducts?: unknown;
+                bloodReports?: unknown;
+                regimens?: unknown;
                 weight?: unknown;
                 lastModified?: unknown;
                 lastDataUpdated?: unknown;
@@ -141,6 +162,12 @@ const SettingsPage: React.FC = () => {
             } else {
                 localStorage.removeItem('hrt-gel-products');
             }
+            const restoredReports = sanitizeBloodReports(snap.bloodReports);
+            localStorage.setItem(BLOOD_REPORTS_KEY, JSON.stringify(restoredReports));
+            setBloodReports(restoredReports);
+            const restoredRegimens = sanitizeRegimens(snap.regimens);
+            localStorage.setItem(REGIMENS_KEY, JSON.stringify(restoredRegimens));
+            setRegimens(restoredRegimens);
             if (typeof snap.weight === 'string') {
                 localStorage.setItem('hrt-weight', snap.weight);
             } else {
@@ -172,7 +199,12 @@ const SettingsPage: React.FC = () => {
             const precheck = precheckImportedBackup(parsed, fallbackWeight);
             const { events: newEvents, labResults: newLabResults, gelProducts: newGelProducts, migratedCount } = precheck;
 
-            if (!importHasContent(precheck)) {
+            // Blood reports / regimens are optional sections (null = absent → keep).
+            const parsedRec = isRecord(parsed) ? parsed : {};
+            const newBloodReports = Array.isArray(parsedRec.bloodReports) ? sanitizeBloodReports(parsedRec.bloodReports) : null;
+            const newRegimens = Array.isArray(parsedRec.regimens) ? sanitizeRegimens(parsedRec.regimens) : null;
+
+            if (!importHasContent(precheck) && !newBloodReports?.length && !newRegimens?.length) {
                 throw new Error('No valid entries');
             }
 
@@ -224,6 +256,8 @@ const SettingsPage: React.FC = () => {
                 events,
                 labResults,
                 gelProducts,
+                bloodReports,
+                regimens,
                 weight: localStorage.getItem('hrt-weight'),
                 lastModified: localStorage.getItem('hrt-last-modified'),
                 lastDataUpdated: localStorage.getItem('hrt-last-data-updated'),
@@ -259,6 +293,14 @@ const SettingsPage: React.FC = () => {
                 if (newGelProducts !== null) {
                     setGelProducts(newGelProducts);
                     writeCustomGelProducts(newGelProducts);
+                }
+                if (newBloodReports !== null) {
+                    setBloodReports(newBloodReports);
+                    localStorage.setItem(BLOOD_REPORTS_KEY, JSON.stringify(newBloodReports));
+                }
+                if (newRegimens !== null) {
+                    setRegimens(newRegimens);
+                    localStorage.setItem(REGIMENS_KEY, JSON.stringify(newRegimens));
                 }
 
                 const lastModified = new Date().toISOString();
@@ -348,7 +390,7 @@ const SettingsPage: React.FC = () => {
     };
 
     const handleQuickExport = () => {
-        if (events.length === 0 && labResults.length === 0 && gelProducts.length === 0) {
+        if (events.length === 0 && labResults.length === 0 && gelProducts.length === 0 && bloodReports.length === 0) {
             showDialog('alert', t('drawer.empty_export'));
             return;
         }
@@ -359,6 +401,8 @@ const SettingsPage: React.FC = () => {
             events,
             labResults,
             gelProducts,
+            bloodReports,
+            regimens,
         };
 
         navigator.clipboard.writeText(JSON.stringify(exportData, null, 2)).then(() => {
@@ -391,7 +435,7 @@ const SettingsPage: React.FC = () => {
     };
 
     const handleExport = () => {
-        if (events.length === 0 && labResults.length === 0 && gelProducts.length === 0) {
+        if (events.length === 0 && labResults.length === 0 && gelProducts.length === 0 && bloodReports.length === 0) {
             showDialog('alert', t('drawer.empty_export'));
             return;
         }
@@ -401,6 +445,8 @@ const SettingsPage: React.FC = () => {
             events,
             labResults,
             gelProducts,
+            bloodReports,
+            regimens,
         };
         downloadFile(JSON.stringify(exportData, null, 2), `hrt-dosages-${new Date().toISOString().split('T')[0]}.json`);
     };
@@ -440,6 +486,41 @@ const SettingsPage: React.FC = () => {
                         {t('nav.settings') || 'Settings'}
                     </h1>
                 </div>
+
+                {/* Account ("我的") — merged into settings */}
+                <section className="space-y-2">
+                    <h2 className={sectionTitleClass} style={{ color: 'var(--text-tertiary)' }}>
+                        {t('settings.group.account')}
+                    </h2>
+                    <Account embedded />
+                </section>
+
+                {/* Medication: regimens + custom gels */}
+                <section id="regimens" className="space-y-2 scroll-mt-20">
+                    <h2 className={sectionTitleClass} style={{ color: 'var(--text-tertiary)' }}>
+                        {t('settings.group.medication')}
+                    </h2>
+                    <RegimenManager onAdd={onAddRegimen} onEdit={onEditRegimen} />
+                    <CustomGelManager />
+                </section>
+
+                {/* Model & calibration — standalone page */}
+                <section className="space-y-2">
+                    <h2 className={sectionTitleClass} style={{ color: 'var(--text-tertiary)' }}>
+                        {t('settings.group.model')}
+                    </h2>
+                    <button
+                        onClick={() => navigate('/settings/calibration')}
+                        className="w-full rounded-2xl glass-card p-4 flex items-center gap-3 text-left btn-press-glass transition hover:bg-[var(--bg-card-hover)]"
+                    >
+                        <Brain size={20} className="shrink-0 text-teal-500" />
+                        <span className="min-w-0 flex-1">
+                            <span className="block text-sm font-bold" style={{ color: 'var(--text-primary)' }}>{t('calib.page_title')}</span>
+                            <span className="block text-xs" style={{ color: 'var(--text-secondary)' }}>{t('calib.entry_desc')}</span>
+                        </span>
+                        <ChevronRight size={18} style={{ color: 'var(--text-tertiary)' }} />
+                    </button>
+                </section>
 
                 {/* Appearance Section */}
                 <section className="space-y-2">
@@ -524,13 +605,6 @@ const SettingsPage: React.FC = () => {
                     </div>
                 </section>
 
-                {/* Custom gels Section */}
-                <section className="space-y-2">
-                    <h2 className={sectionTitleClass} style={{ color: 'var(--text-tertiary)' }}>
-                        {t('settings.group.gels') || 'Custom gels'}
-                    </h2>
-                    <CustomGelManager />
-                </section>
 
                 {/* Data Section */}
                 <section className="space-y-2">

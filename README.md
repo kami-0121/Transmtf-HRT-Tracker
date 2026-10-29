@@ -62,6 +62,14 @@ without duplicating formulas.<br>
 
   **多给药途径模拟**：支持注射（戊酸酯 Valerate、苯甲酸酯 Benzoate、环戊丙酸酯 Cypionate、庚酸酯 Enanthate）、口服、舌下、凝胶以及贴片等多种给药方式。
 
+* **Anti-androgens & Testosterone Model**: Cyproterone acetate, bicalutamide and spironolactone (tracked via its active metabolite canrenone) are simulated alongside estradiol. An endogenous-testosterone suppression model makes the endogenous (aromatised) E2 baseline fade as testosterone is suppressed, instead of treating it as a constant.<br>
+
+  **抗雄药物与睾酮模型**：支持醋酸环丙孕酮、比卡鲁胺与螺内酯（以活性代谢物坎利酮建模）。内源性睾酮抑制模型会让芳香化来源的内源性 E2 随睾酮被抑制而下降，而不再视为常数。
+
+* **Blood Test Reports & Regimens**: Record full blood panels (hormones, liver, kidney, electrolytes, glucose/lipids, blood count) with unit conversion, reference-range flags and per-analyte trend charts; E2 values feed the personal calibration automatically. Save medication regimens (drug, dose, gel product/strength) and log them in one tap from the overview.<br>
+
+  **抽血报告与药物方案**：可记录完整抽血报告（激素、肝肾功能、电解质、血糖血脂、血常规），支持单位换算、参考范围提示与各项目趋势曲线；其中的 E2 会自动用于个人化校准。可预设药物方案（药物、剂量、凝胶产品/浓度），在总览一键记录。
+
 * **Real-time Visualization**: Interactive charts showing estimated estradiol concentration (pg/mL) over time.<br>
 
   **实时可视化**：通过交互式图表展示随时间变化的雌二醇估算浓度（pg/mL）。

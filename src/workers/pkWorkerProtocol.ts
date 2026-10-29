@@ -4,18 +4,18 @@
 // PK types involved (DoseEvent, LabResult, SimulationResult,
 // PersonalModelState, ...) already are, so no custom (de)serialisation exists.
 import type { DoseEvent, LabResult, SimulationResult } from '../../types';
-import type { GelProductSpec } from '../../pk';
+import type { GelProductSpec, TestosteroneModelOptions } from '../../pk';
 import type { CalibrationModel, CalibrationMode } from '../../calibration';
 import type {
     PersonalModelState,
     EKFDiagnostics,
-    computeSimulationWithCI,
+    computeCoupledSimulationWithCI,
 } from '../../personalModel';
 
 export type PKWorkerKind = 'simulation' | 'personalModel' | 'ci';
 
 /** Return shape of computeSimulationWithCI, re-exported as a named type. */
-export type SimCIResult = ReturnType<typeof computeSimulationWithCI>;
+export type SimCIResult = ReturnType<typeof computeCoupledSimulationWithCI>;
 
 export type PKWorkerRequest =
     | {
@@ -29,6 +29,10 @@ export type PKWorkerRequest =
          * never freezes on the 14-day tail clamp.
          */
         endTimeH?: number;
+        /** Endogenous testosterone model options; null/absent = model off. */
+        testosterone?: TestosteroneModelOptions | null;
+        /** Lab (calibration update) times to put on the grid, both sides exact. */
+        breakpointsH?: number[];
     }
     | {
         type: 'personalModel';
@@ -36,6 +40,8 @@ export type PKWorkerRequest =
         events: DoseEvent[];
         labResults: LabResult[];
         gelProducts?: GelProductSpec[];
+        /** Endogenous testosterone model options; null/absent = model off. */
+        testosterone?: TestosteroneModelOptions | null;
     }
     | {
         type: 'ci';
@@ -49,6 +55,8 @@ export type PKWorkerRequest =
         applyCPAInhibitionToE2: boolean;
         calibrationMode: CalibrationMode;
         gelProducts?: GelProductSpec[];
+        /** Testosterone model options → coupled E2/T estimation; null/absent = off. */
+        testosterone?: TestosteroneModelOptions | null;
     };
 
 export type PKWorkerResponse =

@@ -4,10 +4,13 @@ import {
     PersonalModelState, EKFDiagnostics, CalibrationModel, CalibrationMode,
     createCalibrationInterpolator,
     initPersonalModel, isAntiandrogen, GelProductSpec, setCustomGelProducts,
+    TESTOSTERONE_MODEL, type TestosteroneModelOptions, type TestosteroneSeries,
 } from '../../logic';
 import { pkWorker, PKWorkerCancelledError } from '../workers/pkWorkerClient';
 import { computeDataHash } from '../utils/dataHash';
 import { GEL_PRODUCTS_KEY, readCustomGelProducts, writeCustomGelProducts } from '../utils/doseForm';
+import { BLOOD_REPORTS_KEY, readBloodReports, sanitizeBloodReports, toCanonical, type BloodReport } from '../utils/bloodTests';
+import { REGIMENS_KEY, readRegimens, sanitizeRegimens, type Regimen } from '../utils/regimens';
 import { backfillEventWeights, eventsNeedWeightMigration, latestEventWeight, DEFAULT_WEIGHT_KG } from '../utils/weight';
 
 const PERSONAL_MODEL_KEY = 'hrt-personal-model';
@@ -15,6 +18,9 @@ const APPLY_E2_LEARNING_TO_CPA_KEY = 'hrt-apply-e2-learning-to-cpa';
 const CALIBRATION_MODEL_KEY = 'hrt-calibration-model';
 const CALIBRATION_MODE_KEY = 'hrt-calibration-mode';
 const APPLY_CPA_INHIBITION_TO_E2_KEY = 'hrt-apply-cpa-inhibition-to-e2';
+// Device-local model preferences (not part of the cloud-synced snapshot).
+const TESTOSTERONE_MODEL_KEY = 'hrt-testosterone-model';
+const BASELINE_TESTOSTERONE_KEY = 'hrt-baseline-testosterone';
 const THEME_COLOR_KEY = 'hrt-theme-color';
 const DARK_MODE_KEY = 'hrt-dark-mode';
 const THEME_MODE_KEY = 'hrt-theme-mode';
@@ -37,6 +43,15 @@ interface SimCI {
     ci68Low: number[];
     ci68High: number[];
     antiandrogen: Partial<Record<string, CompoundCI>>;
+    /** Coupled E2/T result: T posterior driven by the personalised E2 (testosterone model on). */
+    testosterone?: TestosteroneSeries;
+    /** Personal-model state after the coupled E2/T iterations. */
+    model?: PersonalModelState;
+    couplingIterations?: number;
+    e2DrugPersonal?: number[];
+    endogenousMean?: number[];
+    /** Causal-mode state-change times; never interpolate across them. */
+    updateTimesH?: number[];
 }
 
 interface AppDataContextType {
@@ -69,6 +84,12 @@ interface AppDataContextType {
     /** User-created custom transdermal-gel products (cloud-synced). Presets live in code. */
     gelProducts: GelProductSpec[];
     setGelProducts: React.Dispatch<React.SetStateAction<GelProductSpec[]>>;
+    /** Multi-analyte blood reports (E2 lives in labResults under the same id). Cloud-synced. */
+    bloodReports: BloodReport[];
+    setBloodReports: React.Dispatch<React.SetStateAction<BloodReport[]>>;
+    /** Saved medication regimens for one-tap logging. Cloud-synced. */
+    regimens: Regimen[];
+    setRegimens: React.Dispatch<React.SetStateAction<Regimen[]>>;
     resetPersonalModel: () => void;
     /**
      * True while any PK compute request (simulation / personal-model replay /
@@ -83,6 +104,16 @@ interface AppDataContextType {
      * data is available.
      */
     baselineE2PGmL: number | null;
+    /**
+     * Endogenous testosterone model (pk.ts TESTOSTERONE_MODEL). When on, the
+     * simulation carries a T curve and the endogenous E2 baseline fades as T is
+     * suppressed instead of staying constant. Defaults to on.
+     */
+    testosteroneModelEnabled: boolean;
+    setTestosteroneModelEnabled: React.Dispatch<React.SetStateAction<boolean>>;
+    /** User's pre-treatment total testosterone (ng/dL); null = population default. */
+    baselineTestosteroneNgdL: number | null;
+    setBaselineTestosteroneNgdL: React.Dispatch<React.SetStateAction<number | null>>;
 }
 
 const AppDataContext = createContext<AppDataContextType | undefined>(undefined);
@@ -196,6 +227,50 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         return raw === '1' || raw.toLowerCase() === 'true';
     });
     const [gelProducts, setGelProducts] = useState<GelProductSpec[]>(() => readCustomGelProducts());
+    const [bloodReports, setBloodReports] = useState<BloodReport[]>(() => readBloodReports());
+    const [regimens, setRegimens] = useState<Regimen[]>(() => readRegimens());
+    const [testosteroneModelEnabled, setTestosteroneModelEnabled] = useState<boolean>(() => {
+        const raw = localStorage.getItem(TESTOSTERONE_MODEL_KEY);
+        if (raw === null) return true;
+        return raw === '1' || raw.toLowerCase() === 'true';
+    });
+    const [baselineTestosteroneNgdL, setBaselineTestosteroneNgdL] = useState<number | null>(() => {
+        const v = Number(localStorage.getItem(BASELINE_TESTOSTERONE_KEY));
+        return Number.isFinite(v) && v > 0 ? v : null;
+    });
+    // Measured total testosterone from blood reports (ng/dL) calibrates the T
+    // model; keyed by content so unrelated report edits don't recompute.
+    const tObservationsKey = useMemo(() => JSON.stringify(
+        bloodReports
+            .map(r => {
+                const v = r.values.testosterone;
+                const ngdL = v ? toCanonical('testosterone', v) : null;
+                return ngdL !== null && ngdL > 0 ? { timeH: r.timeH, ngdL } : null;
+            })
+            .filter((o): o is { timeH: number; ngdL: number } => o !== null)
+            .sort((a, b) => a.timeH - b.timeH)
+    ), [bloodReports]);
+    // Every calibration update time (E2 and T labs) goes onto the simulation grid
+    // with the instant before it, so causal personal curves are exact on both
+    // sides of each update (runSimulation breakpointsH).
+    const breakpointsKey = useMemo(() => JSON.stringify(
+        [...new Set([...labResults.map(l => l.timeH), ...JSON.parse(tObservationsKey).map((o: { timeH: number }) => o.timeH)])]
+            .filter((t: number) => Number.isFinite(t))
+            .sort((a: number, b: number) => a - b)
+    ), [labResults, tObservationsKey]);
+    // Stable options object so the compute effects only re-run on real changes.
+    const testosteroneOpts = useMemo<TestosteroneModelOptions | null>(
+        () => testosteroneModelEnabled
+            ? {
+                // Only a fallback: pre-treatment T labs take precedence (pk.ts).
+                baselineNgdL: baselineTestosteroneNgdL ?? undefined,
+                observations: JSON.parse(tObservationsKey),
+                // T and E2 share one data cutoff: causal = forward filter only.
+                mode: calibrationMode,
+            }
+            : null,
+        [testosteroneModelEnabled, baselineTestosteroneNgdL, tObservationsKey, calibrationMode]
+    );
 
     const suppressLocalUpdateRef = useRef({
         events: false,
@@ -205,6 +280,8 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         applyE2LearningToCPA: false,
         applyCPAInhibitionToE2: false,
         gelProducts: false,
+        bloodReports: false,
+        regimens: false,
     });
     const isInitialLoadRef = useRef({
         events: true,
@@ -214,6 +291,8 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         applyE2LearningToCPA: true,
         applyCPAInhibitionToE2: true,
         gelProducts: true,
+        bloodReports: true,
+        regimens: true,
     });
 
     const markExternalUpdate = (key: keyof typeof suppressLocalUpdateRef.current) => {
@@ -270,9 +349,24 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         finalizeLocalUpdate('calibrationMode', CALIBRATION_MODE_KEY);
     }, [calibrationMode]);
     useEffect(() => {
+        localStorage.setItem(TESTOSTERONE_MODEL_KEY, testosteroneModelEnabled ? '1' : '0');
+    }, [testosteroneModelEnabled]);
+    useEffect(() => {
+        if (baselineTestosteroneNgdL === null) localStorage.removeItem(BASELINE_TESTOSTERONE_KEY);
+        else localStorage.setItem(BASELINE_TESTOSTERONE_KEY, String(baselineTestosteroneNgdL));
+    }, [baselineTestosteroneNgdL]);
+    useEffect(() => {
         writeCustomGelProducts(gelProducts);
         finalizeLocalUpdate('gelProducts', GEL_PRODUCTS_KEY);
     }, [gelProducts]);
+    useEffect(() => {
+        localStorage.setItem(BLOOD_REPORTS_KEY, JSON.stringify(bloodReports));
+        finalizeLocalUpdate('bloodReports', BLOOD_REPORTS_KEY);
+    }, [bloodReports]);
+    useEffect(() => {
+        localStorage.setItem(REGIMENS_KEY, JSON.stringify(regimens));
+        finalizeLocalUpdate('regimens', REGIMENS_KEY);
+    }, [regimens]);
 
     useEffect(() => {
         const lang = localStorage.getItem('hrt-lang') || 'en';
@@ -282,9 +376,9 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         const themeMode = localStorage.getItem(THEME_MODE_KEY) || (darkMode ? 'dark' : 'light');
         const gelProductsRaw = localStorage.getItem(GEL_PRODUCTS_KEY);
         const gelProductsParsed = gelProductsRaw ? JSON.parse(gelProductsRaw) : [];
-        const hash = computeDataHash({ events, weight: latestEventWeight(events), labResults, lang, calibrationModel, calibrationMode, applyE2LearningToCPA, applyCPAInhibitionToE2, themeColor, themeMode, darkMode, gelProducts: gelProductsParsed });
+        const hash = computeDataHash({ events, weight: latestEventWeight(events), labResults, lang, calibrationModel, calibrationMode, applyE2LearningToCPA, applyCPAInhibitionToE2, themeColor, themeMode, darkMode, gelProducts: gelProductsParsed, bloodReports, regimens });
         localStorage.setItem('hrt-data-hash', hash);
-    }, [events, labResults, calibrationModel, calibrationMode, applyE2LearningToCPA, applyCPAInhibitionToE2, gelProducts]);
+    }, [events, labResults, calibrationModel, calibrationMode, applyE2LearningToCPA, applyCPAInhibitionToE2, gelProducts, bloodReports, regimens]);
 
     // Update current time every minute
     useEffect(() => {
@@ -303,9 +397,13 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
             markExternalUpdate('events');
             markExternalUpdate('labResults');
             markExternalUpdate('gelProducts');
+            markExternalUpdate('bloodReports');
+            markExternalUpdate('regimens');
             setEvents([]);
             setLabResults([]);
             setGelProducts([]);
+            setBloodReports([]);
+            setRegimens([]);
         };
         window.addEventListener('hrt-clear-local-data', handleClearLocalData);
         return () => window.removeEventListener('hrt-clear-local-data', handleClearLocalData);
@@ -313,7 +411,7 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
 
     useEffect(() => {
         const handleStorageChange = (e: StorageEvent) => {
-            const syncKeys = ['hrt-events', 'hrt-lab-results', 'hrt-calibration-model', CALIBRATION_MODE_KEY, APPLY_E2_LEARNING_TO_CPA_KEY, APPLY_CPA_INHIBITION_TO_E2_KEY, THEME_COLOR_KEY, THEME_MODE_KEY, DARK_MODE_KEY, GEL_PRODUCTS_KEY];
+            const syncKeys = ['hrt-events', 'hrt-lab-results', 'hrt-calibration-model', CALIBRATION_MODE_KEY, APPLY_E2_LEARNING_TO_CPA_KEY, APPLY_CPA_INHIBITION_TO_E2_KEY, THEME_COLOR_KEY, THEME_MODE_KEY, DARK_MODE_KEY, GEL_PRODUCTS_KEY, BLOOD_REPORTS_KEY, REGIMENS_KEY];
             const isCloudSync = e.key === 'hrt-data-synced';
             const isOtherTabSync = e.storageArea === localStorage && e.key && syncKeys.includes(e.key);
             if (!isCloudSync && !isOtherTabSync) {
@@ -350,6 +448,20 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
                 }
                 const saved = localStorage.getItem('hrt-lab-results');
                 setLabResults(saved ? JSON.parse(saved) : []);
+            }
+
+            if (e.key === BLOOD_REPORTS_KEY || isCloudSync) {
+                if (isCloudSync || isOtherTabSync) markExternalUpdate('bloodReports');
+                try {
+                    setBloodReports(sanitizeBloodReports(JSON.parse(localStorage.getItem(BLOOD_REPORTS_KEY) || '[]')));
+                } catch { setBloodReports([]); }
+            }
+
+            if (e.key === REGIMENS_KEY || isCloudSync) {
+                if (isCloudSync || isOtherTabSync) markExternalUpdate('regimens');
+                try {
+                    setRegimens(sanitizeRegimens(JSON.parse(localStorage.getItem(REGIMENS_KEY) || '[]')));
+                } catch { setRegimens([]); }
             }
 
             if (e.key === 'hrt-calibration-model' && isOtherTabSync) {
@@ -490,7 +602,7 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
     // below skips the worker call while the stored grid already covers
     // now + buffer, so a quiet history triggers at most ~one recompute per day
     // (when the buffer is about to be exceeded), not one per minute.
-    const simulationForRef = useRef<{ events: DoseEvent[]; gelProducts: GelProductSpec[] } | null>(null);
+    const simulationForRef = useRef<{ events: DoseEvent[]; gelProducts: GelProductSpec[]; testosterone: TestosteroneModelOptions | null; breakpointsKey: string } | null>(null);
     useEffect(() => {
         if (events.length === 0) {
             // Bump the sequence BEFORE cancelling: pkWorker.cancel rejects the
@@ -509,7 +621,9 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
             ? simulation.timeH[simulation.timeH.length - 1]
             : -Infinity;
         const fresh = simulationForRef.current?.events === events
-            && simulationForRef.current?.gelProducts === gelProducts;
+            && simulationForRef.current?.gelProducts === gelProducts
+            && simulationForRef.current?.testosterone === testosteroneOpts
+            && simulationForRef.current?.breakpointsKey === breakpointsKey;
         // F03 final-review fix: skip while the stored grid still covers "now"
         // with a healthy buffer (>= 12h). Comparing endTimeH (= now + 24h)
         // against the grid end directly would recompute EVERY minute, because
@@ -519,14 +633,14 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         const seq = ++simulationSeqRef.current;
         setCustomGelProducts(gelProducts);
         pkWorker.cancel('simulation');
-        trackCompute(pkWorker.run('simulation', { events, gelProducts, endTimeH }))
+        trackCompute(pkWorker.run('simulation', { events, gelProducts, endTimeH, testosterone: testosteroneOpts, breakpointsH: JSON.parse(breakpointsKey) }))
             .then(res => {
                 if (seq !== simulationSeqRef.current) return;
-                simulationForRef.current = { events, gelProducts };
+                simulationForRef.current = { events, gelProducts, testosterone: testosteroneOpts, breakpointsKey };
                 setSimulation(res);
             })
             .catch(handleComputeError);
-    }, [events, gelProducts, currentTime, simulation]);
+    }, [events, gelProducts, currentTime, simulation, testosteroneOpts, breakpointsKey]);
 
     // Rebuild personal model whenever events, labResults, or the custom-gel
     // registry change (gel calibration resolves kinetics from the registry).
@@ -543,7 +657,7 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
             savePersonalModel(null);
             return;
         }
-        trackCompute(pkWorker.run('personalModel', { events, labResults, gelProducts }))
+        trackCompute(pkWorker.run('personalModel', { events, labResults, gelProducts, testosterone: testosteroneOpts }))
             .then(({ model, diagnostics }) => {
                 if (seq !== personalModelSeqRef.current) return;
                 setLastDiagnostics(diagnostics);
@@ -551,7 +665,7 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
                 savePersonalModel(model);
             })
             .catch(handleComputeError);
-    }, [events, labResults, gelProducts]);
+    }, [events, labResults, gelProducts, testosteroneOpts]);
 
     // Recompute CI bands whenever relevant state changes.
     // - E2 personal CI (e2Adjusted + ci bands) requires at least one post-dose
@@ -575,7 +689,7 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
             trackCompute(pkWorker.run('ci', {
                 simulation, events, model: personalModel!, applyE2LearningToCPA,
                 labResults, calibrationModel, applyCPAInhibitionToE2,
-                calibrationMode, gelProducts,
+                calibrationMode, gelProducts, testosterone: testosteroneOpts,
             }))
                 .then(ci => {
                     if (seq !== ciSeqRef.current) return;
@@ -598,7 +712,7 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         } else {
             setSimCI(null);
         }
-    }, [simulation, personalModel, events, applyE2LearningToCPA, labResults, calibrationModel, applyCPAInhibitionToE2, calibrationMode]);
+    }, [simulation, personalModel, events, applyE2LearningToCPA, labResults, calibrationModel, applyCPAInhibitionToE2, calibrationMode, testosteroneOpts]);
 
     // F07 review: on unmount, invalidate every pending compute and terminate
     // the workers so neither late setState calls nor worker callbacks can
@@ -615,12 +729,14 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
 
     // Expose baseline from pre-dose labs so UI can offset the raw sim curve
     // even when no post-dose learning has occurred yet.
+    // With the testosterone model on, a population pre-treatment baseline is
+    // used when there is no pre-dose lab; the display layers scale it by the
+    // simulated T(t)/T0 (endogenousFractionAt), so it fades under suppression.
     const baselineE2PGmL = useMemo<number | null>(() => {
-        if (!personalModel) return null;
-        const v = personalModel.baselinePGmL;
-        if (v === undefined || !Number.isFinite(v) || v <= 0) return null;
-        return v;
-    }, [personalModel]);
+        const v = personalModel?.baselinePGmL;
+        if (v !== undefined && Number.isFinite(v) && v > 0) return v;
+        return testosteroneModelEnabled ? TESTOSTERONE_MODEL.defaultBaselineE2PGmL : null;
+    }, [personalModel, testosteroneModelEnabled]);
 
     // Create calibration function (legacy ratio-based, still used for current-scale display)
     const calibrationFn = useMemo(() => {
@@ -662,9 +778,17 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         setCalibrationMode,
         gelProducts,
         setGelProducts,
+        bloodReports,
+        setBloodReports,
+        regimens,
+        setRegimens,
         resetPersonalModel,
         isComputing,
         baselineE2PGmL,
+        testosteroneModelEnabled,
+        setTestosteroneModelEnabled,
+        baselineTestosteroneNgdL,
+        setBaselineTestosteroneNgdL,
     };
 
     return <AppDataContext.Provider value={value}>{children}</AppDataContext.Provider>;

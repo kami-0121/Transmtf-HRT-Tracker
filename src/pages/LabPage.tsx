@@ -1,17 +1,10 @@
 import React from 'react';
-import { useOutletContext } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { useAppData } from '../contexts/AppDataContext';
-import { LabResult } from '../../logic';
 import LabView from '../views/LabView';
 
-interface OutletContext {
-    onAddLabResult: () => void;
-    onEditLabResult: (result: LabResult) => void;
-    onClearLabResults: () => void;
-}
-
 const LabPage: React.FC = () => {
-    const { onAddLabResult, onEditLabResult, onClearLabResults } = useOutletContext<OutletContext>();
+    const navigate = useNavigate();
     const {
         labResults,
         personalModel,
@@ -20,6 +13,12 @@ const LabPage: React.FC = () => {
         setApplyE2LearningToCPA,
         applyCPAInhibitionToE2,
         setApplyCPAInhibitionToE2,
+        testosteroneModelEnabled,
+        setTestosteroneModelEnabled,
+        baselineTestosteroneNgdL,
+        setBaselineTestosteroneNgdL,
+        simulation,
+        simCI,
         calibrationModel,
         setCalibrationModel,
         calibrationMode,
@@ -35,13 +34,17 @@ const LabPage: React.FC = () => {
             onSetApplyE2LearningToCPA={setApplyE2LearningToCPA}
             applyCPAInhibitionToE2={applyCPAInhibitionToE2}
             onSetApplyCPAInhibitionToE2={setApplyCPAInhibitionToE2}
+            testosteroneModelEnabled={testosteroneModelEnabled}
+            onSetTestosteroneModelEnabled={setTestosteroneModelEnabled}
+            baselineTestosteroneNgdL={baselineTestosteroneNgdL}
+            onSetBaselineTestosteroneNgdL={setBaselineTestosteroneNgdL}
+            testosteroneSeries={simCI?.testosterone ?? simulation?.testosterone}
+            couplingIterations={simCI?.couplingIterations}
             calibrationModel={calibrationModel}
             onSetCalibrationModel={setCalibrationModel}
             calibrationMode={calibrationMode}
             onSetCalibrationMode={setCalibrationMode}
-            onAddLabResult={onAddLabResult}
-            onEditLabResult={onEditLabResult}
-            onClearLabResults={onClearLabResults}
+            onBack={() => navigate('/settings')}
         />
     );
 };

@@ -36,7 +36,7 @@ export const getAvailableEsters = (route: Route): Ester[] => {
         case Route.injection:
             return [Ester.EB, Ester.EV, Ester.EU, Ester.EC, Ester.EN];
         case Route.oral:
-            return [Ester.E2, Ester.EV, Ester.CPA, Ester.BICA];
+            return [Ester.E2, Ester.EV, Ester.CPA, Ester.BICA, Ester.SPL];
         case Route.sublingual:
             return [Ester.EV, Ester.E2];
         default:
@@ -54,6 +54,7 @@ export const DOSE_QUICK_PRESETS: Partial<Record<Ester, number[]>> = {
     [Ester.EV]: [1, 2, 3, 4],
     [Ester.CPA]: [6.25, 12.5, 25],
     [Ester.BICA]: [20, 25, 50],
+    [Ester.SPL]: [25, 50, 100, 200],
 };
 
 /** True when `mg` matches one of the compound's quick-select presets. */

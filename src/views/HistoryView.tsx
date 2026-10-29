@@ -26,7 +26,7 @@ const HistoryView: React.FC<HistoryViewProps> = ({ events, onAddEvent, onEditEve
   }, [events, lang]);
 
   return (
-    <div className="relative space-y-5 pt-6 pb-16">
+    <div className="relative space-y-5">
       <div className="px-4">
         {/* Title and actions share a row while they fit; on narrow phones
             the action buttons wrap below the title rather than breaking

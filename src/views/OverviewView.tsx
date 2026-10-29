@@ -4,8 +4,12 @@ import { useTranslation } from '../contexts/LanguageContext';
 import { useTheme } from '../contexts/ThemeContext';
 import ResultChart from '../components/ResultChart';
 import ShareImageModal from '../components/ShareImageModal';
-import { formatTime } from '../utils/helpers';
-import { DoseEvent, SimulationResult, LabResult, Route, Ester, ExtraKey, SL_TIER_ORDER, interpolateConcentration_E2, interpolateCompoundConcentration, isAntiandrogen, pickPrimaryAntiandrogen, ANTIANDROGENS, formatAntiandrogenConc, convertToPgMl, PERSONAL_E2_CEILING_PGML } from '../../logic';
+import AddDoseMenu from '../components/AddDoseMenu';
+import { useAppData } from '../contexts/AppDataContext';
+import { regimenDisplayName, formatRegimenDose } from '../utils/regimenDisplay';
+import type { Regimen } from '../utils/regimens';
+import { formatTime, getRouteIcon } from '../utils/helpers';
+import { DoseEvent, SimulationResult, LabResult, Route, Ester, ExtraKey, SL_TIER_ORDER, interpolateConcentration_E2, interpolateCompoundConcentration, isAntiandrogen, pickPrimaryAntiandrogen, ANTIANDROGENS, formatAntiandrogenConc, convertToPgMl, PERSONAL_E2_CEILING_PGML, endogenousFractionAt, interpolateTSeries, interpolateNoCross, type TestosteroneSeries } from '../../logic';
 
 /** Convert hex color string to "r,g,b" for use in rgba() */
 function hexToRgb(hex: string): string {
@@ -169,6 +173,8 @@ interface SimCI {
     ci68Low: number[];
     ci68High: number[];
     antiandrogen: Partial<Record<string, { adjusted: number[]; ci95Low: number[]; ci95High: number[] }>>;
+    testosterone?: TestosteroneSeries;
+    updateTimesH?: number[];
 }
 
 interface OverviewViewProps {
@@ -180,23 +186,9 @@ interface OverviewViewProps {
   baselineE2PGmL?: number | null;
   onAddEvent: () => void;
   onEditEvent: (event: DoseEvent) => void;
+  onAddRegimenDose: (regimen: Regimen) => void;
 }
 
-function interpAt(timeH: number[], values: number[], h: number): number {
-  if (!timeH.length || !values.length) return 0;
-  if (h <= timeH[0]) return values[0];
-  if (h >= timeH[timeH.length - 1]) return values[values.length - 1];
-  let lo = 0, hi = timeH.length - 1;
-  while (hi - lo > 1) {
-    const mid = (lo + hi) >> 1;
-    if (timeH[mid] <= h) lo = mid; else hi = mid;
-  }
-  const frac = (timeH[hi] - timeH[lo]) > 0
-    ? (h - timeH[lo]) / (timeH[hi] - timeH[lo])
-    : 0;
-  const v = values[lo] + frac * (values[hi] - values[lo]);
-  return isFinite(v) ? v : 0;
-}
 
 const OverviewView: React.FC<OverviewViewProps> = ({
   events,
@@ -207,13 +199,18 @@ const OverviewView: React.FC<OverviewViewProps> = ({
   baselineE2PGmL,
   onAddEvent,
   onEditEvent,
+  onAddRegimenDose,
 }) => {
   const { t, lang } = useTranslation();
   const { isDark, colors } = useTheme();
+  const { regimens, gelProducts } = useAppData();
   const [shareImageOpen, setShareImageOpen] = useState(false);
   const h = currentTime.getTime() / 3600000;
 
   const hasPersonalModel = !!simCI && simCI.e2Adjusted.length > 0;
+  // Causal personal curves change state at lab times: never interpolate across one.
+  const interpCI = (values: number[], at: number): number =>
+    interpolateNoCross(simCI!.timeH, values, at, simCI!.updateTimesH ?? []) ?? NaN;
   const hasDoseHistory = events.length > 0;
 
   // The "primary" anti-androgen shown in the headline / side tile = the most
@@ -226,14 +223,38 @@ const OverviewView: React.FC<OverviewViewProps> = ({
   const aaCI = (primaryAA && simCI) ? simCI.antiandrogen[primaryAA] : undefined;
   const hasPersonalAaModel = !!aaCI && aaCI.adjusted.length === (simCI?.timeH.length ?? -1) && aaCI.adjusted.length > 0;
 
+  // Endogenous (aromatised) E2 right now: the pre-treatment baseline scaled by
+  // the simulated testosterone fraction (constant when the T model is off).
+  const endogenousNow = useMemo(() => {
+    if (!baselineE2PGmL || baselineE2PGmL <= 0) return 0;
+    return baselineE2PGmL * endogenousFractionAt(simulation, h);
+  }, [simulation, h, baselineE2PGmL]);
+
+  // Estimated endogenous testosterone (ng/dL) with its 95% posterior range;
+  // prefers the coupled E2/T posterior (personalised E2 input) when present.
+  const tSource = useMemo(() => {
+    if (simCI?.testosterone && simCI.testosterone.values.length === simCI.timeH.length) {
+      return { timeH: simCI.timeH, series: simCI.testosterone };
+    }
+    if (simulation?.testosterone) return { timeH: simulation.timeH, series: simulation.testosterone };
+    return null;
+  }, [simCI, simulation]);
+  const testosteroneNow = useMemo(
+    () => (tSource ? interpolateTSeries(tSource.timeH, tSource.series, 'values', h) : null),
+    [tSource, h]
+  );
+  const testosteroneRange = useMemo(() => {
+    if (!tSource || testosteroneNow === null) return null;
+    const sd = interpolateTSeries(tSource.timeH, tSource.series, 'logSd', h) ?? 0;
+    return { lo: testosteroneNow * Math.exp(-1.96 * sd), hi: testosteroneNow * Math.exp(1.96 * sd) };
+  }, [tSource, testosteroneNow, h]);
+
   const rawLevel = useMemo(() => {
     if (!simulation) return 0;
     const drugE2 = interpolateConcentration_E2(simulation, h) || 0;
-    const shift = (!hasPersonalModel && baselineE2PGmL && baselineE2PGmL > 0)
-      ? baselineE2PGmL
-      : 0;
+    const shift = !hasPersonalModel ? endogenousNow : 0;
     return drugE2 + shift;
-  }, [simulation, h, hasPersonalModel, baselineE2PGmL]);
+  }, [simulation, h, hasPersonalModel, endogenousNow]);
 
   const baselineLevel = useMemo(() => {
     if (!hasDoseHistory && labResults.length > 0) {
@@ -241,11 +262,11 @@ const OverviewView: React.FC<OverviewViewProps> = ({
       const v = convertToPgMl(latest.concValue, latest.unit);
       return Number.isFinite(v) && v > 0 ? v : null;
     }
-    if (hasDoseHistory && !hasPersonalModel && baselineE2PGmL && baselineE2PGmL > 0) {
-      return baselineE2PGmL;
+    if (hasDoseHistory && !hasPersonalModel && endogenousNow > 0) {
+      return endogenousNow;
     }
     return null;
-  }, [hasDoseHistory, hasPersonalModel, baselineE2PGmL, labResults]);
+  }, [hasDoseHistory, hasPersonalModel, endogenousNow, labResults]);
 
   // F13: the personal estimate is a {value, capped} structure, not a nullable
   // number. At the model ceiling (5000) the value is REAL but bounded — the
@@ -254,7 +275,7 @@ const OverviewView: React.FC<OverviewViewProps> = ({
   // keeps showing personal-model intervals.
   const personalLevel = useMemo(() => {
     if (!hasPersonalModel) return null;
-    const v = interpAt(simCI!.timeH, simCI!.e2Adjusted, h);
+    const v = interpCI(simCI!.e2Adjusted, h);
     if (!Number.isFinite(v) || v <= 0) return null; // 无法估计 → fall back below
     return v >= PERSONAL_E2_CEILING_PGML ? { value: v, capped: true as const } : { value: v, capped: false as const };
   }, [hasPersonalModel, simCI, h]);
@@ -266,8 +287,8 @@ const OverviewView: React.FC<OverviewViewProps> = ({
 
   const currentCI = useMemo(() => {
     if (!hasPersonalModel) return null;
-    const lo = interpAt(simCI!.timeH, simCI!.ci95Low, h);
-    const hi = interpAt(simCI!.timeH, simCI!.ci95High, h);
+    const lo = interpCI(simCI!.ci95Low, h);
+    const hi = interpCI(simCI!.ci95High, h);
     if (lo > 0 && hi > 0 && hi > lo) return { lo, hi };
     return null;
   }, [hasPersonalModel, simCI, h]);
@@ -280,7 +301,7 @@ const OverviewView: React.FC<OverviewViewProps> = ({
 
   const personalAA = useMemo(() => {
     if (!hasPersonalAaModel || !aaCI || !primaryAASpec) return null;
-    const v = interpAt(simCI!.timeH, aaCI.adjusted, h);
+    const v = interpCI(aaCI.adjusted, h);
     return (v > 0 && v <= primaryAASpec.ciMaxNative) ? v : null;
   }, [hasPersonalAaModel, aaCI, primaryAASpec, simCI, h]);
 
@@ -292,8 +313,8 @@ const OverviewView: React.FC<OverviewViewProps> = ({
     if (aaCI.ci95Low.length !== simCI!.timeH.length || aaCI.ci95High.length !== simCI!.timeH.length) {
       return null;
     }
-    const lo = interpAt(simCI!.timeH, aaCI.ci95Low, h);
-    const hi = interpAt(simCI!.timeH, aaCI.ci95High, h);
+    const lo = interpCI(aaCI.ci95Low, h);
+    const hi = interpCI(aaCI.ci95High, h);
     if (lo > 0 && hi > 0 && hi > lo) return { lo, hi };
     return null;
   }, [hasPersonalAaModel, aaCI, simCI, h]);
@@ -301,8 +322,8 @@ const OverviewView: React.FC<OverviewViewProps> = ({
   const currentCI68 = useMemo(() => {
     if (!hasPersonalModel) return null;
     if (!simCI!.ci68Low?.length || simCI!.ci68Low.length !== simCI!.timeH.length) return null;
-    const lo = interpAt(simCI!.timeH, simCI!.ci68Low, h);
-    const hi = interpAt(simCI!.timeH, simCI!.ci68High, h);
+    const lo = interpCI(simCI!.ci68Low, h);
+    const hi = interpCI(simCI!.ci68High, h);
     if (lo > 0 && hi > 0 && hi > lo) return { lo, hi };
     return null;
   }, [hasPersonalModel, simCI, h]);
@@ -455,19 +476,13 @@ const OverviewView: React.FC<OverviewViewProps> = ({
                   </span>
                 )}
               </h1>
-              <button
-                type="button"
-                onClick={onAddEvent}
-                aria-label={t('btn.add')}
-                className="md:hidden shrink-0 inline-flex h-11 min-w-11 items-center justify-center gap-1.5 rounded-xl px-3 min-[360px]:px-3.5 text-xs font-bold text-white glass-btn-primary btn-press-glass transition"
-              >
-                <Plus size={15} aria-hidden="true" />
-                {/* The personal-model badge competes for this row; keep the button
-                    icon-only while the pill would not fit beside the labelled
-                    button in every locale (English is the widest: the pill with
-                    badge needs ~270px, the labelled button ~110px). */}
-                <span className={`hidden ${hasPersonalModel ? 'min-[450px]:inline' : 'min-[360px]:inline'}`}>{t('btn.add')}</span>
-              </button>
+              {/* Mobile add: offers saved regimens first, then the free-form form. */}
+              <AddDoseMenu
+                variant="compact"
+                className="md:hidden"
+                onAddCustom={onAddEvent}
+                onAddRegimen={onAddRegimenDose}
+              />
             </div>
             <div className="grid grid-cols-2 gap-4">
               {/* E2 Display */}
@@ -529,7 +544,7 @@ const OverviewView: React.FC<OverviewViewProps> = ({
                 )}
                 {hasPersonalModel && rawLevel > 0 && (
                   <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0 mt-0.5">
-                    <span className="text-[9px] font-bold uppercase tracking-wide whitespace-nowrap" style={{ color: 'var(--text-tertiary)' }}>Raw</span>
+                    <span className="text-[9px] font-bold uppercase tracking-wide whitespace-nowrap" style={{ color: 'var(--text-tertiary)' }}>{t('chart.label_raw')}</span>
                     <span className="text-[10px] font-semibold whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>
                       {rawLevel.toFixed(1)} pg/mL
                     </span>
@@ -537,7 +552,7 @@ const OverviewView: React.FC<OverviewViewProps> = ({
                 )}
                 {!hasDoseHistory && baselineLevel !== null && (
                   <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0 mt-0.5">
-                    <span className="text-[9px] font-bold text-teal-400 uppercase tracking-wide whitespace-nowrap">Baseline</span>
+                    <span className="text-[9px] font-bold text-teal-400 uppercase tracking-wide whitespace-nowrap">{t('chart.label_baseline')}</span>
                     <span className="text-[10px] font-semibold text-teal-500 whitespace-nowrap">
                       {baselineLevel.toFixed(1)} pg/mL
                     </span>
@@ -545,10 +560,31 @@ const OverviewView: React.FC<OverviewViewProps> = ({
                 )}
                 {hasDoseHistory && !hasPersonalModel && baselineE2PGmL != null && (
                   <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0 mt-0.5">
-                    <span className="text-[9px] font-bold text-teal-400 uppercase tracking-wide whitespace-nowrap">Endogenous</span>
+                    <span className="text-[9px] font-bold text-teal-400 uppercase tracking-wide whitespace-nowrap">{t('chart.label_endogenous')}</span>
                     <span className="text-[10px] font-semibold text-teal-500 whitespace-nowrap">
-                      {baselineE2PGmL.toFixed(1)} pg/mL
+                      {endogenousNow.toFixed(1)} pg/mL
                     </span>
+                  </div>
+                )}
+                {hasDoseHistory && testosteroneNow !== null && (
+                  <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0 mt-0.5"
+                    title={t('overview.testosterone_note')}>
+                    <span className="text-[9px] font-bold uppercase tracking-wide whitespace-nowrap" style={{ color: 'var(--text-tertiary)' }}>
+                      {t('overview.testosterone_est')}
+                    </span>
+                    <span className="text-[10px] font-semibold whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>
+                      {testosteroneNow.toFixed(0)} ng/dL
+                    </span>
+                    {testosteroneRange && (
+                      <span className="text-[9px] whitespace-nowrap" style={{ color: 'var(--text-tertiary)' }}>
+                        (95% {testosteroneRange.lo.toFixed(0)}–{testosteroneRange.hi.toFixed(0)})
+                      </span>
+                    )}
+                    {(tSource?.series.observationCount ?? 0) > 0 && (
+                      <span className="text-[9px] font-semibold whitespace-nowrap" style={{ color: 'var(--accent-400)' }}>
+                        {t('overview.testosterone_calibrated').replace('{n}', String(tSource!.series.observationCount))}
+                      </span>
+                    )}
                   </div>
                 )}
                 {currentStatus && (
@@ -577,7 +613,9 @@ const OverviewView: React.FC<OverviewViewProps> = ({
                   const { value } = fmt(v);
                   return value >= 100 ? value.toFixed(0) : value >= 10 ? value.toFixed(1) : value.toFixed(2);
                 };
-                const noteKey = primaryAA === Ester.BICA ? 'chart.bica_note' : 'chart.cpa_note';
+                const noteKey = primaryAA === Ester.BICA ? 'chart.bica_note'
+                  : primaryAA === Ester.SPL ? 'chart.spl_note'
+                  : 'chart.cpa_note';
                 return (
               <div className="space-y-1">
                 <div className="text-[10px] md:text-xs font-bold uppercase tracking-wider"
@@ -631,7 +669,7 @@ const OverviewView: React.FC<OverviewViewProps> = ({
                     )}
                     {rawAA > 0 && rawAA !== personalAA && (
                       <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0 mt-0.5">
-                        <span className="text-[9px] font-bold uppercase tracking-wide whitespace-nowrap" style={{ color: 'var(--text-tertiary)' }}>Base</span>
+                        <span className="text-[9px] font-bold uppercase tracking-wide whitespace-nowrap" style={{ color: 'var(--text-tertiary)' }}>{t('chart.label_base')}</span>
                         <span className="text-[10px] font-semibold whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>
                           {fmtText(rawAA)} {fmt(rawAA).unit}
                         </span>
@@ -817,6 +855,37 @@ const OverviewView: React.FC<OverviewViewProps> = ({
 
           </div>
         </div>
+
+        {/* Quick log from saved regimens (藥物方案) */}
+        {regimens.length > 0 && (
+          <div className="mt-4 glass-card rounded-2xl p-3 md:p-4">
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <span className="text-[10px] md:text-xs font-bold uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
+                {t('regimen.quick_title')}
+              </span>
+              <button onClick={onAddEvent} className="text-[11px] font-semibold" style={{ color: 'var(--accent-500)' }}>
+                {t('regimen.add_custom')}
+              </button>
+            </div>
+            <div className="flex gap-2 overflow-x-auto pb-1 -mx-1 px-1">
+              {regimens.map(r => (
+                <button key={r.id} onClick={() => onAddRegimenDose(r)}
+                  className="shrink-0 flex items-center gap-2 pl-2 pr-3 py-2 rounded-xl border btn-press-glass transition hover:bg-[var(--bg-card-hover)]"
+                  style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-card)' }}>
+                  <span className="w-7 h-7 rounded-lg flex items-center justify-center" style={{ background: 'var(--accent-50)' }}>
+                    {getRouteIcon(r.route)}
+                  </span>
+                  <span className="text-left">
+                    <span className="flex items-center gap-1 text-xs font-bold whitespace-nowrap" style={{ color: 'var(--text-primary)' }}>
+                      <Plus size={11} style={{ color: 'var(--accent-500)' }} />{regimenDisplayName(r, t, gelProducts)}
+                    </span>
+                    <span className="block text-[10px] whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>{formatRegimenDose(r, t, gelProducts)}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </header>
 
       <main className="w-full overflow-x-hidden px-3 md:px-4 py-4 md:py-6 rounded-t-3xl"

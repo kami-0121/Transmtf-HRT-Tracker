@@ -1,4 +1,4 @@
-import { Route, Ester, type DoseEvent, type LabResult, type SimulationResult } from './types';
+import { Route, Ester, type DoseEvent, type LabResult, type SimulationResult, type TestosteroneSeries } from './types';
 import {
     CorePK,
     CPA_2COMP_PK,
@@ -12,6 +12,14 @@ import {
     ANTIANDROGENS,
     ANTIANDROGEN_ESTERS,
     findPatchRemovalForApply,
+    makeEndogenousE2Context,
+    resolveEndogenousE2,
+    sampleEndogenousE2,
+    computeTestosteroneSeries,
+    type TestosteroneModelOptions,
+    POSTERIOR_DRAWS,
+    SHARED_DRAWS,
+    type EndogenousE2Context,
 } from './pk';
 import {
     convertToPgMl,
@@ -257,7 +265,8 @@ export function ekfUpdatePersonalModel(
     events: DoseEvent[],
     state: PersonalModelState,
     labResult: LabResult,
-    prevLabTimeH?: number
+    prevLabTimeH?: number,
+    endo?: EndogenousE2Context
 ): { newState: PersonalModelState; diagnostics: EKFDiagnostics } {
     const hasDoseBeforeLab = events.some((ev) =>
         ev.timeH <= labResult.timeH &&
@@ -288,11 +297,16 @@ export function ekfUpdatePersonalModel(
         // Accumulate baseline estimates using an online mean so multiple pre-dose
         // labs all contribute. Use observationCount (total, not post-dose) as the
         // running count of pre-dose observations already accumulated.
+        // With the testosterone model, a "pre-dose" lab may already sit on a
+        // partially suppressed axis (e.g. an anti-androgen started before E2),
+        // so normalise it back to the pre-treatment baseline: B = obs / f(t).
+        const fracAtLab = endo ? Math.max(endo.fractionAt(labResult.timeH), 0.05) : 1;
+        const obsBaseline = obsPGmL / fracAtLab;
         const prevBaseline = state.baselinePGmL ?? 0;
         const prevCount = state.observationCount;
         const newBaselinePGmL = prevCount === 0
-            ? obsPGmL
-            : (prevBaseline * prevCount + obsPGmL) / (prevCount + 1);
+            ? obsBaseline
+            : (prevBaseline * prevCount + obsBaseline) / (prevCount + 1);
 
         const baselineState: PersonalModelState = {
             ...state,
@@ -328,9 +342,9 @@ export function ekfUpdatePersonalModel(
     // Without this correction the baseline would be absorbed into theta (biasing
     // PK parameters upward) and then added again in computeSimulationWithCI,
     // causing a double-count of the endogenous contribution.
-    const baseline = (state.baselinePGmL !== undefined && Number.isFinite(state.baselinePGmL))
-        ? Math.max(0, state.baselinePGmL)
-        : 0;
+    // With the testosterone model the endogenous part is time-varying (it fades
+    // as T is suppressed); without it this is the legacy constant baseline.
+    const baseline = resolveEndogenousE2(state.baselinePGmL, labResult.timeH, endo);
     const obsDrugPGmL = Math.max(obsPGmL - baseline, EKF_EPS);
     const y = Math.log(obsDrugPGmL);
 
@@ -439,14 +453,15 @@ export interface PersonalSnapshot {
  */
 export function replayPersonalModelTimeline(
     events: DoseEvent[],
-    labResults: LabResult[]
+    labResults: LabResult[],
+    endo?: EndogenousE2Context
 ): PersonalSnapshot[] {
     let state = initPersonalModel();
     const sorted = [...labResults].sort((a, b) => a.timeH - b.timeH);
     const snapshots: PersonalSnapshot[] = [{ timeH: -Infinity, state }];
     for (let i = 0; i < sorted.length; i++) {
         const prevTimeH = i > 0 ? sorted[i - 1].timeH : undefined;
-        const { newState } = ekfUpdatePersonalModel(events, state, sorted[i], prevTimeH);
+        const { newState } = ekfUpdatePersonalModel(events, state, sorted[i], prevTimeH, endo);
         state = newState;
         snapshots.push({ timeH: sorted[i].timeH, state });
     }
@@ -461,9 +476,10 @@ export function replayPersonalModelTimeline(
  */
 export function replayPersonalModel(
     events: DoseEvent[],
-    labResults: LabResult[]
+    labResults: LabResult[],
+    endo?: EndogenousE2Context
 ): PersonalModelState {
-    const timeline = replayPersonalModelTimeline(events, labResults);
+    const timeline = replayPersonalModelTimeline(events, labResults, endo);
     return timeline[timeline.length - 1].state;
 }
 
@@ -524,7 +540,13 @@ export function computeSimulationWithCI(
     labResults: LabResult[] = [],
     calibrationModel: CalibrationModel = 'ekf',
     applyCPAInhibitionToE2: boolean = false,
-    calibrationMode: CalibrationMode = 'retrospective'
+    calibrationMode: CalibrationMode = 'retrospective',
+    /**
+     * Fast path for the inner E2/T coupling iterations: only `e2DrugPersonal`
+     * is needed, evaluated every `strideH` hours and linearly interpolated
+     * (the T turnover model, t½ ≈ 48 h, does not resolve finer structure).
+     */
+    fast?: { drugOnly: true; strideH: number }
 ): {
     timeH: number[];
     e2Adjusted: number[];
@@ -532,6 +554,16 @@ export function computeSimulationWithCI(
     ci95High: number[];
     ci68Low: number[];
     ci68High: number[];
+    /** Personalised DRUG part of E2 (point estimate, no endogenous E2) — drives the coupled T model. */
+    e2DrugPersonal: number[];
+    /** Posterior mean of the endogenous E2 contribution included in e2Adjusted. */
+    endogenousMean: number[];
+    /**
+     * Causal mode: times at which the personalised curves change state (E2 lab
+     * times and T calibration updates). Read the arrays with
+     * interpolateNoCross so no value mixes pre- and post-update states.
+     */
+    updateTimesH: number[];
     antiandrogen: Partial<Record<Ester, { adjusted: number[]; ci95Low: number[]; ci95High: number[] }>>;
 } {
     const n = sim.timeH.length;
@@ -543,6 +575,9 @@ export function computeSimulationWithCI(
             ci95High: [],
             ci68Low: [],
             ci68High: [],
+            e2DrugPersonal: [],
+            endogenousMean: [],
+            updateTimesH: [],
             antiandrogen: {},
         };
     }
@@ -552,15 +587,17 @@ export function computeSimulationWithCI(
     // snapshot timeline), so adding later labs or doses never rewrites the past.
     // In `retrospective` mode the resolver always returns the final learned
     // `state`, i.e. the whole curve is re-fit from hindsight (legacy behaviour).
+    // Endogenous E2: the simulation carries a testosterone series only when the
+    // testosterone model is on; then the baseline fades with T suppression.
+    const endo = makeEndogenousE2Context(sim);
     const timeline = calibrationMode === 'causal'
-        ? replayPersonalModelTimeline(events, labResults)
+        ? replayPersonalModelTimeline(events, labResults, endo)
         : null;
     const resolveState = makeSnapshotResolver(timeline, state);
-    // Baseline endogenous E2 from pre-dose calibration; 0 if none available.
-    const baselineOf = (st: PersonalModelState): number =>
-        (st.baselinePGmL !== undefined && Number.isFinite(st.baselinePGmL))
-            ? Math.max(0, st.baselinePGmL)
-            : 0;
+    // Endogenous E2 at `timeH`: the pre-dose-lab baseline (0 if none, unless the
+    // testosterone model supplies a population default), scaled by T(t)/T0.
+    const baselineOf = (st: PersonalModelState, timeH: number): number =>
+        resolveEndogenousE2(st.baselinePGmL, timeH, endo);
 
     const clampCI = (low: number, high: number, hardMax: number): [number, number] => {
         const lo = Number.isFinite(low) ? Math.max(0, low) : 0;
@@ -568,11 +605,22 @@ export function computeSimulationWithCI(
         return [Math.min(lo, hardMax), Math.min(hi, hardMax)];
     };
 
-    const e2Adjusted = new Array<number>(n);
-    const ci95Low = new Array<number>(n);
-    const ci95High = new Array<number>(n);
-    const ci68Low = new Array<number>(n);
-    const ci68High = new Array<number>(n);
+    // Each calibration model yields the DRUG part of E2 as a lognormal-ish
+    // posterior: a point estimate (`drugCenter`), the log-median and log-SD of
+    // its band, plus the lab-derived endogenous baseline B (undefined = none).
+    // The endogenous part is combined afterwards, in one place, so its
+    // uncertainty is propagated identically for every model.
+    const drugCenter = new Array<number>(n);
+    const drugLnMid = new Array<number>(n);
+    const drugSd = new Array<number>(n);
+    const labBaseline = new Array<number | undefined>(n);
+    const labBaselineOf = (v: number | undefined): number | undefined =>
+        (v !== undefined && Number.isFinite(v) && v > 0) ? v : undefined;
+    // Grid indices to evaluate: all, or a stride for the fast coupling pass.
+    const idx: number[] = [];
+    for (let i = 0; i < n; i++) {
+        if (!fast || i === 0 || i === n - 1 || sim.timeH[i] - sim.timeH[idx[idx.length - 1]] >= fast.strideH) idx.push(i);
+    }
 
     if (calibrationModel === 'ou-kalman') {
         // Causal → forward filter only; retrospective → forward + RTS smoother.
@@ -586,32 +634,17 @@ export function computeSimulationWithCI(
             labResults,
             OU_DEFAULT_PARAMS,
             calibrationMode === 'causal' ? 'forward' : 'smooth',
-            { baselineAt: (timeH: number) => baselineOf(resolveState(timeH)) }
+            { baselineAt: (timeH: number) => baselineOf(resolveState(timeH), timeH) }
         );
 
-        for (let i = 0; i < n; i++) {
-            const baselinePGmL = baselineOf(resolveState(sim.timeH[i]));
+        for (const i of idx) {
             const c0 = Math.max(sim.concPGmL_E2[i], EKF_EPS);
             const mean = ou.m[i];
-            const std = Math.sqrt(Math.max(0, ou.P[i]));
-
-            e2Adjusted[i] = Math.min(baselinePGmL + c0 * Math.exp(mean + 0.5 * ou.P[i]), EKF_CI_MAX_E2);
-
-            const [lo95, hi95] = clampCI(
-                baselinePGmL + c0 * Math.exp(mean - 1.96 * std),
-                baselinePGmL + c0 * Math.exp(mean + 1.96 * std),
-                EKF_CI_MAX_E2
-            );
-            ci95Low[i] = lo95;
-            ci95High[i] = hi95;
-
-            const [lo68, hi68] = clampCI(
-                baselinePGmL + c0 * Math.exp(mean - std),
-                baselinePGmL + c0 * Math.exp(mean + std),
-                EKF_CI_MAX_E2
-            );
-            ci68Low[i] = lo68;
-            ci68High[i] = hi68;
+            const P = Math.max(0, ou.P[i]);
+            labBaseline[i] = labBaselineOf(resolveState(sim.timeH[i]).baselinePGmL);
+            drugCenter[i] = c0 * Math.exp(mean + 0.5 * P);
+            drugLnMid[i] = Math.log(c0) + mean;
+            drugSd[i] = Math.sqrt(P);
         }
     } else if (calibrationModel === 'hybrid-mipd') {
         // Robust MAP-Bayesian individualisation (Hybrid-MIPD): the population PK
@@ -621,38 +654,24 @@ export function computeSimulationWithCI(
         // it to the whole curve. Each fit carries its own endogenous baseline.
         const sortedEvents = [...events].sort((a, b) => a.timeH - b.timeH);
         const mipdTimeline = calibrationMode === 'causal'
-            ? fitMipdTimeline(events, labResults, MIPD_DEFAULT_PRIOR)
+            ? fitMipdTimeline(events, labResults, MIPD_DEFAULT_PRIOR, endo)
             : null;
-        const finalFit = fitMipd(events, labResults, MIPD_DEFAULT_PRIOR);
+        const finalFit = fitMipd(events, labResults, MIPD_DEFAULT_PRIOR, Infinity, endo);
         const resolveMipd = makeMipdResolver(mipdTimeline, finalFit);
 
-        for (let i = 0; i < n; i++) {
+        for (const i of idx) {
             const timeH = sim.timeH[i];
             const fit = resolveMipd(timeH);
             const pred = mipdPredict(sortedEvents, timeH, fit, GP_RESIDUAL_DEFAULT);
-            const baselinePGmL = Math.max(0, fit.baselinePGmL || 0);
             // Central line = GP-corrected MAP point prediction (the posterior
             // mode/median), the standard MIPD choice — uncertainty lives in the
             // bands, not in an upward Jensen shift of the line. This makes the
             // zero-data curve fall back exactly onto the population curve.
-            const effectiveBase = Math.max(0, pred.e2Drug) * Math.exp(pred.gpMean);
-            const sigmaTotal = Math.sqrt(Math.max(0, pred.varLogParam + pred.varLogResid + pred.varLogGp));
-
-            e2Adjusted[i] = Math.min(baselinePGmL + effectiveBase, EKF_CI_MAX_E2);
-            const [lo95, hi95] = clampCI(
-                baselinePGmL + effectiveBase * Math.exp(-1.96 * sigmaTotal),
-                baselinePGmL + effectiveBase * Math.exp(1.96 * sigmaTotal),
-                EKF_CI_MAX_E2
-            );
-            ci95Low[i] = lo95;
-            ci95High[i] = hi95;
-            const [lo68, hi68] = clampCI(
-                baselinePGmL + effectiveBase * Math.exp(-sigmaTotal),
-                baselinePGmL + effectiveBase * Math.exp(sigmaTotal),
-                EKF_CI_MAX_E2
-            );
-            ci68Low[i] = lo68;
-            ci68High[i] = hi68;
+            const effectiveBase = Math.max(EKF_EPS, Math.max(0, pred.e2Drug) * Math.exp(pred.gpMean));
+            labBaseline[i] = labBaselineOf(fit.baselinePGmL);
+            drugCenter[i] = effectiveBase;
+            drugLnMid[i] = Math.log(effectiveBase);
+            drugSd[i] = Math.sqrt(Math.max(0, pred.varLogParam + pred.varLogResid + pred.varLogGp));
         }
     } else {
         // Evaluate the personalised E2 and CI EXACTLY at every grid point — no
@@ -663,35 +682,92 @@ export function computeSimulationWithCI(
         // events change. Events are sorted once and reused across all points.
         const sortedEvents = [...events].sort((a, b) => a.timeH - b.timeH);
 
-        for (let i = 0; i < n; i++) {
+        for (const i of idx) {
             const timeH = sim.timeH[i];
             const st = resolveState(timeH);
             const theta = st.thetaMean;
             const P = st.thetaCov;
-            const baselinePGmL = baselineOf(st);
-            const e2Base = e2AtTimeWithThetaSorted(sortedEvents, timeH, theta);
-            const yhat = Math.log(Math.max(e2Base, EKF_EPS));
+            const e2Base = Math.max(e2AtTimeWithThetaSorted(sortedEvents, timeH, theta), EKF_EPS);
+            const yhat = Math.log(e2Base);
             const thetaKPlus: [number, number] = [theta[0], theta[1] + EKF_DELTA_K];
+            // Same centre formula in the fast and full paths (the Jensen term needs H1).
             const yhatPlus = Math.log(Math.max(e2AtTimeWithThetaSorted(sortedEvents, timeH, thetaKPlus), EKF_EPS));
             const H1 = (yhatPlus - yhat) / EKF_DELTA_K;
             const rawSigma2Param = P[0][0] + 2 * H1 * P[0][1] + H1 * H1 * P[1][1];
             const sigma2Param = Number.isFinite(rawSigma2Param) && rawSigma2Param > 0 ? rawSigma2Param : 0;
-            const sigmaTotal = Math.sqrt(sigma2Param + EKF_SIGMA_RESIDUAL_LOG * EKF_SIGMA_RESIDUAL_LOG);
-            e2Adjusted[i] = Math.min(baselinePGmL + e2Base * Math.exp(0.5 * sigma2Param), EKF_CI_MAX_E2);
-            const [lo95, hi95] = clampCI(
-                baselinePGmL + e2Base * Math.exp(-1.96 * sigmaTotal),
-                baselinePGmL + e2Base * Math.exp(1.96 * sigmaTotal),
+            labBaseline[i] = labBaselineOf(st.baselinePGmL);
+            drugCenter[i] = e2Base * Math.exp(0.5 * sigma2Param);
+            drugLnMid[i] = yhat;
+            drugSd[i] = Math.sqrt(sigma2Param + EKF_SIGMA_RESIDUAL_LOG * EKF_SIGMA_RESIDUAL_LOG);
+        }
+    }
+
+    if (fast) {
+        // Fill the skipped grid points by linear interpolation and return only
+        // what the coupling loop consumes.
+        for (let k = 0; k + 1 < idx.length; k++) {
+            const i0 = idx[k], i1 = idx[k + 1];
+            for (let i = i0 + 1; i < i1; i++) {
+                const w = (sim.timeH[i] - sim.timeH[i0]) / (sim.timeH[i1] - sim.timeH[i0]);
+                drugCenter[i] = drugCenter[i0] + (drugCenter[i1] - drugCenter[i0]) * w;
+            }
+        }
+        return {
+            timeH: sim.timeH, e2Adjusted: [], ci95Low: [], ci95High: [], ci68Low: [], ci68High: [],
+            e2DrugPersonal: drugCenter, endogenousMean: [], updateTimesH: [], antiandrogen: {},
+        };
+    }
+
+    const e2Adjusted = new Array<number>(n);
+    const ci95Low = new Array<number>(n);
+    const ci95High = new Array<number>(n);
+    const ci68Low = new Array<number>(n);
+    const ci68High = new Array<number>(n);
+    const endogenousMean = new Array<number>(n);
+
+    if (!endo) {
+        // Testosterone model off: legacy constant baseline, treated as known.
+        for (let i = 0; i < n; i++) {
+            const B = labBaseline[i] ?? 0;
+            endogenousMean[i] = B;
+            e2Adjusted[i] = Math.min(B + drugCenter[i], EKF_CI_MAX_E2);
+            [ci95Low[i], ci95High[i]] = clampCI(
+                B + Math.exp(drugLnMid[i] - 1.96 * drugSd[i]),
+                B + Math.exp(drugLnMid[i] + 1.96 * drugSd[i]),
                 EKF_CI_MAX_E2
             );
-            ci95Low[i] = lo95;
-            ci95High[i] = hi95;
-            const [lo68, hi68] = clampCI(
-                baselinePGmL + e2Base * Math.exp(-sigmaTotal),
-                baselinePGmL + e2Base * Math.exp(sigmaTotal),
+            [ci68Low[i], ci68High[i]] = clampCI(
+                B + Math.exp(drugLnMid[i] - drugSd[i]),
+                B + Math.exp(drugLnMid[i] + drugSd[i]),
                 EKF_CI_MAX_E2
             );
-            ci68Low[i] = lo68;
-            ci68High[i] = hi68;
+        }
+    } else {
+        // Testosterone model on: the endogenous part is uncertain (T posterior,
+        // ρ prior, B). Combine with the drug part through ONE shared batch of
+        // posterior draws (common random numbers across all time points), and
+        // read the bands off the empirical quantiles.
+        const endoS = new Array<number>(POSTERIOR_DRAWS);
+        const total = new Float64Array(POSTERIOR_DRAWS);
+        const q = (sorted: Float64Array, p: number) => {
+            const x = p * (sorted.length - 1);
+            const lo = Math.floor(x);
+            const hi = Math.min(sorted.length - 1, lo + 1);
+            return sorted[lo] + (sorted[hi] - sorted[lo]) * (x - lo);
+        };
+        for (let i = 0; i < n; i++) {
+            const t = sim.timeH[i];
+            sampleEndogenousE2(labBaseline[i], t, endo, endoS);
+            let endoSum = 0;
+            for (let s = 0; s < POSTERIOR_DRAWS; s++) {
+                endoSum += endoS[s];
+                total[s] = Math.exp(drugLnMid[i] + drugSd[i] * SHARED_DRAWS.drug[s]) + endoS[s];
+            }
+            total.sort();
+            endogenousMean[i] = endoSum / POSTERIOR_DRAWS;
+            e2Adjusted[i] = Math.min(drugCenter[i] + endogenousMean[i], EKF_CI_MAX_E2);
+            [ci95Low[i], ci95High[i]] = clampCI(q(total, 0.025), q(total, 0.975), EKF_CI_MAX_E2);
+            [ci68Low[i], ci68High[i]] = clampCI(q(total, 0.16), q(total, 0.84), EKF_CI_MAX_E2);
         }
     }
 
@@ -758,6 +834,107 @@ export function computeSimulationWithCI(
         ci95High,
         ci68Low,
         ci68High,
+        e2DrugPersonal: drugCenter,
+        endogenousMean,
+        updateTimesH: calibrationMode === 'causal'
+            ? [...new Set([...labResults.map(l => l.timeH), ...(sim.testosterone?.updateTimesH ?? [])])].sort((a, b) => a - b)
+            : [],
         antiandrogen,
     };
 }
+
+/**
+ * Coupled E2/T estimation (block-coordinate / alternating conditional MAP).
+ *
+ * The testosterone model is driven by the PERSONALISED drug E2 — the same
+ * individual parameters that produce the E2 prediction — and the E2
+ * calibration subtracts the endogenous E2 implied by that T posterior. The two
+ * blocks are alternated until the T curve stops moving (≤ `maxIterations`):
+ *   1. E2 calibration given T (all E2 labs, endogenous part from T),
+ *   2. T calibration given the personalised E2 (all T labs; ηT only when
+ *      enough post-treatment T labs exist),
+ * so both lab types constrain the shared state. E2 labs inform the E2
+ * exposure; T labs inform T sensitivity/residual and, through the endogenous
+ * part, the E2 baseline subtraction. T labs deliberately do NOT re-estimate the
+ * E2 exposure scale: with ηT free the two are not separately identifiable from
+ * sparse T data. Every step honours the same data cutoff (`calibrationMode`).
+ */
+export function computeCoupledSimulationWithCI(
+    sim: SimulationResult,
+    events: DoseEvent[],
+    state: PersonalModelState,
+    applyE2LearningToCPA: boolean,
+    labResults: LabResult[],
+    calibrationModel: CalibrationModel,
+    applyCPAInhibitionToE2: boolean,
+    calibrationMode: CalibrationMode,
+    testosterone?: TestosteroneModelOptions | null,
+    maxIterations = 3,
+    tolerance = COUPLING_TOLERANCE
+): ReturnType<typeof computeSimulationWithCI> & {
+    testosterone?: TestosteroneSeries;
+    model: PersonalModelState;
+    couplingIterations: number;
+    /**
+     * max |Δ log T| between the returned T and T recomputed from the returned
+     * personalised E2 — 0 when not coupled. Below `tolerance` ⇔ the pair is a
+     * fixed point of the coupled model.
+     */
+    couplingResidual: number;
+} {
+    if (!testosterone || !sim.testosterone || state.postDoseObservationCount === 0 || sim.timeH.length === 0) {
+        const single = computeSimulationWithCI(sim, events, state, applyE2LearningToCPA, labResults,
+            calibrationModel, applyCPAInhibitionToE2, calibrationMode);
+        return { ...single, testosterone: sim.testosterone, model: state, couplingIterations: 0, couplingResidual: 0 };
+    }
+    const firstDose = [...events].filter(e => e.route !== Route.patchRemove).sort((a, b) => a.timeH - b.timeH)[0];
+    const tOpts: TestosteroneModelOptions = {
+        ...testosterone,
+        mode: calibrationMode,
+        firstDoseH: testosterone.firstDoseH ?? firstDose?.timeH,
+    };
+    const computeT = (e2: number[]) => computeTestosteroneSeries(sim.timeH, e2, sim.byCompound, tOpts);
+    const maxLogDiff = (a: TestosteroneSeries, b: TestosteroneSeries) => {
+        let d = 0;
+        for (let i = 0; i < a.values.length; i++) {
+            d = Math.max(d, Math.abs(Math.log(Math.max(a.values[i], 1e-9) / Math.max(b.values[i], 1e-9))));
+        }
+        return d;
+    };
+    const ciOf = (s: SimulationResult, m: PersonalModelState, fast?: { drugOnly: true; strideH: number }) =>
+        computeSimulationWithCI(s, events, m, applyE2LearningToCPA, labResults,
+            calibrationModel, applyCPAInhibitionToE2, calibrationMode, fast);
+    const adopt = (T: TestosteroneSeries) => {
+        current = { ...sim, testosterone: T };
+        model = replayPersonalModel(events, labResults, makeEndogenousE2Context(current));
+        iterations++;
+    };
+
+    let current: SimulationResult = sim;
+    let model = state;
+    let iterations = 0;
+
+    // Phase 1 — cheap fixed-point iterations on the strided personalised E2
+    // (identical centre formula to the full pass, only fewer grid points).
+    const fast = { drugOnly: true as const, strideH: 2 };
+    for (let k = 0; k < maxIterations; k++) {
+        const T = computeT(ciOf(current, model, fast).e2DrugPersonal);
+        const delta = maxLogDiff(T, current.testosterone!);
+        adopt(T);
+        if (delta < tolerance) break;
+    }
+
+    // Phase 2 — full resolution until the RETURNED pair is self-consistent:
+    // T recomputed from the returned E2 must match the returned T.
+    let ci = ciOf(current, model);
+    let residual = maxLogDiff(computeT(ci.e2DrugPersonal), current.testosterone!);
+    for (let k = 0; k < maxIterations && residual >= tolerance; k++) {
+        adopt(computeT(ci.e2DrugPersonal));
+        ci = ciOf(current, model);
+        residual = maxLogDiff(computeT(ci.e2DrugPersonal), current.testosterone!);
+    }
+    return { ...ci, testosterone: current.testosterone, model, couplingIterations: iterations, couplingResidual: residual };
+}
+
+/** Convergence / self-consistency tolerance of the coupled E2/T estimation (max |Δ log T|). */
+export const COUPLING_TOLERANCE = 0.005;

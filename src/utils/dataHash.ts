@@ -11,12 +11,14 @@ type HashableData = {
     themeMode?: string;
     darkMode?: boolean;
     gelProducts?: unknown[];
+    bloodReports?: unknown[];
+    regimens?: unknown[];
 };
 
 // Bump this whenever the synced field set changes. The hash is prefixed with it
 // so the sync layer can tell "data changed" apart from "hash formula changed"
 // (an old baseline hash with a different prefix must NOT be read as a local edit).
-export const SYNC_HASH_SCHEMA = 'v4';
+export const SYNC_HASH_SCHEMA = 'v5';
 
 /**
  * Canonical projection of the synced fields to their default values. Shared by
@@ -50,6 +52,8 @@ export const projectForSync = (data: Partial<HashableData>): Record<string, unkn
     // very same setting would hash differently and raise a phantom conflict.
     // It is still persisted and uploaded for older clients - just not compared.
     gelProducts: data.gelProducts || [],
+    bloodReports: data.bloodReports || [],
+    regimens: data.regimens || [],
 });
 
 const stableStringify = (value: unknown): string => {

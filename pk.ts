@@ -1,4 +1,4 @@
-import { Route, Ester, ExtraKey, type DoseEvent, type DoseEventExtras, type SimulationResult, type ConcUnit } from './types';
+import { Route, Ester, ExtraKey, type DoseEvent, type DoseEventExtras, type SimulationResult, type ConcUnit, type TestosteroneSeries } from './types';
 
 /**
  * Route-specific metadata for transdermal gel absorption.
@@ -476,6 +476,710 @@ export const BICA_PK = {
 };
 
 /**
+ * Spironolactone (SPL / 螺內酯) apparent one-compartment oral PK constants.
+ *
+ * Spironolactone itself is cleared within hours (t½ ≈ 1.4 h); its sustained
+ * anti-androgen / anti-mineralocorticoid activity comes from the active
+ * metabolites canrenone and 7α-thiomethylspironolactone. The tracked analyte is
+ * therefore CANRENONE, modeled with apparent first-order formation (`ka`, which
+ * lumps absorption + metabolic conversion) and elimination. Dose is entered as
+ * spironolactone mg; `vOverF` is the apparent canrenone volume per mg of parent
+ * dose, so the conversion fraction is folded into it.
+ *
+ * Targets used for the calibration (Aldactone label, 100 mg/day × 15 days, fed):
+ * - canrenone Tmax ≈ 4.3 h (model: ≈ 4.0 h at steady state, ≈ 4.8 h single dose)
+ * - canrenone Cmax ≈ 181 ng/mL at steady state
+ * - canrenone t½ ≈ 16.5 h
+ *
+ * `vOverF` is an ABSOLUTE apparent volume (L), not per-kg.
+ */
+export const SPL_PK = {
+    ka: 0.60,                       // h^-1  apparent canrenone formation
+    ke: Math.log(2) / 16.5,         // h^-1  (canrenone t½ ≈ 16.5 h)
+    vOverF: 737,                    // L     (apparent canrenone V/F per parent mg)
+    popLogVar: 0.12,                // ≈ 35% CV population PK uncertainty
+};
+
+/**
+ * Endogenous testosterone (HPG axis) model — "t-suppression-v1".
+ *
+ * Why it exists: in an untreated AMAB body most circulating E2 (≈ 20–30 pg/mL)
+ * is made by aromatising testosterone. That background E2 is NOT constant once
+ * HRT starts — exogenous estradiol and anti-androgens suppress LH and therefore
+ * testosterone, so the aromatised E2 fades too. Treating the pre-treatment
+ * baseline as a constant offset over-predicts E2 on suppressive regimens (and
+ * the EKF then mis-attributes that bias to the PK parameters). This model makes
+ * the endogenous E2 baseline time-varying: E2_endo(t) = B · T(t) / T0.
+ *
+ * Structure (indirect-response turnover with Emax drug effects):
+ *   T_target(t) = T0 · (1 − I_E2) · (1 − I_CPA) · (1 − I_SPL) · (1 + S_BICA)
+ *   dT/dt       = kout · (T_target − T)
+ * where each I = Imax·C^n / (IC50^n + C^n) uses the population DRUG
+ * concentration (exogenous E2 in pg/mL, anti-androgens in ng/mL), and
+ * bicalutamide's AR blockade at the hypothalamus RAISES LH/T (stimulation S).
+ *
+ * Anchors (population priors; individual responses vary widely):
+ * - E2 monotherapy: ≈ 100 pg/mL → T ≈ 350 ng/dL, ≈ 200 → ≈ 120, ≥ 300 → < 55
+ * - CPA 10–12.5 mg/day alone suppresses T by roughly 70–80 %
+ * - spironolactone lowers T only modestly (mostly an AR antagonist)
+ * - bicalutamide monotherapy raises T (and aromatised E2) by ≈ 50 %
+ * - T falls to a new steady state over a few days (response t½ ≈ 2 d)
+ */
+export const TESTOSTERONE_MODEL = {
+    /** Default pre-treatment total testosterone (ng/dL) for display scaling. */
+    baselineNgdL: 500,
+    /** Pre-treatment endogenous E2 (pg/mL) used when no pre-dose lab exists. */
+    defaultBaselineE2PGmL: 25,
+    /** First-order response rate of T toward its target (h^-1, t½ ≈ 48 h). */
+    kout: Math.log(2) / 48,
+    e2: { Imax: 0.97, IC50: 130, n: 3 },
+    cpa: { Imax: 0.90, IC50: 5, n: 1 },
+    spl: { Imax: 0.40, IC50: 100, n: 1 },
+    bica: { Smax: 0.60, EC50: 3000, n: 1 },
+    /** Floor for the endogenous fraction (adrenal androgens never fully vanish). */
+    minFraction: 0.02,
+};
+
+/** A measured total testosterone value (from a blood report), in ng/dL. */
+export interface TestosteroneObservation {
+    timeH: number;
+    ngdL: number;
+}
+
+/**
+ * Temporal semantics shared with the E2 calibration (`CalibrationMode`):
+ * - `causal`: the estimate at time t uses only labs drawn at or before t
+ *   (forward filter) — the honest "what could be predicted then" view, and the
+ *   one to use for validating predictions.
+ * - `retrospective`: every estimate uses all labs (smoother) — the best
+ *   hindsight reconstruction; later labs DO reshape earlier estimates.
+ */
+export type TCalibrationMode = 'causal' | 'retrospective';
+
+/** Options enabling the testosterone model in {@link runSimulation}. */
+export interface TestosteroneModelOptions {
+    /** Pre-treatment total testosterone in ng/dL (fallback when no pre-treatment T lab). */
+    baselineNgdL?: number;
+    /** Measured total testosterone (blood reports). */
+    observations?: TestosteroneObservation[];
+    /** Time of the first dose (h); observations before it count as pre-treatment. */
+    firstDoseH?: number;
+    /** Data cutoff semantics; must match the E2 calibration mode. Default retrospective. */
+    mode?: TCalibrationMode;
+}
+
+/**
+ * Calibration of the T curve to measured testosterone ("t-gp-v2").
+ *
+ * log T_measured(t_i) = log T0 + δ0 + log S(t_i; ηT) + a(t_i)·u(t_i) + ε_i
+ *
+ * - δ0: the individual's offset from the assumed T0 (population default or the
+ *   user's setting), prior SD `t0SdLog*`. Constant in time, so labs drawn
+ *   BEFORE treatment mostly inform δ0 — that is how pre-treatment labs set the
+ *   personal T0. δ0 does not change T/T0.
+ * - S(t; ηT): structural response T/T0 from the turnover model; ηT scales all
+ *   suppression/stimulation potencies by exp(ηT). ηT is estimated (MAP under the
+ *   GP marginal likelihood, prior SD `etaPriorSd`) only with at least
+ *   `etaMinPostDoseLabs` post-treatment labs — with sparse data it stays 0.
+ * - a(t)·u(t): individual deviation of the RESPONSE. u is an OU process (SD
+ *   `priorSdLog`, correlation `lengthScaleH`); the amplitude
+ *   a(t) = min(1, |ln S_pop(t)| / ln 2) is 0 without drug effect and 1 once T
+ *   has moved by a factor of 2, so pre-treatment T/T0 stays exactly 1.
+ * - ε: assay + diurnal noise, SD `noiseSdLog`.
+ *
+ * `causal` evaluates every time point with only the labs drawn at or before
+ * it (exact GP on that prefix ≡ Kalman filter); `retrospective` uses all labs
+ * (smoother). Posterior variances of both log T and of the response part are
+ * returned and propagated into endogenous E2. All constants are PRIORS
+ * awaiting validation — individual HPG responses (notably to bicalutamide)
+ * vary widely.
+ */
+export const T_CALIBRATION = {
+    priorSdLog: 0.8,
+    lengthScaleH: 45 * 24,
+    noiseSdLog: 0.2,
+    t0SdLogPopulation: 0.35,
+    t0SdLogSetting: 0.15,
+    /** Bounds on the multiplicative correction exp(r). */
+    minRatio: 0.05,
+    maxRatio: 20,
+    etaPriorSd: 0.5,
+    etaMinPostDoseLabs: 2,
+    etaBounds: [-2.5, 2.5] as [number, number],
+};
+
+/**
+ * Endogenous (non-drug) E2 model: E2_endo(t) = B · (ρ · T(t)/T0 + (1 − ρ)).
+ *
+ * ρ is the share of the pre-treatment endogenous E2 assumed to track total T
+ * (aromatisation of T and LH-driven testicular secretion); the remainder
+ * (e.g. aromatised adrenal androstenedione) is held constant. Neither the
+ * proportionality nor ρ is established for every individual, so ρ is a PRIOR
+ * that is never fitted — its uncertainty (logit-normal) is propagated instead.
+ * B comes from pre-treatment E2 labs when present (with a small lab SD),
+ * otherwise from a wide population prior. With sparse data the model therefore
+ * never estimates B, ρ and the T↔E2 conversion all at once.
+ */
+export const ENDOGENOUS_E2 = {
+    coupledShareMedian: 0.75,
+    coupledShareSdLogit: 1.0,
+    baselineDefaultPGmL: 25,
+    baselineDefaultSdLog: 0.4,
+    baselineLabSdLog: 0.15,
+};
+
+const hillEffect = (c: number, emax: number, c50: number, n: number): number => {
+    if (!(c > 0)) return 0;
+    const cn = Math.pow(c, n);
+    return emax * cn / (Math.pow(c50, n) + cn);
+};
+
+/**
+ * Steady-state testosterone fraction T_target/T0 for the given instantaneous
+ * drug exposure. `etaT` scales every potency by exp(etaT) (individual HPG
+ * sensitivity). Exported for tests and for explaining the model in the UI.
+ */
+export function testosteroneTargetFraction(
+    e2DrugPGmL: number,
+    aaNgML: Partial<Record<Ester, number>> = {},
+    etaT = 0
+): number {
+    const m = TESTOSTERONE_MODEL;
+    const k = Math.exp(etaT);
+    const iE2 = hillEffect(e2DrugPGmL, m.e2.Imax, m.e2.IC50 * k, m.e2.n);
+    const iCPA = hillEffect(aaNgML[Ester.CPA] ?? 0, m.cpa.Imax, m.cpa.IC50 * k, m.cpa.n);
+    const iSPL = hillEffect(aaNgML[Ester.SPL] ?? 0, m.spl.Imax, m.spl.IC50 * k, m.spl.n);
+    const sBICA = hillEffect(aaNgML[Ester.BICA] ?? 0, m.bica.Smax, m.bica.EC50 * k, m.bica.n);
+    const f = (1 - iE2) * (1 - iCPA) * (1 - iSPL) * (1 + sBICA);
+    return Math.max(m.minFraction, f);
+}
+
+/** Hill term specialised for the integer exponents used (avoids Math.pow in the hot loop). */
+const hillFast = (c: number, emax: number, c50: number, n: number): number => {
+    if (!(c > 0)) return 0;
+    const cn = n === 1 ? c : n === 3 ? c * c * c : Math.pow(c, n);
+    const kn = n === 1 ? c50 : n === 3 ? c50 * c50 * c50 : Math.pow(c50, n);
+    return emax * cn / (kn + cn);
+};
+
+/**
+ * Integrate the T/T0 turnover ODE (exact step for piecewise-constant targets)
+ * on the grid, or — with `strideH` — on a subsampled grid whose points are at
+ * least `strideH` apart (used by the ηT optimiser; T has t½ ≈ 48 h). Returns
+ * the evaluated times and values.
+ */
+function integrateTFraction(
+    timeH: number[],
+    e2PGmL: number[],
+    byCompound: SimulationResult['byCompound'],
+    etaT: number,
+    strideH = 0
+): { t: number[]; v: number[] } {
+    const m = TESTOSTERONE_MODEL;
+    const k = Math.exp(etaT);
+    const cpa = byCompound[Ester.CPA]?.values;
+    const spl = byCompound[Ester.SPL]?.values;
+    const bica = byCompound[Ester.BICA]?.values;
+    const e2c = m.e2.IC50 * k, cpac = m.cpa.IC50 * k, splc = m.spl.IC50 * k, bicac = m.bica.EC50 * k;
+    const ts: number[] = [];
+    const vs: number[] = [];
+    let frac = 1;
+    let lastT = -Infinity;
+    const n = timeH.length;
+    for (let i = 0; i < n; i++) {
+        const t = timeH[i];
+        if (strideH > 0 && i !== 0 && i !== n - 1 && t - lastT < strideH) continue;
+        const f = (1 - hillFast(e2PGmL[i] ?? 0, m.e2.Imax, e2c, m.e2.n))
+            * (1 - hillFast(cpa ? cpa[i] : 0, m.cpa.Imax, cpac, m.cpa.n))
+            * (1 - hillFast(spl ? spl[i] : 0, m.spl.Imax, splc, m.spl.n))
+            * (1 + hillFast(bica ? bica[i] : 0, m.bica.Smax, bicac, m.bica.n));
+        const target = Math.max(m.minFraction, f);
+        if (ts.length > 0) frac = target + (frac - target) * Math.exp(-m.kout * Math.max(0, t - lastT));
+        ts.push(t);
+        vs.push(frac);
+        lastT = t;
+    }
+    return { t: ts, v: vs };
+}
+
+/** Cholesky factor of a small symmetric positive-definite matrix. */
+function cholesky(A: number[][]): number[][] {
+    const n = A.length;
+    const L = A.map(row => row.map(() => 0));
+    for (let i = 0; i < n; i++) {
+        for (let j = 0; j <= i; j++) {
+            let sum = A[i][j];
+            for (let k = 0; k < j; k++) sum -= L[i][k] * L[j][k];
+            L[i][j] = i === j ? Math.sqrt(Math.max(sum, 1e-12)) : sum / L[j][j];
+        }
+    }
+    return L;
+}
+
+/** Solve (L Lᵀ) x = b given the Cholesky factor L. */
+function cholSolve(L: number[][], b: number[]): number[] {
+    const n = b.length;
+    const y = new Array<number>(n).fill(0);
+    for (let i = 0; i < n; i++) {
+        let sum = b[i];
+        for (let k = 0; k < i; k++) sum -= L[i][k] * y[k];
+        y[i] = sum / L[i][i];
+    }
+    const x = new Array<number>(n).fill(0);
+    for (let i = n - 1; i >= 0; i--) {
+        let sum = y[i];
+        for (let k = i + 1; k < n; k++) sum -= L[k][i] * x[k];
+        x[i] = sum / L[i][i];
+    }
+    return x;
+}
+
+/** Response-deviation amplitude a(t) from the population structural fraction. */
+export const responseAmplitude = (structFrac: number): number =>
+    Math.min(1, Math.abs(Math.log(Math.max(structFrac, 1e-9))) / Math.LN2);
+
+export interface TGPResult {
+    /** Posterior mean / variance of the response deviation a(t)·u(t) (affects T/T0). */
+    rMean: number[];
+    rVar: number[];
+    /** Posterior mean / variance of δ0 + a(t)·u(t) (absolute log T vs. the structural curve). */
+    totalMean: number[];
+    totalVar: number[];
+}
+
+/** A GP conditioned on a fixed set of observations; evaluates at any (t, a(t)). */
+interface TGPPosterior {
+    at: (t: number, a: number) => { rMean: number; rVar: number; totalMean: number; totalVar: number };
+}
+
+/**
+ * Condition the T-calibration GP (see T_CALIBRATION) on observations with log
+ * residuals `y` and response amplitudes `obsAmp`. With no observations the
+ * prior is returned.
+ */
+function conditionTGP(obsTimes: number[], y: number[], obsAmp: number[], t0SdLog: number, p = T_CALIBRATION): TGPPosterior {
+    const s2 = p.priorSdLog * p.priorSdLog;
+    const d2 = t0SdLog * t0SdLog;
+    const e2 = p.noiseSdLog * p.noiseSdLog;
+    const lo = Math.log(p.minRatio), hi = Math.log(p.maxRatio);
+    const clamp = (v: number) => Math.min(hi, Math.max(lo, v));
+    const k = obsTimes.length;
+    const kr = (ta: number, aa: number, tb: number, ab: number) => aa * ab * s2 * Math.exp(-Math.abs(ta - tb) / p.lengthScaleH);
+    if (k === 0) {
+        return { at: (_t, a) => ({ rMean: 0, rVar: a * a * s2, totalMean: 0, totalVar: a * a * s2 + d2 }) };
+    }
+    const L = cholesky(Array.from({ length: k }, (_, i) => Array.from({ length: k }, (_, j) =>
+        kr(obsTimes[i], obsAmp[i], obsTimes[j], obsAmp[j]) + d2 + (i === j ? e2 : 0))));
+    const alpha = cholSolve(L, y);
+    return {
+        at: (t, a) => {
+            const cr = obsTimes.map((ot, i) => kr(t, a, ot, obsAmp[i]));
+            const ct = cr.map(c => c + d2);
+            let mr = 0, mt = 0;
+            for (let i = 0; i < k; i++) { mr += cr[i] * alpha[i]; mt += ct[i] * alpha[i]; }
+            const wr = cholSolve(L, cr), wt = cholSolve(L, ct);
+            let qr = 0, qt = 0;
+            for (let i = 0; i < k; i++) { qr += cr[i] * wr[i]; qt += ct[i] * wt[i]; }
+            const priorR = a * a * s2;
+            return {
+                rMean: clamp(mr), totalMean: clamp(mt),
+                rVar: Math.max(0, priorR - qr),
+                totalVar: Math.max(1e-6, priorR + d2 - qt),
+            };
+        },
+    };
+}
+
+/**
+ * GP posterior of the T calibration terms on `times` for FIXED residuals `y`.
+ * `causal` conditions each time on the observations at or before it.
+ * (The series builder re-derives residuals per update — see
+ * computeTestosteroneSeries; this helper is the plain GP, kept for tests.)
+ */
+export function testosteroneGP(
+    obsTimes: number[],
+    y: number[],
+    obsAmp: number[],
+    times: number[],
+    amp: number[],
+    t0SdLog: number,
+    mode: TCalibrationMode = 'retrospective',
+    p = T_CALIBRATION
+): TGPResult {
+    const order = obsTimes.map((_, i) => i).sort((a, b) => obsTimes[a] - obsTimes[b]);
+    const ot = order.map(i => obsTimes[i]), oy = order.map(i => y[i]), oa = order.map(i => obsAmp[i]);
+    const cache = new Map<number, TGPPosterior>();
+    const post = (k: number) => {
+        let g = cache.get(k);
+        if (!g) { g = conditionTGP(ot.slice(0, k), oy.slice(0, k), oa.slice(0, k), t0SdLog, p); cache.set(k, g); }
+        return g;
+    };
+    const out: TGPResult = { rMean: [], rVar: [], totalMean: [], totalVar: [] };
+    times.forEach((t, q) => {
+        let k = ot.length;
+        if (mode === 'causal') { k = 0; while (k < ot.length && ot[k] <= t) k++; }
+        const r = post(k).at(t, amp[q]);
+        out.rMean.push(r.rMean); out.rVar.push(r.rVar); out.totalMean.push(r.totalMean); out.totalVar.push(r.totalVar);
+    });
+    return out;
+}
+
+/** −2·log posterior (up to constants) of ηT under the GP marginal likelihood. */
+function etaObjective(obsTimes: number[], y: number[], obsAmp: number[], t0SdLog: number, eta: number, p = T_CALIBRATION): number {
+    const n = obsTimes.length;
+    const s2 = p.priorSdLog * p.priorSdLog, d2 = t0SdLog * t0SdLog, e2 = p.noiseSdLog * p.noiseSdLog;
+    const A = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) =>
+        obsAmp[i] * obsAmp[j] * s2 * Math.exp(-Math.abs(obsTimes[i] - obsTimes[j]) / p.lengthScaleH) + d2 + (i === j ? e2 : 0)));
+    const alpha = cholSolve(cholesky(A), y);
+    let quad = 0;
+    for (let i = 0; i < n; i++) quad += y[i] * alpha[i];
+    return quad + (eta * eta) / (p.etaPriorSd * p.etaPriorSd);
+}
+
+interface EtaFit { eta: number; sd: number; estimated: boolean; }
+
+/**
+ * MAP of ηT (golden section; each evaluation integrates the T ODE) with a
+ * Laplace SD from a numerical second derivative. Returns the prior
+ * (0, etaPriorSd) with fewer than `etaMinPostDoseLabs` post-treatment labs.
+ */
+function fitEtaT(
+    obs: TestosteroneObservation[],
+    firstDoseH: number,
+    structAt: (eta: number) => (t: number) => number,
+    obsAmp: number[],
+    T0: number,
+    t0SdLog: number,
+    p = T_CALIBRATION
+): EtaFit {
+    const postDose = obs.filter(o => o.timeH >= firstDoseH).length;
+    if (postDose < p.etaMinPostDoseLabs) return { eta: 0, sd: p.etaPriorSd, estimated: false };
+    const times = obs.map(o => o.timeH);
+    const J = (eta: number) => {
+        const f = structAt(eta);
+        return etaObjective(times, obs.map(o => Math.log(o.ngdL / Math.max(f(o.timeH) * T0, 1e-6))), obsAmp, t0SdLog, eta, p);
+    };
+    let [a, b] = p.etaBounds;
+    const g = (Math.sqrt(5) - 1) / 2;
+    let c = b - g * (b - a), d = a + g * (b - a);
+    let fc = J(c), fd = J(d);
+    for (let it = 0; it < 28; it++) {
+        if (fc < fd) { b = d; d = c; fd = fc; c = b - g * (b - a); fc = J(c); }
+        else { a = c; c = d; fc = fd; d = a + g * (b - a); fd = J(d); }
+    }
+    const eta = (a + b) / 2;
+    const h = 0.05;
+    const second = (J(eta + h) - 2 * J(eta) + J(eta - h)) / (h * h);
+    const sd = second > 1e-6 ? Math.min(p.etaPriorSd, Math.sqrt(2 / second)) : p.etaPriorSd;
+    return { eta, sd, estimated: true };
+}
+
+/** One evaluated point of the calibrated T posterior. */
+interface TPoint {
+    values: number;
+    tFraction: number;
+    logSd: number;
+    fractionLogSd: number;
+    endogenousFraction: number;
+}
+const T_POINT_FIELDS = ['values', 'tFraction', 'logSd', 'fractionLogSd', 'endogenousFraction'] as const;
+export type TSeriesField = typeof T_POINT_FIELDS[number];
+
+/**
+ * Build the endogenous testosterone series on a simulation grid.
+ *
+ * `e2PGmL` is the E2 exposure driving suppression — the population drug curve
+ * from runSimulation, or the PERSONALISED drug curve when called from the
+ * coupled E2/T estimation (computeCoupledSimulationWithCI), so both predictions
+ * share the same individual parameters.
+ *
+ * Calibration is organised in SEGMENTS between update times (distinct T lab
+ * times). In segment k the state is: labs visible = those drawn at or before
+ * the segment start; ηT refit on exactly those labs; ALL visible residuals
+ * recomputed against that ηT's structural curve; GP conditioned on them.
+ * Causal mode has one segment per update; retrospective mode a single
+ * segment containing every lab — the same code path, so both agree once all
+ * labs are visible. Exact values on both sides of every update are stored as
+ * knots, and all readers interpolate only WITHIN a segment
+ * (interpolateTSeries), so no value ever mixes pre- and post-update states.
+ */
+export function computeTestosteroneSeries(
+    timeH: number[],
+    e2PGmL: number[],
+    byCompound: SimulationResult['byCompound'],
+    opts: TestosteroneModelOptions = {}
+): TestosteroneSeries {
+    const mode: TCalibrationMode = opts.mode ?? 'retrospective';
+    const P = T_CALIBRATION;
+    const observations = (opts.observations ?? [])
+        .filter(o => Number.isFinite(o.timeH) && Number.isFinite(o.ngdL) && o.ngdL > 0)
+        .sort((a, b) => a.timeH - b.timeH);
+    const firstDoseH = opts.firstDoseH ?? Infinity;
+    const hasSetting = typeof opts.baselineNgdL === 'number' && Number.isFinite(opts.baselineNgdL) && opts.baselineNgdL > 0;
+    const T0 = hasSetting ? opts.baselineNgdL! : TESTOSTERONE_MODEL.baselineNgdL;
+    const t0SdLog = hasSetting ? P.t0SdLogSetting : P.t0SdLogPopulation;
+    const n = timeH.length;
+
+    const cache = new Map<number, number[]>();
+    const trajectory = (eta: number): number[] => {
+        const key = Math.round(eta * 1e6) / 1e6;
+        let tr = cache.get(key);
+        if (!tr) { tr = integrateTFraction(timeH, e2PGmL, byCompound, key).v; cache.set(key, tr); }
+        return tr;
+    };
+    // Continuous in t for a fixed ηT (no calibration state inside) → safe to interpolate.
+    const trajAt = (eta: number, t: number) => interpolateSeries(timeH, trajectory(eta), t) ?? 1;
+    const explore = (eta: number) => {
+        const r = integrateTFraction(timeH, e2PGmL, byCompound, eta, 2);
+        return (t: number) => interpolateSeries(r.t, r.v, t) ?? 1;
+    };
+    const popFrac = trajectory(0);
+    const amp = popFrac.map(responseAmplitude);
+    const ampAt = (t: number) => interpolateSeries(timeH, amp, t) ?? 0;
+    const obsAmp = observations.map(o => ampAt(o.timeH));
+
+    // Update times and the number of labs visible in each segment.
+    const updateTimesH: number[] = [];
+    const visibleCounts: number[] = [0];
+    if (mode === 'causal') {
+        for (let i = 0; i < observations.length; i++) {
+            const t = observations[i].timeH;
+            if (updateTimesH.length === 0 || updateTimesH[updateTimesH.length - 1] !== t) updateTimesH.push(t);
+            visibleCounts[updateTimesH.length] = i + 1;
+        }
+    } else {
+        visibleCounts[0] = observations.length;
+    }
+
+    interface Segment { fit: EtaFit; gp: TGPPosterior; }
+    const segments: Segment[] = visibleCounts.map(m => {
+        const vis = observations.slice(0, m);
+        const visAmp = obsAmp.slice(0, m);
+        const fit = fitEtaT(vis, firstDoseH, explore, visAmp, T0, t0SdLog);
+        // Residuals of ALL visible labs against THIS segment's structural curve.
+        const y = vis.map(o => Math.log(o.ngdL / Math.max(trajAt(fit.eta, o.timeH) * T0, 1e-6)));
+        return { fit, gp: conditionTGP(vis.map(o => o.timeH), y, visAmp, t0SdLog) };
+    });
+    const segmentOf = (t: number) => {
+        let k = 0;
+        while (k < updateTimesH.length && updateTimesH[k] <= t) k++;
+        return k;
+    };
+
+    const rhoMean = ENDOGENOUS_E2_RHO_MEAN;
+    const h = 0.05;
+    const evalPoint = (seg: Segment, t: number, structFrac: number, a: number, dLogS: number): TPoint => {
+        const r = seg.gp.at(t, a);
+        const etaVar = dLogS * dLogS * seg.fit.sd * seg.fit.sd;
+        const vf = r.rVar + etaVar;
+        const tFraction = structFrac * Math.exp(r.rMean);
+        return {
+            values: T0 * structFrac * Math.exp(r.totalMean),
+            tFraction,
+            logSd: Math.sqrt(r.totalVar + etaVar),
+            fractionLogSd: Math.sqrt(vf),
+            // Mean endogenous multiplier E[ρ]·E[T/T0] + (1 − E[ρ]), lognormal mean.
+            endogenousFraction: rhoMean * tFraction * Math.exp(0.5 * vf) + (1 - rhoMean),
+        };
+    };
+    const evalAt = (k: number, t: number): TPoint => {
+        const seg = segments[k];
+        const eta = seg.fit.eta;
+        const dLogS = (Math.log(trajAt(eta + h, t)) - Math.log(trajAt(eta - h, t))) / (2 * h);
+        return evalPoint(seg, t, trajAt(eta, t), ampAt(t), dLogS);
+    };
+
+    const series = {
+        values: new Array<number>(n), tFraction: new Array<number>(n), logSd: new Array<number>(n),
+        fractionLogSd: new Array<number>(n), endogenousFraction: new Array<number>(n),
+    };
+    for (let i = 0; i < n; i++) {
+        const k = segmentOf(timeH[i]);
+        const seg = segments[k];
+        const eta = seg.fit.eta;
+        const dLogS = (Math.log(trajectory(eta + h)[i]) - Math.log(trajectory(eta - h)[i])) / (2 * h);
+        const pt = evalPoint(seg, timeH[i], trajectory(eta)[i], amp[i], dLogS);
+        for (const f of T_POINT_FIELDS) series[f][i] = pt[f];
+    }
+    // Exact values on both sides of each update: before = previous segment's
+    // state at the update time, after = the new segment's state.
+    const knotsBefore = updateTimesH.map((u, j) => evalAt(j, u));
+    const knotsAfter = updateTimesH.map((u, j) => evalAt(j + 1, u));
+
+    // Personal T0 actually implied by the data: T0·exp(E[δ0]) at the first grid
+    // point without drug effect, from the final segment.
+    const preIdx = amp.findIndex(x => x < 1e-6);
+    const last = segments[segments.length - 1];
+    const personalT0 = preIdx >= 0 ? T0 * Math.exp(last.gp.at(timeH[preIdx], 0).totalMean) : T0;
+    const pre = observations.filter(o => o.timeH < firstDoseH);
+    return {
+        unit: 'ng/dL',
+        baselineNgdL: personalT0,
+        baselineSource: pre.length > 0 ? 'lab' : hasSetting ? 'setting' : 'population',
+        mode,
+        ...series,
+        populationValues: popFrac.map(f => f * T0),
+        updateTimesH,
+        knotsBefore,
+        knotsAfter,
+        observationCount: observations.length,
+        postDoseObservationCount: observations.length - pre.length,
+        etaT: last.fit.eta, etaTSd: last.fit.sd, etaTEstimated: last.fit.estimated,
+    };
+}
+
+/**
+ * Read a T-series field at `hour` without ever interpolating across a
+ * calibration update: inside a segment the grid values are interpolated
+ * linearly; at a segment edge the exact knot (left limit before an update,
+ * new state at it) replaces the neighbour from the other segment.
+ */
+export function interpolateTSeries(timeH: number[], series: TestosteroneSeries, field: TSeriesField, hour: number): number | null {
+    const vals = series[field];
+    const n = timeH.length;
+    if (n === 0) return null;
+    const ups = series.updateTimesH ?? [];
+    if (ups.length === 0) return interpolateSeries(timeH, vals, hour);
+    let k = 0;
+    while (k < ups.length && ups[k] <= hour) k++;
+    const segStart = k > 0 ? ups[k - 1] : -Infinity;
+    const segEnd = k < ups.length ? ups[k] : Infinity;
+    // Bracketing grid indices.
+    let lo = -1, hi = -1;
+    if (hour <= timeH[0]) hi = 0;
+    else if (hour >= timeH[n - 1]) lo = n - 1;
+    else {
+        let a = 0, b = n - 1;
+        while (b - a > 1) { const m = (a + b) >> 1; if (timeH[m] <= hour) a = m; else b = m; }
+        lo = a; hi = b;
+    }
+    let left: [number, number] | null = null;
+    let right: [number, number] | null = null;
+    if (lo >= 0) left = timeH[lo] >= segStart ? [timeH[lo], vals[lo]] : [segStart, series.knotsAfter![k - 1][field]];
+    if (hi >= 0) right = timeH[hi] < segEnd ? [timeH[hi], vals[hi]] : [segEnd, series.knotsBefore![k][field]];
+    if (hour === segStart && k > 0) return series.knotsAfter![k - 1][field];
+    if (!left) return right![1];
+    if (!right) return left[1];
+    if (right[0] === left[0]) return left[1];
+    return left[1] + (right[1] - left[1]) * (hour - left[0]) / (right[0] - left[0]);
+}
+
+// ── Shared posterior draws (common random numbers) ──────────────────────────
+// One fixed batch of standard-normal draws is reused for every time point and
+// every consumer, so uncertainty bands are smooth in time and the endogenous
+// E2 samples are built from the SAME ρ / B / T draws everywhere.
+
+/** Deterministic PRNG (mulberry32) + Box–Muller. */
+function makeNormals(count: number, seed: number): number[] {
+    let a = seed >>> 0;
+    const rand = () => {
+        a = (a + 0x6D2B79F5) >>> 0;
+        let t = a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const out: number[] = [];
+    while (out.length < count) {
+        const u = Math.max(rand(), 1e-12), v = rand();
+        const r = Math.sqrt(-2 * Math.log(u));
+        out.push(r * Math.cos(2 * Math.PI * v), r * Math.sin(2 * Math.PI * v));
+    }
+    return out.slice(0, count);
+}
+
+export const POSTERIOR_DRAWS = 256;
+/** Independent standard normals for: drug-E2 residual, T, ρ, B. */
+export const SHARED_DRAWS = {
+    drug: makeNormals(POSTERIOR_DRAWS, 0xE2),
+    t: makeNormals(POSTERIOR_DRAWS, 0x7E57),
+    rho: makeNormals(POSTERIOR_DRAWS, 0x2B0),
+    baseline: makeNormals(POSTERIOR_DRAWS, 0xBA5E),
+};
+
+const logit = (p: number) => Math.log(p / (1 - p));
+const logistic = (x: number) => 1 / (1 + Math.exp(-x));
+/** ρ draws (logit-normal prior) — the same batch everywhere. */
+export const RHO_DRAWS = SHARED_DRAWS.rho.map(z =>
+    logistic(logit(ENDOGENOUS_E2.coupledShareMedian) + ENDOGENOUS_E2.coupledShareSdLogit * z));
+/** E[ρ] under the prior, evaluated on the shared draws (so mean and samples agree). */
+export const ENDOGENOUS_E2_RHO_MEAN = RHO_DRAWS.reduce((s, x) => s + x, 0) / RHO_DRAWS.length;
+
+/**
+ * Time-varying endogenous E2 context shared by the calibration layers (EKF,
+ * OU-Kalman, MIPD). `fractionAt(t)` is the MEAN endogenous multiplier
+ * E[ρ·T/T0 + 1 − ρ] that scales the pre-treatment baseline B; the T median and
+ * log-SD let callers draw posterior samples consistently.
+ */
+export interface EndogenousE2Context {
+    fractionAt: (timeH: number) => number;
+    tFractionAt: (timeH: number) => number;
+    tLogSdAt: (timeH: number) => number;
+    defaultBaselinePGmL: number;
+}
+
+/**
+ * Build the endogenous-E2 context from a simulation that carries a
+ * testosterone series; returns undefined (legacy constant-baseline behaviour)
+ * when the testosterone model was off.
+ */
+export function makeEndogenousE2Context(sim: SimulationResult | null | undefined): EndogenousE2Context | undefined {
+    const series = sim?.testosterone;
+    if (!sim || !series || series.endogenousFraction.length !== sim.timeH.length) return undefined;
+    const timeH = sim.timeH;
+    return {
+        fractionAt: (t: number) => interpolateTSeries(timeH, series, 'endogenousFraction', t) ?? 1,
+        tFractionAt: (t: number) => interpolateTSeries(timeH, series, 'tFraction', t) ?? 1,
+        tLogSdAt: (t: number) => interpolateTSeries(timeH, series, 'fractionLogSd', t) ?? 0,
+        defaultBaselinePGmL: ENDOGENOUS_E2.baselineDefaultPGmL,
+    };
+}
+
+/**
+ * Endogenous E2 (pg/mL, posterior mean) at `timeH`. Without a context this is
+ * the legacy constant pre-dose-lab baseline (0 when none); with one, the
+ * baseline (or the population default) times the mean endogenous multiplier.
+ */
+export function resolveEndogenousE2(
+    labBaselinePGmL: number | undefined,
+    timeH: number,
+    ctx?: EndogenousE2Context
+): number {
+    const lab = (labBaselinePGmL !== undefined && Number.isFinite(labBaselinePGmL) && labBaselinePGmL > 0)
+        ? labBaselinePGmL
+        : undefined;
+    if (!ctx) return lab ?? 0;
+    const base = lab ?? ctx.defaultBaselinePGmL;
+    const f = ctx.fractionAt(timeH);
+    return base * (Number.isFinite(f) ? Math.max(0, f) : 1);
+}
+
+/**
+ * Posterior samples of endogenous E2 at `timeH` using the shared draws:
+ * B_s · (ρ_s · (T/T0)·exp(sd_T·z_s) + 1 − ρ_s). B has a small SD when it came
+ * from pre-treatment labs and the wide population prior otherwise. Writes into
+ * `out` (length POSTERIOR_DRAWS) to avoid per-point allocation.
+ */
+export function sampleEndogenousE2(
+    labBaselinePGmL: number | undefined,
+    timeH: number,
+    ctx: EndogenousE2Context,
+    out: number[]
+): void {
+    const hasLab = labBaselinePGmL !== undefined && Number.isFinite(labBaselinePGmL) && labBaselinePGmL > 0;
+    const B = hasLab ? labBaselinePGmL! : ctx.defaultBaselinePGmL;
+    const sdB = hasLab ? ENDOGENOUS_E2.baselineLabSdLog : ENDOGENOUS_E2.baselineDefaultSdLog;
+    // Median-centred lognormal for B (its mean is used for the point estimate's scale).
+    const f = ctx.tFractionAt(timeH);
+    const sdT = ctx.tLogSdAt(timeH);
+    for (let s = 0; s < POSTERIOR_DRAWS; s++) {
+        const b = B * Math.exp(sdB * SHARED_DRAWS.baseline[s] - 0.5 * sdB * sdB);
+        const rho = RHO_DRAWS[s];
+        out[s] = b * (rho * f * Math.exp(sdT * SHARED_DRAWS.t[s]) + (1 - rho));
+    }
+}
+
+/**
  * Estradiol undecylate (EU / 十一酸雌二醇) intramuscular depot — "im-depot-v1".
  *
  * EU is a long-chain (undecanoate) ester. Its hallmark — a duration of action far
@@ -551,11 +1255,21 @@ export const ANTIANDROGENS: Partial<Record<Ester, AntiandrogenSpec>> = {
         // amount (mg) / V/F (L) -> mg/L; ×1000 -> ng/mL
         concFromAmountMG: (amountMG) => Math.max(0, (amountMG / BICA_PK.vOverF) * 1000),
     },
+    [Ester.SPL]: {
+        ester: Ester.SPL,
+        nativeUnit: 'ng/mL',
+        color: '#0ea5e9',
+        popLogVar: SPL_PK.popLogVar,
+        ciMaxNative: 2000,
+        adherenceFromE2: false,
+        // canrenone amount (mg) / V/F (L) -> mg/L; ×1000 -> ng/mL
+        concFromAmountMG: (amountMG) => Math.max(0, (amountMG / SPL_PK.vOverF) * 1000),
+    },
 };
 
 export const ANTIANDROGEN_ESTERS = Object.keys(ANTIANDROGENS) as Ester[];
 
-/** True when the ester is a tracked non-E2 anti-androgen (CPA / BICA / …). */
+/** True when the ester is a tracked non-E2 anti-androgen (CPA / BICA / SPL / …). */
 export function isAntiandrogen(ester: Ester): boolean {
     return Object.prototype.hasOwnProperty.call(ANTIANDROGENS, ester);
 }
@@ -610,7 +1324,8 @@ const EsterInfo = {
     [Ester.EN]: { name: "Estradiol Enanthate", mw: 384.56 },
     [Ester.EU]: { name: "Estradiol Undecylate", mw: 440.66 },
     [Ester.CPA]: { name: "Cyproterone Acetate", mw: 416.94 },
-    [Ester.BICA]: { name: "Bicalutamide", mw: 430.37 }
+    [Ester.BICA]: { name: "Bicalutamide", mw: 430.37 },
+    [Ester.SPL]: { name: "Spironolactone", mw: 416.57 }
 };
 
 /**
@@ -800,7 +1515,7 @@ export function resolveParams(event: DoseEvent): PKParams {
 
         case Route.oral: {
             if (isAntiandrogen(event.ester)) {
-                // Anti-androgens (CPA / bicalutamide) are dosed as raw compound
+                // Anti-androgens (CPA / bicalutamide / spironolactone) are dosed as raw compound
                 // mg and their amount is produced by their own model in
                 // PrecomputedEventModel; these params are not used for them.
                 return {
@@ -880,6 +1595,20 @@ export function bicalutamideConcNgML(events: DoseEvent[], timeH: number): number
         totalAmountMG += computeBicalutamideAmount(ev.doseMG, timeH - ev.timeH);
     }
     return spec.concFromAmountMG(totalAmountMG, 0);
+}
+
+/**
+ * Analytical single-dose oral spironolactone → canrenone amount (mg-equivalent)
+ * at elapsed time `tau` hours (apparent one-compartment formation/elimination).
+ * Dividing by `SPL_PK.vOverF` (and ×1000) yields canrenone ng/mL.
+ */
+export function computeSpironolactoneAmount(doseMG: number, tau: number): number {
+    if (tau < 0 || doseMG <= 0) return 0;
+    const { ka, ke } = SPL_PK;
+    if (Math.abs(ka - ke) < 1e-9) {
+        return Math.max(0, doseMG * ka * tau * Math.exp(-ke * tau));
+    }
+    return Math.max(0, doseMG * ka / (ka - ke) * (Math.exp(-ke * tau) - Math.exp(-ka * tau)));
 }
 
 /**
@@ -1014,6 +1743,9 @@ class PrecomputedEventModel {
                     if (event.ester === Ester.BICA) {
                         return computeBicalutamideAmount(dose, tau);
                     }
+                    if (event.ester === Ester.SPL) {
+                        return computeSpironolactoneAmount(dose, tau);
+                    }
                     return oneCompAmount(tau, dose, params);
                 };
                 break;
@@ -1111,10 +1843,24 @@ export function weightAtTimeH(sortedEvents: DoseEvent[], t: number): number {
  * `opts.endTimeH` is given — extends to at least that time. Callers that
  * display a "current" value pass now+buffer here so interpolation at the
  * current time is a real grid point instead of a frozen 14-day tail clamp.
+ *
+ * When `opts.testosterone` is given, the endogenous testosterone curve (and the
+ * derived endogenous-E2 fraction) is attached as `result.testosterone`; the
+ * drug curves themselves are unchanged.
  */
 export function runSimulation(
     events: DoseEvent[],
-    opts?: { endTimeH?: number }
+    opts?: {
+        endTimeH?: number;
+        testosterone?: TestosteroneModelOptions | null;
+        /**
+         * Calibration update times (E2 and T lab times). Each one and the instant
+         * just before it (BREAKPOINT_EPS_H earlier) are added to the grid, so the
+         * personalised curves are evaluated exactly on both sides of every update
+         * and no grid step ever contains an update strictly inside it.
+         */
+        breakpointsH?: number[];
+    }
 ): SimulationResult | null {
     if (events.length === 0) return null;
 
@@ -1155,9 +1901,23 @@ export function runSimulation(
     let auc = 0;
 
     const stepSize = (endTime - startTime) / (steps - 1);
+    const gridTimes: number[] = [];
+    for (let i = 0; i < steps; i++) gridTimes.push(startTime + i * stepSize);
+    const extra = (opts?.breakpointsH ?? [])
+        .filter(u => Number.isFinite(u) && u > startTime && u <= endTime)
+        .flatMap(u => [u - BREAKPOINT_EPS_H, u]);
+    if (extra.length > 0) {
+        gridTimes.push(...extra);
+        gridTimes.sort((a, b) => a - b);
+        // Drop near-duplicates (keep the exact breakpoint over a coincident grid point).
+        const exact = new Set(extra);
+        for (let i = gridTimes.length - 1; i > 0; i--) {
+            if (gridTimes[i] - gridTimes[i - 1] < 1e-9) gridTimes.splice(exact.has(gridTimes[i]) ? i - 1 : i, 1);
+        }
+    }
 
-    for (let i = 0; i < steps; i++) {
-        const t = startTime + i * stepSize;
+    for (let i = 0; i < gridTimes.length; i++) {
+        const t = gridTimes[i];
         let totalAmountMG_E2 = 0;
         const amountByCompound: Partial<Record<Ester, number>> = {};
 
@@ -1194,11 +1954,19 @@ export function runSimulation(
         concPGmL_CPA.push(currentConc_CPA);
 
         if (i > 0) {
-            auc += 0.5 * (currentConc + concPGmL[i - 1]) * stepSize;
+            auc += 0.5 * (currentConc + concPGmL[i - 1]) * (t - timeH[i - 1]);
         }
     }
 
-    return { timeH, concPGmL, concPGmL_E2, concPGmL_CPA, byCompound, auc };
+    const result: SimulationResult = { timeH, concPGmL, concPGmL_E2, concPGmL_CPA, byCompound, auc };
+    if (opts?.testosterone) {
+        const firstDose = sortedEvents.find(e => e.route !== Route.patchRemove);
+        result.testosterone = computeTestosteroneSeries(timeH, concPGmL_E2, byCompound, {
+            ...opts.testosterone,
+            firstDoseH: opts.testosterone.firstDoseH ?? firstDose?.timeH,
+        });
+    }
+    return result;
 }
 
 /**
@@ -1236,6 +2004,39 @@ function interpolateSeries(
     return c0 + (c1 - c0) * ratio;
 }
 
+/** Offset of the "just before the update" grid point added for each breakpoint (h ≈ 3.6 s). */
+export const BREAKPOINT_EPS_H = 0.001;
+
+/**
+ * Linear interpolation that never mixes the states on both sides of a
+ * calibration update: when an update time lies between the two bracketing grid
+ * points, the value from the grid point on the same side of the update as
+ * `hour` is held instead. Used for causal-mode personal curves read at
+ * arbitrary times (e.g. "now").
+ */
+export function interpolateNoCross(timeH: number[], values: number[], hour: number, updateTimesH: number[] = []): number | null {
+    const n = timeH.length;
+    if (n === 0) return null;
+    if (hour <= timeH[0]) return values[0];
+    if (hour >= timeH[n - 1]) return values[n - 1];
+    let a = 0, b = n - 1;
+    while (b - a > 1) { const m = (a + b) >> 1; if (timeH[m] <= hour) a = m; else b = m; }
+    let earlier = false, later = false;
+    for (const u of updateTimesH) {
+        if (u > timeH[a] && u <= hour) earlier = true;
+        if (u > hour && u <= timeH[b]) later = true;
+    }
+    // The right endpoint already contains an update after `hour` → never use it
+    // (holds the last state known at `hour`; with breakpoints on the grid this
+    // only happens within BREAKPOINT_EPS_H of the update).
+    if (later) return values[a];
+    // An update between the left endpoint and `hour`: the left value predates
+    // it, the right one is in the same state as `hour`.
+    if (earlier) return values[b];
+    const t0 = timeH[a], t1 = timeH[b];
+    return t1 === t0 ? values[a] : values[a] + (values[b] - values[a]) * (hour - t0) / (t1 - t0);
+}
+
 export function interpolateConcentration(sim: SimulationResult, hour: number): number | null {
     return interpolateSeries(sim.timeH, sim.concPGmL, hour);
 }
@@ -1260,4 +2061,21 @@ export function interpolateCompoundConcentration(
 
 export function interpolateConcentration_CPA(sim: SimulationResult, hour: number): number | null {
     return interpolateCompoundConcentration(sim, Ester.CPA, hour);
+}
+
+/** Interpolated endogenous testosterone (ng/dL), or null when the model is off. */
+export function interpolateTestosterone(sim: SimulationResult, hour: number): number | null {
+    const series = sim.testosterone;
+    if (!series) return null;
+    return interpolateTSeries(sim.timeH, series, 'values', hour);
+}
+
+/**
+ * Endogenous E2 fraction T(t)/T0 at `hour`; 1 (constant baseline, the legacy
+ * behaviour) when the simulation carries no testosterone series.
+ */
+export function endogenousFractionAt(sim: SimulationResult | null | undefined, hour: number): number {
+    const series = sim?.testosterone;
+    if (!sim || !series) return 1;
+    return interpolateTSeries(sim.timeH, series, 'endogenousFraction', hour) ?? 1;
 }

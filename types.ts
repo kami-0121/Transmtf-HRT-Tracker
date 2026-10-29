@@ -41,7 +41,10 @@ export enum Ester {
     // action is an absorption (flip-flop) effect, not slow clearance. See EU_DEPOT_PK.
     EU = "EU",
     CPA = "CPA",
-    BICA = "BICA"
+    BICA = "BICA",
+    // Spironolactone (螺內酯). Oral anti-androgen; its plasma curve is modeled via
+    // the long-lived active metabolite canrenone (see SPL_PK in pk.ts).
+    SPL = "SPL"
 }
 
 /**
@@ -149,6 +152,65 @@ export interface SimulationResult {
     concPGmL_CPA: number[];
     byCompound: Partial<Record<Ester, CompoundSeries>>;
     auc: number;
+    /**
+     * Optional endogenous testosterone curve (see TESTOSTERONE_MODEL in pk.ts),
+     * present only when the simulation was run with the testosterone model on.
+     * `endogenousFraction[i]` = T(t)/T0, which scales the pre-treatment
+     * endogenous E2 baseline (aromatised from T) at that grid point.
+     */
+    testosterone?: TestosteroneSeries;
+}
+
+/** One exact evaluation of the T posterior (used for segment-edge knots). */
+export interface TSeriesPoint {
+    values: number;
+    tFraction: number;
+    logSd: number;
+    fractionLogSd: number;
+    endogenousFraction: number;
+}
+
+/** Endogenous testosterone curve on the shared simulation grid. */
+export interface TestosteroneSeries {
+    unit: 'ng/dL';
+    /** Pre-treatment (baseline) total testosterone used for scaling, ng/dL. */
+    baselineNgdL: number;
+    /** Where T0 came from: pre-treatment T lab(s), the user's setting, or the population default. */
+    baselineSource: 'lab' | 'setting' | 'population';
+    /** Data-cutoff semantics used (shared with the E2 calibration mode). */
+    mode: 'causal' | 'retrospective';
+    /** Posterior MEDIAN T after calibration to measured T. */
+    values: number[];
+    /** Uncalibrated model T curve (population response, ηT = 0, scaled by T0). */
+    populationValues: number[];
+    /** values / T0. */
+    tFraction: number[];
+    /** Posterior SD of log T (absolute: T0 offset + response deviation + ηT). */
+    logSd: number[];
+    /** Posterior SD of log(T/T0) — the part that drives endogenous E2 (0 before treatment). */
+    fractionLogSd: number[];
+    /**
+     * MEAN endogenous-E2 multiplier E[ρ·T/T0 + 1 − ρ] — scales the
+     * pre-treatment endogenous E2 baseline B (see ENDOGENOUS_E2 in pk.ts).
+     */
+    endogenousFraction: number[];
+    /**
+     * Calibration update times (distinct T lab times, causal mode only). The
+     * series is piecewise between them: read it with interpolateTSeries,
+     * never with plain linear interpolation across an update.
+     */
+    updateTimesH?: number[];
+    /** Exact state just BEFORE each update (left limit) and AT it (new state). */
+    knotsBefore?: TSeriesPoint[];
+    knotsAfter?: TSeriesPoint[];
+    /** Number of measured T values that informed the calibration. */
+    observationCount: number;
+    postDoseObservationCount: number;
+    /** Individual HPG-suppression sensitivity (log potency shift) and its posterior SD. */
+    etaT: number;
+    etaTSd: number;
+    /** False when sparse data kept ηT fixed at its prior (0). */
+    etaTEstimated: boolean;
 }
 
 /**
