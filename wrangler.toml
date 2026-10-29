@@ -18,10 +18,19 @@ run_worker_first = true
 enabled = true
 head_sampling_rate = 1
 
+# Cloud backup database (accounts + one snapshot per user, encrypted with the
+# user's security PIN when set). `wrangler deploy` creates it on first deploy;
+# the Worker creates its tables on first use (server/schema.ts).
+[[d1_databases]]
+binding = "DB"
+database_name = "hrt-tracker"
+
 [vars]
-# Local-only mode: no accounts / cloud sync, nothing leaves the browser.
-# To enable cloud features, point to YOUR OWN backend (see docs/api.md) and
-# Turnstile site key, then set CLOUD_ENABLED = "true":
-#   VITE_API_BASE_URL = "https://your-backend.example.com/api"
-#   VITE_TURNSTILE_SITE_KEY = "your-turnstile-site-key"
-CLOUD_ENABLED = "false"
+# Accounts + cloud backup served by this Worker from D1 (server/api.ts).
+# "false" = local-only app (no account UI, no requests).
+CLOUD_ENABLED = "true"
+# Optional hardening (set in the dashboard; keep secrets out of this file):
+#   TURNSTILE_SECRET_KEY (secret) + VITE_TURNSTILE_SITE_KEY → CAPTCHA on register/login
+#   REGISTRATION_DISABLED = "true" → close sign-ups
+#   PASSWORD_PBKDF2_ITERATIONS → login password hashing cost (default 100000)
+# To use an external backend instead of D1, set VITE_API_BASE_URL.

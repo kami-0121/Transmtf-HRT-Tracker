@@ -1,48 +1,52 @@
-# 部署到 Cloudflare Workers
+# 部署到 Cloudflare Workers（D1 雲端存檔）
 
-此 fork 以 Cloudflare Workers（靜態資源 + 一個小 Worker）部署。Worker 會先處理每個請求：負責 SPA 路由，並在每個 HTML 頁面注入 `window.__ENV__`（執行期設定）。
+此 fork 由一個 Cloudflare Worker 同時提供：
 
-## 預設：本機模式
+- **App**：靜態資源（PWA，可安裝到主畫面）與 SPA 路由；每個 HTML 頁面注入 `window.__ENV__`（執行期設定）。
+- **雲端存檔 API**：`/api/*`（`server/api.ts`），資料存在 **D1**。
 
-`wrangler.toml` 預設 `CLOUD_ENABLED = "false"`：
+## 資料怎麼存
 
-- 不顯示登入／註冊，不還原舊登入、不刷新 token；
-- 不連線到任何後端，也不讀取原專案的公告與使用統計；
-- 所有紀錄（用藥、抽血報告、藥物方案）只存在使用者的瀏覽器，請用「設定 › 資料管理」匯出備份。
+- **本機存檔是主要副本**：所有紀錄先存在瀏覽器（localStorage），離線也能用。
+- **雲端存檔是備份**：登入後自動備份到 D1，換裝置登入即可取回。
+- **慢速同步（不再每 3 秒請求）**：
+  - 修改後約 8 秒上傳（連續修改會合併成一次，最長等 60 秒）；離開或切到背景時立即上傳。
+  - 開啟 App、PWA 回到前景、恢復連線時，若距上次檢查超過 1 分鐘就檢查雲端；使用中每 15 分鐘檢查一次。
+  - 「設定 › 帳號 › 立即備份到雲端」可手動同步。
+- 雲端快照以 gzip 壓縮；設定 6 位數「安全密碼」後，另以該密碼衍生的金鑰 AES-GCM 加密，伺服器不保存安全密碼。**忘記安全密碼將無法還原雲端備份**（本機資料不受影響）。
 
 ## 一次性設定（Cloudflare Workers Builds，Git 自動部署）
 
 1. Cloudflare Dashboard → **Workers & Pages** → **Create** → **Import a repository**，連結 GitHub 並選擇 `kami-0121/Transmtf-HRT-Tracker`。
-2. Worker／專案名稱填 **`transmtf-hrt-tracker`**（必須與 `wrangler.toml` 的 `name` 相同）。
+2. Worker 名稱填 **`transmtf-hrt-tracker`**（必須與 `wrangler.toml` 的 `name` 相同）。
 3. 建置設定：
    - Build command：`npm test && npm run build`（測試失敗就不部署）
    - Deploy command：`npx wrangler deploy`
-4. Production branch：選要上線的分支（建議先把開發分支合併到 `main`，再以 `main` 為 production）。其他分支的推送會產生預覽版本。
-5. 完成後網址為 `https://transmtf-hrt-tracker.<你的子網域>.workers.dev`；可在 Worker 的 **Settings → Domains & Routes** 綁定自己的網域。
+4. Production branch：選要上線的分支（建議合併到 `main` 後以 `main` 為 production）。
+5. 第一次部署時 wrangler 會自動建立名為 `hrt-tracker` 的 D1 資料庫並綁定為 `DB`；資料表由 Worker 在第一次收到 API 請求時自動建立（`server/schema.ts`），不需手動 migration。
+   - 若你的帳號不支援自動建立：先執行 `npx wrangler d1 create hrt-tracker`，把輸出的 `database_id` 加到 `wrangler.toml` 的 `[[d1_databases]]`。
 
-之後每次推送到 production branch 都會自動建置與部署。
+網址：`https://transmtf-hrt-tracker.<你的子網域>.workers.dev`（可在 Worker 的 **Settings → Domains & Routes** 綁定自己的網域）。
 
-## 手動部署（本機）
+## 建議的安全設定（Dashboard → Worker → Settings → Variables and Secrets）
+
+| 變數 | 用途 |
+|---|---|
+| `TURNSTILE_SECRET_KEY`（Secret）＋ `VITE_TURNSTILE_SITE_KEY` | 註冊／登入加上人機驗證（在 Cloudflare Turnstile 建立 widget，網域填你的網址） |
+| `REGISTRATION_DISABLED = "true"` | 自己帳號建好後關閉註冊，避免陌生人使用 |
+| `PASSWORD_PBKDF2_ITERATIONS` | 登入密碼雜湊成本（預設 100000） |
+| `CLOUD_ENABLED = "false"` | 改回純本機模式（不顯示帳號、不發任何請求） |
+
+> Workers **免費方案**每個請求的 CPU 時間上限是 10 ms。登入／註冊時的密碼雜湊（PBKDF2 100000 次）可能超過，偶爾出現錯誤 1102。若遇到，可改用 Workers Paid，或把 `PASSWORD_PBKDF2_ITERATIONS` 調低（不低於 10000；已存在帳號會在下次登入時自動改用新設定）。一般同步請求不做密碼雜湊。
+
+## 本機開發與測試
 
 ```bash
-npx wrangler login      # 第一次
-npm run deploy          # = npm test && npm run build && npx wrangler deploy
+npm run build
+npx wrangler dev                      # App + API + 本機 D1（.wrangler/state）
+npm run deploy                        # = npm test && npm run build && npx wrangler deploy
 ```
 
-## 啟用雲端功能（需要自己的後端）
+## 這個後端不提供的功能
 
-雲端同步、帳號、分享需要相容 `docs/api.md` 的後端，以及綁定你網域的 Turnstile site key。原專案的後端與 Turnstile key 只接受原作者的網域，而且此 fork 的資料格式（抽血報告、藥物方案、同步雜湊 v5）不應上傳到原作者的伺服器。
-
-在 `wrangler.toml` 的 `[vars]`（或 Dashboard → Worker → Settings → Variables）設定：
-
-```toml
-CLOUD_ENABLED = "true"
-VITE_API_BASE_URL = "https://your-backend.example.com/api"
-VITE_TURNSTILE_SITE_KEY = "your-turnstile-site-key"
-```
-
-這些值在執行期由 Worker 注入，修改後重新部署即可，前端不需重新建置。
-
-## 注意
-
-`run_worker_first = true` 是必要的：只設 `["/api/*"]` 時，HTML 會直接由靜態資源回應，`window.__ENV__` 不會被注入（原專案設定即有此問題）。
+分享連結、頭像上傳、Transmtf 第三方登入（OIDC）與使用統計（API 回 501，介面自動隱藏）。若要改接相容原專案 API 的完整後端，設定 `VITE_API_BASE_URL`。

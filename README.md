@@ -78,9 +78,9 @@ without duplicating formulas.<br>
 
   **舌下服用指导**：基于严格的医学建模，提供详细的“含服时间（Hold Time）”与吸收参数（$\theta$）参考。
 
-* **Privacy First**: All data is stored locally in your browser's `localStorage` by default. If you create an account and sign in, optional automatic cloud sync uploads your encrypted-in-transit data payload to the project server (see `docs/api.md`); the security PIN is verified against the server and forgotten-PIN-encrypted cloud data cannot be recovered by anyone. Review the sync and deployment docs before enabling cloud features.<br>
+* **Privacy First**: Records are stored locally in your browser first. If you sign in, they are additionally backed up to this deployment's own Cloudflare D1 database (see `docs/DEPLOY_WORKERS.md`) with slow, event-driven sync; with a 6-digit security PIN the backup is encrypted with a PIN-derived key that the server never stores, so a forgotten PIN makes the cloud copy unrecoverable.<br>
 
-  **隐私优先**：所有数据默认仅存储在你浏览器的 `localStorage` 中。若注册并登录账号，可选的自动云同步会将传输中加密的完整数据载荷上传至项目服务器（见 `docs/api.md`）；安全密码会提交服务端校验，且忘记密码后加密的云端数据无法被任何人恢复。启用云功能前请先阅读同步与部署文档。
+  **隐私优先**：记录先保存在浏览器本机；登录后再以慢速、事件触发的方式备份到本部署自己的 Cloudflare D1 数据库（见 `docs/DEPLOY_WORKERS.md`）。设置 6 位数安全密码后，云端备份以该密码派生的密钥加密，服务器不保存安全密码，忘记密码将无法还原云端备份。
 
 * **Internationalization**: Native support for **Simplified Chinese** and **English**, **Cantonese**, **Russian, Ukrainian** and more.<br>
 

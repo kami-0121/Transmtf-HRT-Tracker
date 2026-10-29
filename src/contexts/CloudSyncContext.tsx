@@ -14,6 +14,8 @@ interface CloudSyncContextType {
   syncError: string | null;
   pendingConflict: ConflictState | null;
   resolveConflict: (resolution: 'local' | 'cloud' | 'merge', mergedData?: Record<string, any>) => void;
+  /** Sync immediately (manual "back up now"). */
+  syncNow: () => void;
 }
 
 const CloudSyncContext = createContext<CloudSyncContextType | undefined>(undefined);
@@ -23,8 +25,20 @@ const LAST_PULL_TIME_KEY = 'hrt-last-pull-time';
 const LAST_DATA_UPDATED_KEY = 'hrt-last-data-updated';
 const LAST_KNOWN_CLOUD_UPDATED_KEY = 'hrt-last-known-cloud-updated';
 const LAST_KNOWN_CLOUD_HASH_KEY = 'hrt-last-known-cloud-hash';
-const SYNC_INTERVAL = 3000; // 3 seconds
-const PULL_CHECK_INTERVAL = 3000; // 3 seconds
+// Slow, event-driven sync (local storage is the primary copy; the cloud is a
+// backup). No fast polling: each sync is one GET (+ one PUT when local changed).
+//  - local edit        → push after PUSH_DEBOUNCE_MS of quiet (≤ PUSH_MAX_WAIT_MS)
+//  - app hidden        → flush a pending push right away
+//  - app shown / PWA resumed / back online → pull if the last pull is older
+//                        than RESUME_PULL_MIN_MS
+//  - while visible     → pull every PULL_INTERVAL_MS
+const PULL_INTERVAL_MS = 15 * 60 * 1000;
+const RESUME_PULL_MIN_MS = 60 * 1000;
+const PUSH_DEBOUNCE_MS = 8 * 1000;
+const PUSH_MAX_WAIT_MS = 60 * 1000;
+const SCHEDULER_TICK_MS = 60 * 1000;
+/** Window event other modules dispatch to request a sync (e.g. ownership resolved). */
+export const SYNC_REQUEST_EVENT = 'hrt-sync-request';
 
 // Record the cloud baseline = the cloud state we last successfully synced with.
 // This lets us distinguish "local-only changes since baseline" (safe to push) from
@@ -102,7 +116,11 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setPendingConflict(next);
   }, []);
 
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  // Slow-sync scheduler state.
+  const syncRunningRef = useRef(false);
+  const syncRerunRef = useRef(false);
+  const pushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pushFirstRequestRef = useRef<number | null>(null);
   const isSyncingRef = useRef(false);
   const conflictPendingRef = useRef(false);
   // Live view of the authed account so post-await checks in async callbacks
@@ -289,7 +307,7 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const shouldPullFromCloud = useCallback(() => {
     const lastPull = localStorage.getItem(LAST_PULL_TIME_KEY);
     if (!lastPull) return true;
-    return Date.now() - new Date(lastPull).getTime() >= SYNC_INTERVAL;
+    return Date.now() - new Date(lastPull).getTime() >= PULL_INTERVAL_MS;
   }, []);
 
   // Load last sync time from localStorage
@@ -758,45 +776,100 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
   }, [pushLocalDataToCloud, applyCloudToLocal, getLocalDataSnapshot, getSessionGeneration, updatePendingConflict, restoreLocalDataFromSnapshot]);
 
-  // ── Watch for local data changes → trigger unified sync ──
+  // ── Slow-sync scheduler ──
+  // Serialises syncs: a request arriving while one runs is not dropped — it
+  // triggers exactly one more run afterwards (performSync itself bails out
+  // while another sync is in flight).
+  const runSync = useCallback(async () => {
+    if (syncRunningRef.current) { syncRerunRef.current = true; return; }
+    syncRunningRef.current = true;
+    try {
+      do {
+        syncRerunRef.current = false;
+        await performSync();
+      } while (syncRerunRef.current);
+    } finally {
+      syncRunningRef.current = false;
+    }
+  }, [performSync]);
+
+  const flushPush = useCallback(() => {
+    if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
+    pushTimerRef.current = null;
+    pushFirstRequestRef.current = null;
+    runSync();
+  }, [runSync]);
+
+  // Debounced push: coalesce bursts of edits into one upload.
+  const schedulePush = useCallback(() => {
+    const now = Date.now();
+    if (pushFirstRequestRef.current === null) pushFirstRequestRef.current = now;
+    if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
+    const waited = now - pushFirstRequestRef.current;
+    const delay = Math.max(0, Math.min(PUSH_DEBOUNCE_MS, PUSH_MAX_WAIT_MS - waited));
+    pushTimerRef.current = setTimeout(flushPush, delay);
+  }, [flushPush]);
+
+  const syncNow = useCallback(() => { flushPush(); }, [flushPush]);
+
   useEffect(() => {
     if (!isAuthenticated || isLogoutInProgress()) return;
 
-    const handleStorageChange = (e: StorageEvent) => {
+    const onLocalUpdate = () => schedulePush();
+    // Another tab changed synced storage: that tab syncs its own edit; we only
+    // need a (debounced) check so this tab's baseline stays current.
+    const onStorage = (e: StorageEvent) => {
       if (e.storageArea !== localStorage) return;
       const syncKeys = ['hrt-events', 'hrt-weight', 'hrt-lab-results', 'hrt-lang', 'hrt-calibration-model', 'hrt-calibration-mode', 'hrt-apply-e2-learning-to-cpa', 'hrt-apply-cpa-inhibition-to-e2', 'hrt-theme-color', 'hrt-theme-mode', 'hrt-dark-mode', 'hrt-gel-products', 'hrt-blood-reports', 'hrt-regimens'];
-      if (e.key && syncKeys.includes(e.key)) performSync();
+      if (e.key && syncKeys.includes(e.key)) schedulePush();
     };
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        // Leaving / backgrounding the app (incl. an installed PWA): upload now.
+        if (pushTimerRef.current) flushPush();
+      } else {
+        // Shown again / PWA resumed: pull if it has been a while.
+        const lastPull = localStorage.getItem(LAST_PULL_TIME_KEY);
+        if (!lastPull || Date.now() - new Date(lastPull).getTime() >= RESUME_PULL_MIN_MS) runSync();
+      }
+    };
+    const onOnline = () => runSync();
+    const onRequest = () => flushPush();
 
-    const handleLocalUpdate = () => performSync();
+    window.addEventListener('hrt-local-data-updated', onLocalUpdate as EventListener);
+    window.addEventListener('storage', onStorage);
+    window.addEventListener('online', onOnline);
+    window.addEventListener(SYNC_REQUEST_EVENT, onRequest);
+    document.addEventListener('visibilitychange', onVisibility);
 
-    window.addEventListener('storage', handleStorageChange);
-    window.addEventListener('hrt-local-data-updated', handleLocalUpdate as EventListener);
+    // Initial sync on mount / auth change, then a slow periodic pull while visible.
+    runSync();
+    const tick = setInterval(() => {
+      if (document.visibilityState === 'visible' && shouldPullFromCloud()) runSync();
+    }, SCHEDULER_TICK_MS);
+
     return () => {
-      window.removeEventListener('storage', handleStorageChange);
-      window.removeEventListener('hrt-local-data-updated', handleLocalUpdate as EventListener);
+      window.removeEventListener('hrt-local-data-updated', onLocalUpdate as EventListener);
+      window.removeEventListener('storage', onStorage);
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener(SYNC_REQUEST_EVENT, onRequest);
+      document.removeEventListener('visibilitychange', onVisibility);
+      clearInterval(tick);
+      if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
+      pushTimerRef.current = null;
+      pushFirstRequestRef.current = null;
     };
-  }, [isAuthenticated, performSync]);
+  }, [isAuthenticated, runSync, schedulePush, flushPush, shouldPullFromCloud]);
 
-  // ── Periodic poll + initial sync ──
+  // Sync becomes possible later (security PIN verified): run once then —
+  // the old 3-second poll used to cover this implicitly.
   useEffect(() => {
-    if (!isAuthenticated || isLogoutInProgress()) return;
-
-    // Initial sync on mount / auth change
-    performSync();
-
-    pollIntervalRef.current = setInterval(() => {
-      if (shouldPullFromCloud()) performSync();
-    }, PULL_CHECK_INTERVAL);
-
-    return () => {
-      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-    };
-  }, [isAuthenticated, performSync, shouldPullFromCloud]);
+    if (isAuthenticated && hasSecurityPassword && isVerified && securityPassword) runSync();
+  }, [isAuthenticated, hasSecurityPassword, isVerified, securityPassword, runSync]);
 
   return (
     <CloudSyncContext.Provider
-      value={{ isSyncing, lastSyncTime, syncError, pendingConflict, resolveConflict }}
+      value={{ isSyncing, lastSyncTime, syncError, pendingConflict, resolveConflict, syncNow }}
     >
       {children}
     </CloudSyncContext.Provider>

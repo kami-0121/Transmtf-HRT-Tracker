@@ -4,6 +4,7 @@ import { Settings, Activity, Calendar, User } from 'lucide-react';
 import { useTranslation } from '../contexts/LanguageContext';
 import { useDialog } from '../contexts/DialogContext';
 import { useAuth } from '../contexts/AuthContext';
+import { SYNC_REQUEST_EVENT } from '../contexts/CloudSyncContext';
 import { API_ORIGIN } from '../api/config';
 import { useAppData, PER_DOSE_WEIGHT_MIGRATION_EVENT } from '../contexts/AppDataContext';
 import { formatDate, formatTime } from '../utils/helpers';
@@ -123,6 +124,7 @@ const MainLayout: React.FC = () => {
             if (choice === 'confirm') {
                 // Upload: sync resumes and pushes the local records to this account.
                 localStorage.removeItem('hrt-data-ownership-pending');
+                window.dispatchEvent(new CustomEvent(SYNC_REQUEST_EVENT));
             } else if (choice === 'cancel') {
                 // Clear: wipe local records (storage + in-memory state holders).
                 clearAllLocalMedicalData();
