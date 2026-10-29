@@ -74,11 +74,15 @@ export interface GetUserDataRequest {
 export interface UserDataResponse {
   data: any;
   is_encrypted: boolean;
+  /** Server revision of the snapshot (D1 backend; absent on older servers). */
+  revision?: number;
 }
 
 export interface UpdateUserDataRequest {
   password?: string;
   data: any;
+  /** Revision the upload is based on; a stale one is refused with 409. */
+  base_revision?: number;
 }
 
 // Share Types

@@ -18,7 +18,14 @@
  *   additionally AES-GCM encrypted under a key derived from the PIN, which is
  *   never stored. A forgotten PIN makes the cloud copy unrecoverable (the local
  *   copy is unaffected).
- * - Failed logins are throttled per username.
+ * - Failed logins are throttled per username; snapshot uploads are rate
+ *   limited per user (DATA_WRITES_PER_MINUTE).
+ * - The snapshot carries a revision. An upload names the revision it was based
+ *   on (`base_revision`) and is refused with 409 when another device uploaded
+ *   in between, so the client merges instead of overwriting (optimistic
+ *   concurrency, as in AtDo's vault items).
+ * - Expired sessions and old throttling rows are purged by the daily cron
+ *   (scheduledCleanup).
  */
 import {
     toB64, fromB64, randomBytes, randomToken, sha256Hex, timingSafeEqual, pbkdf2,
@@ -45,18 +52,30 @@ const MAX_STORED_BYTES = 1_900_000;          // D1 row limit is 2 MB
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_FAILURES = 10;
 const LAST_USED_RESOLUTION_MS = 60 * 60 * 1000;
+// Slow sync uploads at most every few seconds; anything far above this is a
+// runaway client or abuse (the client backs off and retries later on 429).
+const DATA_WRITES_PER_MINUTE = 30;
+const DATA_WRITES_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 class HttpError extends Error {
-    constructor(public status: number, message: string) { super(message); }
+    constructor(public status: number, message: string, public data?: unknown) { super(message); }
 }
 
+// API responses are JSON only: never rendered, framed or read cross-origin.
+export const API_HEADERS: Record<string, string> = {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'Cross-Origin-Resource-Policy': 'same-origin',
+};
+
 const json = (status: number, body: unknown): Response =>
-    new Response(JSON.stringify(body), {
-        status,
-        headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
-    });
+    new Response(JSON.stringify(body), { status, headers: API_HEADERS });
 const ok = (data?: unknown, message?: string) => json(200, { success: true, ...(message ? { message } : {}), ...(data !== undefined ? { data } : {}) });
-const fail = (status: number, error: string) => json(status, { success: false, error });
+const fail = (status: number, error: string, data?: unknown) =>
+    json(status, { success: false, error, ...(data !== undefined ? { data } : {}) });
 
 const nowIso = () => new Date().toISOString();
 
@@ -124,7 +143,7 @@ interface SessionRow {
     created_at: string;
     last_used_at: string;
 }
-interface DataRow { payload: string; is_encrypted: number; }
+interface DataRow { payload: string; is_encrypted: number; revision: number; }
 
 const getUserById = (env: ApiEnv, id: number) =>
     env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(id).first<UserRow>();
@@ -234,15 +253,56 @@ async function unpackData(row: DataRow, key: CryptoKey | null): Promise<unknown>
 }
 
 const getData = (env: ApiEnv, userId: number) =>
-    env.DB.prepare('SELECT payload, is_encrypted FROM user_data WHERE user_id = ?').bind(userId).first<DataRow>();
+    env.DB.prepare('SELECT payload, is_encrypted, revision FROM user_data WHERE user_id = ?').bind(userId).first<DataRow>();
 
-async function putData(env: ApiEnv, userId: number, value: unknown, key: CryptoKey | null) {
+/** `null` = no base revision given (explicit "keep this device's copy"): overwrite. */
+function readBaseRevision(value: unknown): number | null {
+    if (value === undefined || value === null) return null;
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+        throw new HttpError(400, 'base_revision must be a non-negative integer');
+    }
+    return value;
+}
+
+async function enforceWriteLimit(env: ApiEnv, userId: number) {
+    const row = await env.DB.prepare('SELECT COUNT(*) AS n FROM data_writes WHERE user_id = ? AND at > ?')
+        .bind(userId, Date.now() - 60_000).first<{ n: number }>();
+    if ((row?.n ?? 0) >= DATA_WRITES_PER_MINUTE) throw new HttpError(429, 'Too many uploads, try again later');
+}
+
+/** Store the snapshot; returns its new revision. 409 when `baseRevision` is stale. */
+async function putData(env: ApiEnv, userId: number, value: unknown, key: CryptoKey | null, baseRevision: number | null): Promise<number> {
+    await enforceWriteLimit(env, userId);
     const { payload, encrypted } = await packData(value, key);
-    await env.DB.prepare(
-        `INSERT INTO user_data (user_id, payload, is_encrypted, size_bytes, updated_at) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(user_id) DO UPDATE SET payload = excluded.payload, is_encrypted = excluded.is_encrypted,
-         size_bytes = excluded.size_bytes, updated_at = excluded.updated_at`
-    ).bind(userId, payload, encrypted ? 1 : 0, payload.length, nowIso()).run();
+    // One statement, so the revision check and the write cannot interleave with
+    // another device's upload. A first upload (no row yet) always succeeds.
+    const [write] = await env.DB.batch([
+        env.DB.prepare(
+            `INSERT INTO user_data (user_id, payload, is_encrypted, size_bytes, updated_at, revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)
+             ON CONFLICT(user_id) DO UPDATE SET payload = excluded.payload, is_encrypted = excluded.is_encrypted,
+             size_bytes = excluded.size_bytes, updated_at = excluded.updated_at, revision = user_data.revision + 1
+             WHERE ?6 IS NULL OR user_data.revision = ?6
+             RETURNING revision`
+        ).bind(userId, payload, encrypted ? 1 : 0, payload.length, nowIso(), baseRevision),
+        env.DB.prepare('INSERT INTO data_writes (user_id, at) VALUES (?, ?)').bind(userId, Date.now()),
+    ]);
+    const revision = (write.results?.[0] as { revision?: number } | undefined)?.revision;
+    if (typeof revision === 'number') return revision;
+    const current = await env.DB.prepare('SELECT revision FROM user_data WHERE user_id = ?').bind(userId).first<{ revision: number }>();
+    throw new HttpError(409, 'Cloud data changed on another device', { revision: current?.revision ?? 0 });
+}
+
+/** Daily cron: drop expired sessions and stale throttling rows. */
+export async function scheduledCleanup(env: ApiEnv): Promise<void> {
+    if (!env.DB) return;
+    await ensureSchema(env.DB);
+    const now = Date.now();
+    await env.DB.batch([
+        env.DB.prepare('DELETE FROM sessions WHERE refresh_expires < ?').bind(now),
+        env.DB.prepare('DELETE FROM login_failures WHERE at < ?').bind(now - LOGIN_WINDOW_MS),
+        env.DB.prepare('DELETE FROM data_writes WHERE at < ?').bind(now - DATA_WRITES_RETENTION_MS),
+    ]);
 }
 
 // ── routes ───────────────────────────────────────────────────────────────────
@@ -400,17 +460,18 @@ const routes: [string, RegExp, Handler][] = [
         const body = await readJson(request);
         const key = user.pin_salt ? await pinKeyFor(user, str(body.password)) : null;
         const row = await getData(env, user.id);
-        if (!row) return ok({ data: null, is_encrypted: !!key });
-        return ok({ data: await unpackData(row, key), is_encrypted: !!row.is_encrypted });
+        if (!row) return ok({ data: null, is_encrypted: !!key, revision: 0 });
+        return ok({ data: await unpackData(row, key), is_encrypted: !!row.is_encrypted, revision: row.revision });
     }],
 
     ['PUT', /^\/api\/user\/data$/, async (env, request) => {
         const { user } = await authenticate(env, request);
         const body = await readJson(request);
         if (!body.data || typeof body.data !== 'object') throw new HttpError(400, 'data required');
+        const baseRevision = readBaseRevision(body.base_revision);
         const key = user.pin_salt ? await pinKeyFor(user, str(body.password)) : null;
-        await putData(env, user.id, body.data, key);
-        return ok(undefined, 'Saved');
+        const revision = await putData(env, user.id, body.data, key, baseRevision);
+        return ok({ revision }, 'Saved');
     }],
 
     ['PUT', /^\/api\/user\/password$/, async (env, request) => {
@@ -445,7 +506,7 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
         if (routes.some(([, re]) => re.test(pathname))) return fail(405, 'Method not allowed');
         return fail(404, 'Not found');
     } catch (e) {
-        if (e instanceof HttpError) return fail(e.status, e.message);
+        if (e instanceof HttpError) return fail(e.status, e.message, e.data);
         console.error('API error', e);
         return fail(500, 'Internal server error');
     }

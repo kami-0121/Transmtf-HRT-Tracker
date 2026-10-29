@@ -4,6 +4,7 @@ import { useAuth } from './AuthContext';
 import { useSecurityPassword } from './SecurityPasswordContext';
 import { computeDataHash, projectForSync, resolveThemeMode, SYNC_HASH_SCHEMA } from '../utils/dataHash';
 import { classifyChanges } from '../utils/syncDecision';
+import { mergeSnapshots, pickMergeFields } from '../utils/syncMerge';
 import { DEFAULT_WEIGHT_KG } from '../utils/weight';
 import { isLogoutInProgress } from '../utils/authSessionState';
 import type { ConflictState, FieldDiff } from '../components/SyncConflictModal';
@@ -25,6 +26,9 @@ const LAST_PULL_TIME_KEY = 'hrt-last-pull-time';
 const LAST_DATA_UPDATED_KEY = 'hrt-last-data-updated';
 const LAST_KNOWN_CLOUD_UPDATED_KEY = 'hrt-last-known-cloud-updated';
 const LAST_KNOWN_CLOUD_HASH_KEY = 'hrt-last-known-cloud-hash';
+// The synced fields of the baseline itself, for the three-way merge
+// (utils/syncMerge.ts), tagged with the baseline hash it belongs to.
+const SYNC_BASE_KEY = 'hrt-sync-base';
 // Slow, event-driven sync (local storage is the primary copy; the cloud is a
 // backup). No fast polling: each sync is one GET (+ one PUT when local changed).
 //  - local edit        → push after PUSH_DEBOUNCE_MS of quiet (≤ PUSH_MAX_WAIT_MS)
@@ -43,11 +47,28 @@ export const SYNC_REQUEST_EVENT = 'hrt-sync-request';
 // Record the cloud baseline = the cloud state we last successfully synced with.
 // This lets us distinguish "local-only changes since baseline" (safe to push) from
 // "cloud changed under us while we also changed locally" (real conflict).
-function setCloudBaseline(cloudUpdated: string | null | undefined, cloudHash: string) {
+function setCloudBaseline(cloudUpdated: string | null | undefined, cloudHash: string, data: Record<string, any>) {
   if (cloudUpdated) {
     localStorage.setItem(LAST_KNOWN_CLOUD_UPDATED_KEY, cloudUpdated);
   }
   localStorage.setItem(LAST_KNOWN_CLOUD_HASH_KEY, cloudHash);
+  try {
+    localStorage.setItem(SYNC_BASE_KEY, JSON.stringify({ hash: cloudHash, data: pickMergeFields(data) }));
+  } catch {
+    // Quota: without a base the next divergence falls back to the conflict dialog.
+    localStorage.removeItem(SYNC_BASE_KEY);
+  }
+}
+
+/** The baseline's data, only if it still belongs to the current baseline hash. */
+function readSyncBase(): Record<string, any> | null {
+  try {
+    const stored = JSON.parse(localStorage.getItem(SYNC_BASE_KEY) || 'null');
+    const hash = localStorage.getItem(LAST_KNOWN_CLOUD_HASH_KEY);
+    return stored && hash && stored.hash === hash && stored.data ? stored.data : null;
+  } catch {
+    return null;
+  }
 }
 
 // Deep-equal for comparing field values (handles arrays, objects, primitives)
@@ -247,7 +268,7 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     regimens?: any[];
     lastModified: string;
     lastDataUpdated?: string | null;
-  }) => {
+  }, baseRevision?: number) => {
     // F02: stamp results only if the session that issued the push is still
     // current when the response arrives.
     const generation = getSessionGeneration();
@@ -258,6 +279,8 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         lastDataUpdated: localData.lastDataUpdated || localData.lastModified,
       },
       password: hasSecurityPassword ? securityPassword : undefined,
+      // Omitted for an explicit "keep this device's copy" (conflict dialog).
+      base_revision: baseRevision,
     });
 
     if (getSessionGeneration() !== generation) {
@@ -292,7 +315,7 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
       // After a successful push, the cloud's state == what we just uploaded,
       // so record it as the new baseline.
-      setCloudBaseline(localData.lastDataUpdated || localData.lastModified, dataHash);
+      setCloudBaseline(localData.lastDataUpdated || localData.lastModified, dataHash, localData);
       // The local data now matches THIS account's cloud copy (blocker 1).
       if (userRef.current?.username) {
         localStorage.setItem('hrt-data-owner', userRef.current.username);
@@ -300,6 +323,11 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return true;
     }
 
+    if (response.status === 409) {
+      // Another device uploaded since our pull: pull again and merge.
+      syncRerunRef.current = true;
+      return false;
+    }
     setSyncError(response.error || 'Failed to sync to cloud');
     return false;
   }, [hasSecurityPassword, securityPassword, getSessionGeneration]);
@@ -328,7 +356,9 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, [isAuthenticated, user?.username, updatePendingConflict]);
 
   // ── apply cloud data to local ──
-  const applyCloudToLocal = useCallback((data: any, localData: Record<string, any>, fallbackTimestamp?: string) => {
+  // setBaseline=false: the written data is NOT what the cloud holds (local
+  // edits on top of an uploaded merge), so the baseline stays as the upload set it.
+  const applyCloudToLocal = useCallback((data: any, localData: Record<string, any>, fallbackTimestamp?: string, setBaseline = true) => {
     const resolvedLang = data?.lang || localData.lang;
     if (data?.events) localStorage.setItem('hrt-events', JSON.stringify(data.events));
     if (data?.weight !== undefined) localStorage.setItem('hrt-weight', data.weight.toString());
@@ -384,7 +414,7 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     localStorage.setItem('hrt-data-hash', dataHash);
     // After applying cloud data locally, our local state == cloud state,
     // so the cloud version we just pulled becomes the new baseline.
-    setCloudBaseline(data?.lastDataUpdated || fallbackTimestamp || null, dataHash);
+    if (setBaseline) setCloudBaseline(data?.lastDataUpdated || fallbackTimestamp || null, dataHash, data ?? {});
     // The local data now matches THIS account's cloud copy (blocker 1).
     if (userRef.current?.username) {
       localStorage.setItem('hrt-data-owner', userRef.current.username);
@@ -463,8 +493,11 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       // F02 re-review: after ANY awaited push, stop dead if the session changed
       // — otherwise the stamp/baseline lines after the push would still run
       // for a sync whose session is over.
+      // Uploads in this sync name the revision just pulled: if another device
+      // uploads in between, the server refuses (409) and the sync reruns.
+      const cloudRevision = typeof response.data?.revision === 'number' ? response.data.revision : undefined;
       const pushAndStayCurrent = async (data: Parameters<typeof pushLocalDataToCloud>[0]): Promise<boolean> => {
-        const pushed = await pushLocalDataToCloud(data);
+        const pushed = await pushLocalDataToCloud(data, cloudRevision);
         // Final-review fix: the remote must explicitly confirm the upload
         // before we stamp sync time — a failed push returns false here so the
         // stamp lines after each call site are skipped.
@@ -522,7 +555,7 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           if (!(await pushAndStayCurrent({ ...localData, lastModified: localData.lastModified || now.toISOString() }))) return;
         }
         // Local == cloud, refresh baseline so future pushes don't trip false conflicts
-        setCloudBaseline(cloudData.lastDataUpdated || localData.lastDataUpdated || null, cloudHash);
+        setCloudBaseline(cloudData.lastDataUpdated || localData.lastDataUpdated || null, cloudHash, cloudData);
         setLastSyncTime(now);
         localStorage.setItem(LAST_SYNC_TIME_KEY, now.toISOString());
         localStorage.setItem(LAST_PULL_TIME_KEY, now.toISOString());
@@ -594,9 +627,39 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
 
       if (cloudChangedSinceBaseline && localChangedSinceBaseline) {
-        // Both sides diverged from the shared baseline → genuine conflict.
-        // Never fall through to timestamp-based auto-resolution here — that would
-        // silently overwrite one side's changes. Always prompt the user.
+        // Both sides diverged from the shared baseline. With the baseline's own
+        // data at hand, merge record by record (utils/syncMerge.ts): additions,
+        // edits and deletions from both devices are kept, and only the same
+        // field edited on both sides is decided (for this device). Upload the
+        // merge first; only once the server accepted it, write it locally.
+        const base = readSyncBase();
+        if (base) {
+          const stamp = now.toISOString();
+          const merged = {
+            ...localData,
+            ...mergeSnapshots(base, localData, cloudData),
+            lastModified: stamp,
+            lastDataUpdated: stamp,
+          };
+          if (!(await pushAndStayCurrent(merged))) return;
+          // Edits made on this device while the upload was in flight are kept
+          // on top of the merge and go out with the next sync.
+          const latest = getLocalDataSnapshot();
+          const editedMeanwhile = latest.dataHash !== localData.dataHash;
+          applyCloudToLocal(
+            editedMeanwhile ? { ...merged, ...mergeSnapshots(localData, latest, merged) } : merged,
+            latest,
+            undefined,
+            !editedMeanwhile,
+          );
+          if (editedMeanwhile) syncRerunRef.current = true;
+          setLastSyncTime(now);
+          localStorage.setItem(LAST_SYNC_TIME_KEY, now.toISOString());
+          localStorage.setItem(LAST_PULL_TIME_KEY, now.toISOString());
+          return;
+        }
+        // No usable baseline data (first sync after an upgrade, storage
+        // quota): never auto-resolve by timestamp, ask the user.
         const diffs = computeFieldDiffs(localData, cloudData);
         if (diffs.length > 0) {
           conflictPendingRef.current = true;

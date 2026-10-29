@@ -16,6 +16,7 @@ export function clearAllLocalMedicalData(): void {
     localStorage.removeItem('hrt-last-pull-time');
     localStorage.removeItem('hrt-last-known-cloud-updated');
     localStorage.removeItem('hrt-last-known-cloud-hash');
+    localStorage.removeItem('hrt-sync-base');
     localStorage.removeItem('hrt-data-hash');
 
     // Medical-adjacent stores that must not survive a "clear" either (F01):

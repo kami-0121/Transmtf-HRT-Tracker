@@ -25,6 +25,11 @@ head_sampling_rate = 1
 binding = "DB"
 database_name = "hrt-tracker"
 
+# Daily housekeeping (worker.ts `scheduled`): purge expired sessions and old
+# rate-limit rows. 03:15 UTC = 11:15 Taipei.
+[triggers]
+crons = ["15 3 * * *"]
+
 [vars]
 # Accounts + cloud backup served by this Worker from D1 (server/api.ts).
 # "false" = local-only app (no account UI, no requests).
