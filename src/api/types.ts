@@ -56,6 +56,40 @@ export interface RevokeSessionRequest {
 // User Data Types
 export interface SetSecurityPasswordRequest {
   password: string;
+  /** D1 backend: remember this device for 7 days. */
+  remember?: boolean;
+}
+
+/** D1 backend: an unlock token for this browser (see server/keys.ts). */
+export interface UnlockGrant {
+  unlock_token: string;
+  token_id: string;
+  expires_at: number;
+  remembered: boolean;
+}
+
+export interface SetSecurityPasswordResponse extends Partial<UnlockGrant> {
+  /** Shown once: opens the data if the PIN is forgotten. */
+  recovery_key?: string;
+}
+
+export type UnlockRequest =
+  | { method: 'pin'; pin: string; remember?: boolean }
+  | { method: 'passkey'; credential_id: string; prf_output: string; remember?: boolean };
+
+export interface PasskeyInfo {
+  id: string;
+  credential_id: string;
+  prf_input: string;
+  label: string | null;
+  created_at: string;
+}
+
+export interface RememberedDeviceInfo {
+  id: string;
+  label: string | null;
+  created_at: string;
+  expires_at: number;
 }
 
 export interface UpdateSecurityPasswordRequest {
@@ -65,6 +99,10 @@ export interface UpdateSecurityPasswordRequest {
 
 export interface SecurityPasswordStatusResponse {
   has_security_password: boolean;
+  /** D1 backend only. */
+  has_recovery_key?: boolean;
+  passkeys?: PasskeyInfo[];
+  devices?: RememberedDeviceInfo[];
 }
 
 export interface GetUserDataRequest {

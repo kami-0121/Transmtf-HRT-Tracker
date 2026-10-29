@@ -31,8 +31,13 @@
  */
 import {
     toB64, fromB64, randomBytes, randomToken, sha256Hex,
-    pinKey, aesEncrypt, aesDecrypt, gzip, gunzip, encodeJson, decodeJson, utf8,
+    aesEncrypt, aesDecrypt, gzip, gunzip, encodeJson, decodeJson, utf8,
 } from './crypto';
+import {
+    PIN_CHECK_TEXT, PIN_RE, DEVICE_TTL_MS, SESSION_TTL_MS, type DataKey, type EnvelopeRow,
+    newDek, pinKek, wrapDek, unwrapDek, newRecoveryKey, normalizeRecoveryKey, recoveryKek,
+    issueToken, parseToken, tokenKek, passkeyKek,
+} from './keys';
 import { ensureSchema } from './schema';
 import {
     googleEnabled, buildAuthorizeUrl, exchangeCode, subjectHash, OAUTH_STATE_TTL_MS, type GoogleEnv,
@@ -46,8 +51,9 @@ export interface ApiEnv extends GoogleEnv {
 
 const ACCESS_TTL_MS = 60 * 60 * 1000;
 const REFRESH_TTL_MS = 60 * 24 * 60 * 60 * 1000;
-const PIN_ITERATIONS = 10_000;
-const PIN_CHECK_TEXT = 'hrt-tracker-pin-check-v1';
+// Wrong PIN / recovery key / passkey attempts per account before a pause.
+const UNLOCK_WINDOW_MS = 15 * 60 * 1000;
+const UNLOCK_MAX_FAILURES = 10;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_STORED_BYTES = 1_900_000;          // D1 row limit is 2 MB
 const LAST_USED_RESOLUTION_MS = 60 * 60 * 1000;
@@ -97,7 +103,6 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
 
 const str = (v: unknown): string => (typeof v === 'string' ? v : '');
 
-const PIN_RE = /^\d{6}$/;
 
 // ── rows ─────────────────────────────────────────────────────────────────────
 
@@ -113,6 +118,7 @@ interface UserRow {
     avatar: string | null;
     google_picture: string | null;
     greet: number;
+    key_version: number;
 }
 interface SessionRow {
     id: string;
@@ -187,17 +193,139 @@ async function authenticate(env: ApiEnv, request: Request): Promise<AuthContext>
 
 // ── user data (gzip, optional PIN encryption) ────────────────────────────────
 
-async function pinKeyFor(user: UserRow, pin: string): Promise<CryptoKey> {
-    if (!user.pin_salt || !user.pin_check) throw new HttpError(400, 'No security password set');
-    if (!PIN_RE.test(pin)) throw new HttpError(403, 'Invalid security password');
-    const key = await pinKey(pin, fromB64(user.pin_salt), PIN_ITERATIONS);
-    try {
-        await aesDecrypt(key, fromB64(user.pin_check));
-    } catch {
-        throw new HttpError(403, 'Invalid security password');
-    }
-    return key;
+// ── unlocking the data key (server/keys.ts) ──────────────────────────────────
+
+const badSecret = () => new HttpError(403, 'Invalid security password');
+
+const envelopeQuery = (env: ApiEnv, userId: number, kind: string) =>
+    env.DB.prepare('SELECT * FROM key_envelopes WHERE user_id = ? AND kind = ?').bind(userId, kind);
+
+async function assertUnlockNotThrottled(env: ApiEnv, userId: number) {
+    const row = await env.DB.prepare('SELECT COUNT(*) AS n FROM login_failures WHERE username = ? AND at > ?')
+        .bind(`unlock:${userId}`, Date.now() - UNLOCK_WINDOW_MS).first<{ n: number }>();
+    if ((row?.n ?? 0) >= UNLOCK_MAX_FAILURES) throw new HttpError(429, 'Too many wrong attempts, try again in 15 minutes');
 }
+
+async function recordUnlockFailure(env: ApiEnv, userId: number) {
+    await env.DB.prepare('INSERT INTO login_failures (username, at) VALUES (?, ?)').bind(`unlock:${userId}`, Date.now()).run();
+}
+
+/** Runs `open`; a failure counts towards the per-account throttle. */
+async function guarded(env: ApiEnv, userId: number, open: () => Promise<DataKey>): Promise<DataKey> {
+    await assertUnlockNotThrottled(env, userId);
+    try {
+        return await open();
+    } catch (e) {
+        if (e instanceof HttpError && e.status !== 403) throw e;
+        await recordUnlockFailure(env, userId);
+        throw badSecret();
+    }
+}
+
+/**
+ * Legacy accounts (key_version 1) kept the snapshot under the PIN key. On the
+ * first correct PIN: create a data key, wrap it with the PIN, re-encrypt the
+ * snapshot — in one transaction that only applies while still at version 1,
+ * so two devices upgrading at once cannot end up with two data keys.
+ */
+async function upgradeLegacy(env: ApiEnv, user: UserRow, kek: CryptoKey): Promise<DataKey> {
+    try {
+        await aesDecrypt(kek, fromB64(user.pin_check!));
+    } catch {
+        throw badSecret();
+    }
+    const dek = await newDek();
+    const stillLegacy = `EXISTS (SELECT 1 FROM users WHERE id = ${user.id} AND key_version = 1)`;
+    const stmts = [
+        env.DB.prepare(`INSERT INTO key_envelopes (id, user_id, kind, wrapped, created_at) SELECT ?, ?, 'pin', ?, ? WHERE ${stillLegacy}`)
+            .bind(randomToken(12), user.id, await wrapDek(kek, dek), nowIso()),
+    ];
+    const row = await getData(env, user.id);
+    if (row?.is_encrypted) {
+        const payload = toB64(await aesEncrypt(dek.key, await aesDecrypt(kek, fromB64(row.payload))));
+        stmts.push(env.DB.prepare(`UPDATE user_data SET payload = ?, size_bytes = ? WHERE user_id = ? AND ${stillLegacy}`)
+            .bind(payload, payload.length, user.id));
+    }
+    stmts.push(env.DB.prepare('UPDATE users SET key_version = 2 WHERE id = ? AND key_version = 1').bind(user.id));
+    const results = await env.DB.batch(stmts);
+    if (results[results.length - 1].meta.changes) return dek;
+    // Another request upgraded first: use its data key.
+    return openWithPin(env, { ...user, key_version: 2 }, kek);
+}
+
+async function openWithPin(env: ApiEnv, user: UserRow, kek: CryptoKey): Promise<DataKey> {
+    if (user.key_version < 2) return upgradeLegacy(env, user, kek);
+    const envelope = await envelopeQuery(env, user.id, 'pin').first<EnvelopeRow>();
+    if (!envelope) throw badSecret();
+    try {
+        return await unwrapDek(kek, envelope.wrapped);
+    } catch {
+        throw badSecret();
+    }
+}
+
+const unlockWithPin = (env: ApiEnv, user: UserRow, pin: string) => guarded(env, user.id, async () => {
+    if (!user.pin_salt || !PIN_RE.test(pin)) throw badSecret();
+    return openWithPin(env, user, await pinKek(pin, user.pin_salt));
+});
+
+/**
+ * The data key for a request: null without a security PIN (snapshot only
+ * gzipped), else opened by an unlock token ("u1.<id>.<secret>", the normal
+ * case) or, for older clients, the PIN itself.
+ */
+async function resolveDataKey(env: ApiEnv, user: UserRow, credential: string): Promise<DataKey | null> {
+    if (!user.pin_salt) return null;
+    const token = parseToken(credential);
+    if (!token) return unlockWithPin(env, user, credential);
+    const envelope = await env.DB.prepare(
+        `SELECT * FROM key_envelopes WHERE id = ? AND user_id = ? AND kind IN ('device', 'session')`
+    ).bind(token.id, user.id).first<EnvelopeRow>();
+    if (!envelope || (envelope.expires_at ?? 0) < Date.now()) throw badSecret();
+    try {
+        return await unwrapDek(await tokenKek(token.secret), envelope.wrapped);
+    } catch {
+        throw badSecret();
+    }
+}
+
+/** Issue an unlock token for this browser: 7 days if remembered, else 24 h (kept in memory). */
+async function grantToken(env: ApiEnv, request: Request, userId: number, dek: DataKey, remember: boolean) {
+    const issued = await issueToken(dek, remember ? DEVICE_TTL_MS : SESSION_TTL_MS);
+    await env.DB.prepare(
+        'INSERT INTO key_envelopes (id, user_id, kind, wrapped, label, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).bind(issued.id, userId, remember ? 'device' : 'session', issued.wrapped, deviceInfo(request), nowIso(), issued.expiresAt).run();
+    return { unlock_token: issued.token, token_id: issued.id, expires_at: issued.expiresAt, remembered: remember };
+}
+
+const pinEnvelopeStatements = async (env: ApiEnv, userId: number, pin: string, dek: DataKey) => {
+    const salt = toB64(randomBytes(16));
+    const kek = await pinKek(pin, salt);
+    return [
+        env.DB.prepare(`DELETE FROM key_envelopes WHERE user_id = ? AND kind = 'pin'`).bind(userId),
+        env.DB.prepare(`INSERT INTO key_envelopes (id, user_id, kind, wrapped, created_at) VALUES (?, ?, 'pin', ?, ?)`)
+            .bind(randomToken(12), userId, await wrapDek(kek, dek), nowIso()),
+        env.DB.prepare('UPDATE users SET pin_salt = ?, pin_check = ?, key_version = 2 WHERE id = ?')
+            .bind(salt, toB64(await aesEncrypt(kek, utf8(PIN_CHECK_TEXT))), userId),
+    ];
+};
+
+const recoveryEnvelopeStatements = async (env: ApiEnv, userId: number, dek: DataKey) => {
+    const recoveryKey = newRecoveryKey();
+    const wrapped = await wrapDek(await recoveryKek(normalizeRecoveryKey(recoveryKey)!), dek);
+    return {
+        recoveryKey,
+        statements: [
+            env.DB.prepare(`DELETE FROM key_envelopes WHERE user_id = ? AND kind = 'recovery'`).bind(userId),
+            env.DB.prepare(`INSERT INTO key_envelopes (id, user_id, kind, wrapped, created_at) VALUES (?, ?, 'recovery', ?, ?)`)
+                .bind(randomToken(12), userId, wrapped, nowIso()),
+        ],
+    };
+};
+
+const MAX_LABEL = 80;
+const cleanLabel = (value: unknown, fallback: string) =>
+    (typeof value === 'string' && value.trim() ? value.trim() : fallback).slice(0, MAX_LABEL);
 
 async function packData(value: unknown, key: CryptoKey | null): Promise<{ payload: string; encrypted: boolean }> {
     let bytes = await gzip(encodeJson(value));
@@ -266,6 +394,8 @@ export async function scheduledCleanup(env: ApiEnv): Promise<void> {
         env.DB.prepare('DELETE FROM sessions WHERE refresh_expires < ?').bind(now),
         env.DB.prepare('DELETE FROM data_writes WHERE at < ?').bind(now - DATA_WRITES_RETENTION_MS),
         env.DB.prepare('DELETE FROM oauth_states WHERE expires < ?').bind(now),
+        env.DB.prepare('DELETE FROM key_envelopes WHERE expires_at IS NOT NULL AND expires_at < ?').bind(now),
+        env.DB.prepare('DELETE FROM login_failures WHERE at < ?').bind(now - UNLOCK_WINDOW_MS),
     ]);
 }
 
@@ -452,50 +582,174 @@ const routes: [string, RegExp, Handler][] = [
         return ok(profileOf({ ...user, ...next }));
     }],
 
+    // What protects the cloud copy, and the passkeys a browser may offer
+    // (credential ids + PRF inputs are needed before unlocking).
     ['GET', /^\/api\/user\/security-password\/status$/, async (env, request) => {
         const { user } = await authenticate(env, request);
-        return ok({ has_security_password: !!user.pin_salt });
+        const { results } = await env.DB.prepare(
+            `SELECT * FROM key_envelopes WHERE user_id = ? AND kind IN ('recovery', 'passkey', 'device') AND (expires_at IS NULL OR expires_at > ?)
+             ORDER BY created_at`
+        ).bind(user.id, Date.now()).all<EnvelopeRow>();
+        return ok({
+            has_security_password: !!user.pin_salt,
+            // Accounts from before envelopes have none until they create one in settings.
+            has_recovery_key: results.some(e => e.kind === 'recovery'),
+            passkeys: results.filter(e => e.kind === 'passkey').map(e => ({
+                id: e.id, credential_id: e.credential_id, prf_input: e.prf_input, label: e.label, created_at: e.created_at,
+            })),
+            devices: results.filter(e => e.kind === 'device').map(e => ({
+                id: e.id, label: e.label, created_at: e.created_at, expires_at: e.expires_at,
+            })),
+        });
     }],
 
+    // Set the PIN: creates the data key, wraps it with the PIN and a new
+    // recovery key (returned once), and encrypts the existing snapshot.
     ['POST', /^\/api\/user\/security-password$/, async (env, request) => {
         const { user } = await authenticate(env, request);
         if (user.pin_salt) throw new HttpError(409, 'Security password already set');
-        const pin = str((await readJson(request)).password);
+        const body = await readJson(request);
+        const pin = str(body.password);
         if (!PIN_RE.test(pin)) throw new HttpError(400, 'Password must be 6 digits');
-        const salt = randomBytes(16);
-        const key = await pinKey(pin, salt, PIN_ITERATIONS);
-        const check = toB64(await aesEncrypt(key, utf8(PIN_CHECK_TEXT)));
+        const dek = await newDek();
+        const recovery = await recoveryEnvelopeStatements(env, user.id, dek);
+        const stmts = [...await pinEnvelopeStatements(env, user.id, pin, dek), ...recovery.statements];
         const existing = await getData(env, user.id);
-        const stmts = [env.DB.prepare('UPDATE users SET pin_salt = ?, pin_check = ? WHERE id = ?').bind(toB64(salt), check, user.id)];
-        if (existing) {
-            const value = await unpackData(existing, null);
-            const { payload } = await packData(value, key);
-            stmts.push(env.DB.prepare('UPDATE user_data SET payload = ?, is_encrypted = 1, size_bytes = ?, updated_at = ? WHERE user_id = ?')
-                .bind(payload, payload.length, nowIso(), user.id));
+        if (existing && !existing.is_encrypted) {
+            const { payload } = await packData(await unpackData(existing, null), dek.key);
+            stmts.push(env.DB.prepare('UPDATE user_data SET payload = ?, is_encrypted = 1, size_bytes = ? WHERE user_id = ?')
+                .bind(payload, payload.length, user.id));
         }
+        // One transaction: PIN, recovery key and encrypted snapshot change together.
         await env.DB.batch(stmts);
-        return ok(undefined, 'Security password set');
+        return ok({ recovery_key: recovery.recoveryKey, ...await grantToken(env, request, user.id, dek, body.remember === true) },
+            'Security password set');
     }],
 
+    // Change the PIN: only the PIN envelope changes; the data stays as it is.
     ['PUT', /^\/api\/user\/security-password$/, async (env, request) => {
         const { user } = await authenticate(env, request);
         const body = await readJson(request);
-        const oldKey = await pinKeyFor(user, str(body.old_password));
+        const dek = await resolveDataKey(env, user, str(body.old_password));
+        if (!dek) throw new HttpError(400, 'No security password set');
         const pin = str(body.new_password);
         if (!PIN_RE.test(pin)) throw new HttpError(400, 'Password must be 6 digits');
-        const salt = randomBytes(16);
-        const key = await pinKey(pin, salt, PIN_ITERATIONS);
-        const check = toB64(await aesEncrypt(key, utf8(PIN_CHECK_TEXT)));
-        const existing = await getData(env, user.id);
-        const stmts = [env.DB.prepare('UPDATE users SET pin_salt = ?, pin_check = ? WHERE id = ?').bind(toB64(salt), check, user.id)];
-        if (existing) {
-            const value = await unpackData(existing, oldKey);
-            const { payload } = await packData(value, key);
-            stmts.push(env.DB.prepare('UPDATE user_data SET payload = ?, is_encrypted = 1, size_bytes = ?, updated_at = ? WHERE user_id = ?')
-                .bind(payload, payload.length, nowIso(), user.id));
-        }
-        await env.DB.batch(stmts);
+        await env.DB.batch(await pinEnvelopeStatements(env, user.id, pin, dek));
         return ok(undefined, 'Security password updated');
+    }],
+
+    // Unlock with the PIN or a passkey; returns an unlock token for this
+    // browser (remember = 7 days on this device, else 24 h in memory).
+    ['POST', /^\/api\/user\/security\/unlock$/, async (env, request) => {
+        const { user } = await authenticate(env, request);
+        if (!user.pin_salt) throw new HttpError(400, 'No security password set');
+        const body = await readJson(request);
+        let dek: DataKey;
+        if (body.method === 'passkey') {
+            const credentialId = str(body.credential_id);
+            const prfOutput = str(body.prf_output);
+            dek = await guarded(env, user.id, async () => {
+                const envelope = await env.DB.prepare(
+                    `SELECT * FROM key_envelopes WHERE user_id = ? AND kind = 'passkey' AND credential_id = ?`
+                ).bind(user.id, credentialId).first<EnvelopeRow>();
+                if (!envelope || !prfOutput) throw badSecret();
+                try {
+                    return await unwrapDek(await passkeyKek(prfOutput), envelope.wrapped);
+                } catch {
+                    throw badSecret();
+                }
+            });
+        } else {
+            dek = await unlockWithPin(env, user, str(body.pin));
+        }
+        return ok(await grantToken(env, request, user.id, dek, body.remember === true));
+    }],
+
+    // Forgot the PIN: the recovery key opens the data key and a new PIN is set.
+    ['POST', /^\/api\/user\/security\/recover$/, async (env, request) => {
+        const { user } = await authenticate(env, request);
+        if (!user.pin_salt) throw new HttpError(400, 'No security password set');
+        const body = await readJson(request);
+        const pin = str(body.new_password);
+        if (!PIN_RE.test(pin)) throw new HttpError(400, 'Password must be 6 digits');
+        const canonical = normalizeRecoveryKey(str(body.recovery_key));
+        const dek = await guarded(env, user.id, async () => {
+            const envelope = await envelopeQuery(env, user.id, 'recovery').first<EnvelopeRow>();
+            if (!envelope || !canonical) throw badSecret();
+            try {
+                return await unwrapDek(await recoveryKek(canonical), envelope.wrapped);
+            } catch {
+                throw badSecret();
+            }
+        });
+        await env.DB.batch(await pinEnvelopeStatements(env, user.id, pin, dek));
+        return ok(await grantToken(env, request, user.id, dek, body.remember === true));
+    }],
+
+    // New recovery key (shown once); the previous one stops working.
+    ['POST', /^\/api\/user\/security\/recovery$/, async (env, request) => {
+        const { user } = await authenticate(env, request);
+        const dek = await resolveDataKey(env, user, str((await readJson(request)).password));
+        if (!dek) throw new HttpError(400, 'No security password set');
+        const recovery = await recoveryEnvelopeStatements(env, user.id, dek);
+        await env.DB.batch(recovery.statements);
+        return ok({ recovery_key: recovery.recoveryKey });
+    }],
+
+    // Add a passkey: the browser created it and evaluated its PRF; the
+    // output becomes another way to open the data key.
+    ['POST', /^\/api\/user\/security\/passkeys$/, async (env, request) => {
+        const { user } = await authenticate(env, request);
+        const body = await readJson(request);
+        const dek = await resolveDataKey(env, user, str(body.password));
+        if (!dek) throw new HttpError(400, 'No security password set');
+        const credentialId = str(body.credential_id);
+        const prfInput = str(body.prf_input);
+        const prfOutput = str(body.prf_output);
+        if (!/^[A-Za-z0-9_-]{16,1024}$/.test(credentialId) || !/^[A-Za-z0-9+/=]{20,200}$/.test(prfInput) || !/^[A-Za-z0-9+/=]{20,200}$/.test(prfOutput)) {
+            throw new HttpError(400, 'Invalid passkey');
+        }
+        const id = randomToken(12);
+        await env.DB.prepare(
+            `INSERT INTO key_envelopes (id, user_id, kind, wrapped, credential_id, prf_input, label, created_at) VALUES (?, ?, 'passkey', ?, ?, ?, ?, ?)`
+        ).bind(id, user.id, await wrapDek(await passkeyKek(prfOutput), dek), credentialId, prfInput, cleanLabel(body.label, deviceInfo(request)), nowIso()).run();
+        return ok({ id });
+    }],
+
+    ['DELETE', /^\/api\/user\/security\/passkeys\/([A-Za-z0-9_-]+)$/, async (env, request, [id]) => {
+        const { user } = await authenticate(env, request);
+        await env.DB.prepare(`DELETE FROM key_envelopes WHERE id = ? AND user_id = ? AND kind = 'passkey'`).bind(id, user.id).run();
+        return ok(undefined, 'Passkey removed');
+    }],
+
+    // Re-issue this browser's token from the current one: start or stop
+    // remembering the device without asking for the PIN again.
+    ['POST', /^\/api\/user\/security\/token$/, async (env, request) => {
+        const { user } = await authenticate(env, request);
+        const body = await readJson(request);
+        const current = parseToken(str(body.password));
+        const dek = current ? await resolveDataKey(env, user, str(body.password)) : null;
+        if (!dek || !current) throw badSecret();
+        const grant = await grantToken(env, request, user.id, dek, body.remember === true);
+        await env.DB.prepare(`DELETE FROM key_envelopes WHERE id = ? AND user_id = ?`).bind(current.id, user.id).run();
+        return ok(grant);
+    }],
+
+    // Forget one remembered device / browser session (e.g. this one on logout).
+    ['DELETE', /^\/api\/user\/security\/devices\/([A-Za-z0-9_-]+)$/, async (env, request, [id]) => {
+        const { user } = await authenticate(env, request);
+        await env.DB.prepare(`DELETE FROM key_envelopes WHERE id = ? AND user_id = ? AND kind IN ('device', 'session')`).bind(id, user.id).run();
+        return ok(undefined, 'Device forgotten');
+    }],
+
+    // Lost phone: every other device has to unlock again (passkeys stay).
+    ['POST', /^\/api\/user\/security\/devices\/revoke-others$/, async (env, request) => {
+        const { user } = await authenticate(env, request);
+        const keep = str((await readJson(request)).keep_id);
+        const res = await env.DB.prepare(
+            `DELETE FROM key_envelopes WHERE user_id = ? AND kind IN ('device', 'session') AND id != ?`
+        ).bind(user.id, keep).run();
+        return ok({ revoked_count: res.meta.changes ?? 0 });
     }],
 
     // Cheap "anything new?" check (no PIN, no download, no decryption), the
@@ -511,7 +765,7 @@ const routes: [string, RegExp, Handler][] = [
     ['POST', /^\/api\/user\/data$/, async (env, request) => {
         const { user } = await authenticate(env, request);
         const body = await readJson(request);
-        const key = user.pin_salt ? await pinKeyFor(user, str(body.password)) : null;
+        const key = (await resolveDataKey(env, user, str(body.password)))?.key ?? null;
         const row = await getData(env, user.id);
         if (!row) return ok({ data: null, is_encrypted: !!key, revision: 0 });
         return ok({ data: await unpackData(row, key), is_encrypted: !!row.is_encrypted, revision: row.revision });
@@ -522,7 +776,7 @@ const routes: [string, RegExp, Handler][] = [
         const body = await readJson(request);
         if (!body.data || typeof body.data !== 'object') throw new HttpError(400, 'data required');
         const baseRevision = readBaseRevision(body.base_revision);
-        const key = user.pin_salt ? await pinKeyFor(user, str(body.password)) : null;
+        const key = (await resolveDataKey(env, user, str(body.password)))?.key ?? null;
         const revision = await putData(env, user.id, body.data, key, baseRevision);
         return ok({ revision }, 'Saved');
     }],

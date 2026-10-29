@@ -143,7 +143,7 @@ function pullWouldClearLocalList(localData: Record<string, any>, cloudData: Reco
 
 export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { isAuthenticated, user, getSessionGeneration } = useAuth();
-  const { hasSecurityPassword, isVerified, securityPassword, passwordVerificationFailed, checkSecurityPassword } = useSecurityPassword();
+  const { hasSecurityPassword, isVerified, securityPassword, passwordVerificationFailed, checkSecurityPassword, invalidateUnlock } = useSecurityPassword();
   const [isSyncing, setIsSyncing] = useState(false);
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
@@ -199,6 +199,9 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   // Offline / busy get a friendly message and an automatic retry (runSync).
   const reportFailure = useCallback((status: number | undefined, error: string | undefined) => {
     const code = status ?? 0;
+    // The unlock token expired or was revoked (another device chose "sign out
+    // other devices"): show the PIN / passkey gate again.
+    if (code === 403 && /security password/i.test(error || '')) invalidateUnlock();
     // 401 here means the access token could not be renewed just now (e.g. the
     // network was not back yet when the phone woke up); a failed renewal that
     // really ends the session logs out instead. Retry like an offline failure.
@@ -212,7 +215,7 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         // screenshot is enough to tell what went wrong.
         : `${error || 'Sync failed'} (HTTP ${code})`,
     );
-  }, []);
+  }, [invalidateUnlock]);
 
   // ── getLocalDataSnapshot ──
   const getLocalDataSnapshot = useCallback(() => {

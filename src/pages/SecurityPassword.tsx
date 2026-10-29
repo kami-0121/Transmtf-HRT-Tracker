@@ -6,6 +6,13 @@ import { useAuth } from '../contexts/AuthContext';
 import apiClient from '../api/client';
 import PINInput from '../components/PINInput';
 import { saveSecurityPassword } from '../utils/crypto';
+import { CLOUD_BACKEND } from '../api/config';
+import { useSecurityPassword } from '../contexts/SecurityPasswordContext';
+import SecurityKeysPanel, { RecoveryKeyCard } from '../components/SecurityKeysPanel';
+
+// This fork's own backend: unlock tokens, passkeys and a recovery key (as AtDo);
+// the PIN is never stored on the device.
+const TOKEN_UNLOCK = CLOUD_BACKEND === 'd1';
 
 const SecurityPassword: React.FC = () => {
   const { t } = useTranslation();
@@ -22,6 +29,9 @@ const SecurityPassword: React.FC = () => {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const { acceptGrant, checkSecurityPassword } = useSecurityPassword();
+  // Shown once right after the PIN is set.
+  const [recoveryKey, setRecoveryKey] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -65,8 +75,13 @@ const SecurityPassword: React.FC = () => {
     if (response.success) {
       setSuccess(t('security.success.set') || 'Security password set successfully');
 
-      // 保存密码到 Cookie（加密，7天过期）
-      if (user?.username) {
+      if (TOKEN_UNLOCK) {
+        // Unlocked for this session; the recovery key is shown once.
+        if (response.data?.unlock_token) acceptGrant(response.data as Required<typeof response.data>);
+        if (response.data?.recovery_key) setRecoveryKey(response.data.recovery_key);
+        checkSecurityPassword();
+      } else if (user?.username) {
+        // 保存密码到 Cookie（加密）
         await saveSecurityPassword(newPassword, user.username);
       }
 
@@ -110,8 +125,8 @@ const SecurityPassword: React.FC = () => {
     if (response.success) {
       setSuccess(t('security.success.changed') || 'Security password changed successfully');
 
-      // 保存新密码到 Cookie（加密，7天过期）
-      if (user?.username) {
+      // 保存新密码到 Cookie（加密）— the D1 backend keeps tokens instead.
+      if (!TOKEN_UNLOCK && user?.username) {
         await saveSecurityPassword(newPassword, user.username);
       }
 
@@ -303,6 +318,9 @@ const SecurityPassword: React.FC = () => {
           )}
         </div>
 
+        {TOKEN_UNLOCK && recoveryKey && <RecoveryKeyCard recoveryKey={recoveryKey} onDone={() => setRecoveryKey(null)} />}
+        {TOKEN_UNLOCK && hasPassword && mode === 'view' && <SecurityKeysPanel />}
+
         <div className="bg-blue-50 border border-blue-200 rounded-2xl p-4">
           <h3 className="font-semibold text-blue-900 mb-2 flex items-center gap-2">
             <AlertCircle size={18} />
@@ -312,7 +330,7 @@ const SecurityPassword: React.FC = () => {
             <li>{t('security.info.1') || 'Use 6 digits (0-9) only'}</li>
             <li>{t('security.info.2') || 'This password encrypts your data'}</li>
             <li className="text-red-600 font-semibold">
-              {t('security.info.warning') || 'If you forget this password, your encrypted data cannot be recovered'}
+              {TOKEN_UNLOCK ? t('security.info.warningRecovery') : (t('security.info.warning') || 'If you forget this password, your encrypted data cannot be recovered')}
             </li>
           </ul>
         </div>

@@ -10,6 +10,9 @@ import type {
   SetSecurityPasswordRequest,
   UpdateSecurityPasswordRequest,
   SecurityPasswordStatusResponse,
+  SetSecurityPasswordResponse,
+  UnlockGrant,
+  UnlockRequest,
   GetUserDataRequest,
   UserDataResponse,
   UpdateUserDataRequest,
@@ -339,8 +342,8 @@ class ApiClient {
   }
 
   // User Data APIs
-  async setSecurityPassword(data: SetSecurityPasswordRequest): Promise<ApiResponse<void>> {
-    return this.request<void>('/user/security-password', {
+  async setSecurityPassword(data: SetSecurityPasswordRequest): Promise<ApiResponse<SetSecurityPasswordResponse>> {
+    return this.request<SetSecurityPasswordResponse>('/user/security-password', {
       method: 'POST',
       body: JSON.stringify(data),
     });
@@ -355,6 +358,43 @@ class ApiClient {
 
   async getSecurityPasswordStatus(): Promise<ApiResponse<SecurityPasswordStatusResponse>> {
     return this.request<SecurityPasswordStatusResponse>('/user/security-password/status');
+  }
+
+  // ── D1 backend: unlocking without the PIN (server/keys.ts) ──
+  private postJson<T>(endpoint: string, body: unknown, method = 'POST') {
+    return this.request<T>(endpoint, { method, body: JSON.stringify(body) });
+  }
+
+  unlock(data: UnlockRequest) {
+    return this.postJson<UnlockGrant>('/user/security/unlock', data);
+  }
+
+  recoverWithKey(data: { recovery_key: string; new_password: string; remember?: boolean }) {
+    return this.postJson<UnlockGrant>('/user/security/recover', data);
+  }
+
+  regenerateRecoveryKey(password: string) {
+    return this.postJson<{ recovery_key: string }>('/user/security/recovery', { password });
+  }
+
+  addPasskey(data: { password: string; credential_id: string; prf_input: string; prf_output: string; label?: string }) {
+    return this.postJson<{ id: string }>('/user/security/passkeys', data);
+  }
+
+  removePasskey(id: string) {
+    return this.request<void>(`/user/security/passkeys/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  }
+
+  reissueToken(password: string, remember: boolean) {
+    return this.postJson<UnlockGrant>('/user/security/token', { password, remember });
+  }
+
+  forgetDevice(id: string) {
+    return this.request<void>(`/user/security/devices/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  }
+
+  revokeOtherDevices(keepId: string) {
+    return this.postJson<{ revoked_count: number }>('/user/security/devices/revoke-others', { keep_id: keepId });
   }
 
   async getUserData(data?: GetUserDataRequest, externalSignal?: AbortSignal): Promise<ApiResponse<UserDataResponse>> {

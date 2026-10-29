@@ -1,9 +1,14 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Lock, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { Lock, AlertCircle, CheckCircle2, Fingerprint, KeyRound } from 'lucide-react';
 import { useTranslation } from '../contexts/LanguageContext';
 import { useAuth } from '../contexts/AuthContext';
 import { useSecurityPassword } from '../contexts/SecurityPasswordContext';
 import NumericKeypad from './NumericKeypad';
+import { CLOUD_BACKEND } from '../api/config';
+import { canUsePasskeys } from '../utils/passkey';
+
+// This fork's own backend: remember the device, passkeys, recovery key (as AtDo).
+const TOKEN_UNLOCK = CLOUD_BACKEND === 'd1';
 
 // Transport/timeout/server-side failure markers produced by apiClient
 // (fetch errors, aborts, 5xx fallbacks, refresh failure, non-401 verify
@@ -16,7 +21,17 @@ const NETWORK_ERROR_PATTERN = /failed to fetch|networkerror|network error|load f
 const SecurityPasswordGate: React.FC = () => {
   const { t } = useTranslation();
   const { logout } = useAuth();
-  const { hasSecurityPassword, isVerified, isAutoVerifying, verifySecurityPassword } = useSecurityPassword();
+  const { hasSecurityPassword, isVerified, isAutoVerifying, verifySecurityPassword, status, unlockWithPasskey, recoverWithKey } = useSecurityPassword();
+  // "Remember this device for 7 days" — off by default, as in AtDo.
+  const [remember, setRemember] = useState(false);
+  const [passkeysUsable, setPasskeysUsable] = useState(false);
+  const [mode, setMode] = useState<'pin' | 'recover'>('pin');
+  const [recoveryKey, setRecoveryKey] = useState('');
+  const [newPin, setNewPin] = useState('');
+  const hasPasskeys = TOKEN_UNLOCK && !!status?.passkeys?.length;
+  useEffect(() => {
+    if (hasPasskeys) canUsePasskeys().then(setPasskeysUsable);
+  }, [hasPasskeys]);
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [isVerifying, setIsVerifying] = useState(false);
@@ -49,7 +64,7 @@ const SecurityPasswordGate: React.FC = () => {
     verifyingRef.current = true;
 
     try {
-      const result = await verifySecurityPassword(pwd);
+      const result = await verifySecurityPassword(pwd, remember);
       if (result.success) {
         setIsSuccess(true);
         setPassword('');
@@ -72,7 +87,66 @@ const SecurityPasswordGate: React.FC = () => {
       setIsVerifying(false);
       verifyingRef.current = false;
     }
-  }, [isVerifying, verifySecurityPassword, t]);
+  }, [isVerifying, verifySecurityPassword, t, remember]);
+
+  const showFailure = useCallback((msg: string) => {
+    if (msg === 'cancelled') return;
+    if (/too many/i.test(msg)) setError(t('security.error.rateLimited') || 'Too many attempts. Please wait and try again.');
+    else if (NETWORK_ERROR_PATTERN.test(msg)) setError(t('security.gate.network_error') || 'Network error');
+    else setError(msg);
+  }, [t]);
+
+  const handlePasskey = useCallback(async () => {
+    if (verifyingRef.current) return;
+    setError('');
+    setIsVerifying(true);
+    verifyingRef.current = true;
+    try {
+      const result = await unlockWithPasskey(remember);
+      if (result.success) setIsSuccess(true);
+      else showFailure(result.error === 'cancelled' ? 'cancelled' : /invalid security/i.test(result.error || '') ? t('security.passkeyFailed') : (result.error || ''));
+    } finally {
+      setIsVerifying(false);
+      verifyingRef.current = false;
+    }
+  }, [unlockWithPasskey, remember, showFailure, t]);
+
+  const handleRecover = useCallback(async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (verifyingRef.current) return;
+    if (!/^\d{6}$/.test(newPin)) {
+      setError(t('security.error.invalid') || 'Password must be 6 digits');
+      return;
+    }
+    setError('');
+    setIsVerifying(true);
+    verifyingRef.current = true;
+    try {
+      const result = await recoverWithKey(recoveryKey, newPin, remember);
+      if (result.success) {
+        setIsSuccess(true);
+        setRecoveryKey('');
+        setNewPin('');
+      } else {
+        showFailure(/invalid security/i.test(result.error || '') ? t('security.recover.invalid') : (result.error || ''));
+      }
+    } finally {
+      setIsVerifying(false);
+      verifyingRef.current = false;
+    }
+  }, [recoverWithKey, recoveryKey, newPin, remember, showFailure, t]);
+
+  const rememberToggle = TOKEN_UNLOCK && (
+    <label className="mb-4 flex cursor-pointer items-center justify-center gap-2 text-xs sm:text-sm" style={{ color: 'rgba(120,80,160,0.9)' }}>
+      <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} className="h-4 w-4 accent-pink-500" />
+      <span>{t('security.remember7d')}</span>
+    </label>
+  );
+
+  const linkStyle: React.CSSProperties = {
+    fontSize: 12, fontWeight: 500, color: 'rgba(120,80,160,0.85)', background: 'none', border: 'none',
+    padding: '6px 10px', cursor: 'pointer', textDecoration: 'underline', textUnderlineOffset: '3px',
+  };
 
   useEffect(() => {
     if (password.length === 6 && !isVerifying && !verifyingRef.current) {
@@ -285,14 +359,82 @@ const SecurityPasswordGate: React.FC = () => {
               </div>
             )}
 
-            {/* Keypad */}
-            <div className="mb-5">
-              <NumericKeypad
-                onNumberPress={handleNumberPress}
-                onDelete={handleDelete}
-                disabled={isVerifying}
-              />
-            </div>
+            {mode === 'pin' ? (
+              <>
+                {rememberToggle}
+
+                {/* Keypad */}
+                <div className="mb-5">
+                  <NumericKeypad
+                    onNumberPress={handleNumberPress}
+                    onDelete={handleDelete}
+                    disabled={isVerifying}
+                  />
+                </div>
+
+                {hasPasskeys && passkeysUsable && (
+                  <button
+                    type="button"
+                    onClick={handlePasskey}
+                    disabled={isVerifying}
+                    className="mb-3 flex w-full items-center justify-center gap-2 rounded-2xl border px-4 py-3 text-sm font-semibold transition disabled:opacity-60"
+                    style={{ borderColor: 'rgba(236,72,153,0.35)', color: '#be185d', background: 'rgba(253,242,248,0.6)' }}
+                  >
+                    <Fingerprint size={18} />
+                    {t('security.passkeyUnlock')}
+                  </button>
+                )}
+
+                {TOKEN_UNLOCK && status?.has_recovery_key && (
+                  <div className="mb-3 text-center">
+                    <button type="button" style={linkStyle} onClick={() => { setMode('recover'); setError(''); }}>
+                      {t('security.forgotPin')}
+                    </button>
+                  </div>
+                )}
+              </>
+            ) : (
+              <form onSubmit={handleRecover} className="mb-5 space-y-3">
+                <p className="flex items-center gap-2 text-sm font-semibold" style={{ color: '#9d174d' }}>
+                  <KeyRound size={16} />
+                  {t('security.recover.title')}
+                </p>
+                <input
+                  value={recoveryKey}
+                  onChange={(e) => setRecoveryKey(e.target.value)}
+                  placeholder={t('security.recover.keyPlaceholder')}
+                  autoCapitalize="characters"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="w-full rounded-2xl border px-4 py-3 font-mono text-sm tracking-wider focus:outline-none focus:ring-2 focus:ring-pink-400"
+                  style={{ borderColor: 'rgba(236,72,153,0.3)', background: 'rgba(255,255,255,0.7)', color: '#4a044e' }}
+                />
+                <input
+                  value={newPin}
+                  onChange={(e) => setNewPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  placeholder={t('security.recover.newPin')}
+                  inputMode="numeric"
+                  type="password"
+                  autoComplete="new-password"
+                  className="w-full rounded-2xl border px-4 py-3 text-sm tracking-[0.4em] focus:outline-none focus:ring-2 focus:ring-pink-400"
+                  style={{ borderColor: 'rgba(236,72,153,0.3)', background: 'rgba(255,255,255,0.7)', color: '#4a044e' }}
+                />
+                {rememberToggle}
+                <button
+                  type="submit"
+                  disabled={isVerifying || !recoveryKey.trim() || newPin.length !== 6}
+                  className="w-full rounded-2xl px-4 py-3 text-sm font-semibold text-white disabled:opacity-50"
+                  style={{ background: 'linear-gradient(135deg,#f472b6,#db2777)' }}
+                >
+                  {t('security.recover.submit')}
+                </button>
+                <div className="text-center">
+                  <button type="button" style={linkStyle} onClick={() => { setMode('pin'); setError(''); }}>
+                    {t('security.recover.back')}
+                  </button>
+                </div>
+              </form>
+            )}
 
             {/* Hints */}
             <div

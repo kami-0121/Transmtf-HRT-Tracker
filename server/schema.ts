@@ -96,6 +96,24 @@ export const MIGRATIONS: string[][] = [
         `CREATE INDEX IF NOT EXISTS idx_sessions_prev_access ON sessions(prev_access_hash)`,
         `CREATE INDEX IF NOT EXISTS idx_sessions_prev_refresh ON sessions(prev_refresh_hash)`,
     ],
+    // v6: key envelopes (server/keys.ts). The snapshot is encrypted with a
+    // random data key; the PIN, recovery key, passkeys and remembered devices
+    // each wrap that key. key_version 1 = legacy (snapshot under the PIN key).
+    [
+        `ALTER TABLE users ADD COLUMN key_version INTEGER NOT NULL DEFAULT 1`,
+        `CREATE TABLE IF NOT EXISTS key_envelopes (
+            id              TEXT PRIMARY KEY,
+            user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            kind            TEXT NOT NULL,
+            wrapped         TEXT NOT NULL,
+            credential_id   TEXT,
+            prf_input       TEXT,
+            label           TEXT,
+            created_at      TEXT NOT NULL,
+            expires_at      INTEGER
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_key_envelopes_user ON key_envelopes(user_id, kind)`,
+    ],
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

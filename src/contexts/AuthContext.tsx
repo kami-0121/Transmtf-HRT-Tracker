@@ -3,6 +3,7 @@ import React, { createContext, useContext, useState, useEffect, useCallback } fr
 import apiClient from '../api/client';
 import type { AuthTokens, UpdateProfileRequest, UserProfile } from '../api/types';
 import { clearSecurityPassword } from '../utils/crypto';
+import { loadRememberedUnlock, clearRememberedUnlock } from '../utils/unlockStore';
 import { deleteCookie, getCookie, setCookie } from '../utils/cookies';
 import { setLogoutInProgress } from '../utils/authSessionState';
 import { clearAllLocalMedicalData, hasLocalMedicalData } from '../utils/localDataCleanup';
@@ -114,6 +115,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // namespaced cookie only (F18: never clear another account's PIN cookie).
     const usernameToClear = getStoredValue(USERNAME_STORAGE_KEY);
 
+    // This device's remembered unlock (7 days without the PIN) ends with the
+    // sign-in: revoke it on the server while the access token still works.
+    const rememberedUnlock = usernameToClear ? loadRememberedUnlock(usernameToClear) : null;
+    clearRememberedUnlock(usernameToClear);
+
     // Invalidate any in-flight refresh for the session being torn down.
     sessionGenerationRef.current += 1;
     // Capture this logout's generation: every post-await cleanup step below
@@ -124,6 +130,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // Abort in-flight API requests (sync pulls/pushes) so their results can
     // never land after this session ends (F02).
     apiClient.cancelInflightRequests();
+    if (rememberedUnlock) void apiClient.forgetDevice(rememberedUnlock.id);
 
     setIsLoggingOut(true);
     setLogoutInProgress(true);

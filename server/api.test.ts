@@ -286,6 +286,103 @@ describe.skipIf(!sqlite)('cloud-backup API (D1)', () => {
         });
     });
 
+    describe('security PIN, remembered devices, recovery key, passkeys', () => {
+        const b64 = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64');
+
+        it('sets a PIN with a recovery key and unlocks with a token', async () => {
+            const token = await signIn('sub-keys');
+            await call('PUT', '/user/data', { data: { events: [1] } }, token);
+            const set = await call('POST', '/user/security-password', { password: '246810', remember: true }, token);
+            expect(set.status).toBe(200);
+            expect(set.body.data.recovery_key).toMatch(/^([0-9A-HJKMNP-TV-Z]{4}-){7}[0-9A-HJKMNP-TV-Z]{4}$/);
+            const unlock = set.body.data.unlock_token as string;
+            expect(unlock).toMatch(/^u1\./);
+            // The existing snapshot is now encrypted and opens with the token or the PIN.
+            expect((await call('POST', '/user/data', { password: unlock }, token)).body.data.data).toEqual({ events: [1] });
+            expect((await call('POST', '/user/data', { password: '246810' }, token)).body.data.data).toEqual({ events: [1] });
+            expect((await call('POST', '/user/data', {}, token)).status).toBe(403);
+            const status = (await call('GET', '/user/security-password/status', undefined, token)).body.data;
+            expect(status).toMatchObject({ has_security_password: true, has_recovery_key: true, passkeys: [] });
+            expect(status.devices).toHaveLength(1);   // remembered for 7 days
+            expect(status.devices[0].expires_at - Date.now()).toBeGreaterThan(6.9 * 24 * 3600e3);
+        });
+
+        it('keeps data and tokens when the PIN changes, and the recovery key resets a forgotten PIN', async () => {
+            const token = await signIn('sub-keys');
+            const unlock = (await call('POST', '/user/security/unlock', { method: 'pin', pin: '246810' }, token)).body.data.unlock_token;
+            expect((await call('PUT', '/user/security-password', { old_password: unlock, new_password: '135790' }, token)).status).toBe(200);
+            expect((await call('POST', '/user/data', { password: unlock }, token)).status).toBe(200);
+            expect((await call('POST', '/user/data', { password: '246810' }, token)).status).toBe(403);
+            expect((await call('POST', '/user/data', { password: '135790' }, token)).body.data.data).toEqual({ events: [1] });
+
+            const recovery = (await call('POST', '/user/security/recovery', { password: unlock }, token)).body.data.recovery_key as string;
+            const reset = await call('POST', '/user/security/recover', { recovery_key: recovery.toLowerCase().replace(/-/g, ' '), new_password: '111222' }, token);
+            expect(reset.status).toBe(200);
+            expect((await call('POST', '/user/data', { password: reset.body.data.unlock_token }, token)).body.data.data).toEqual({ events: [1] });
+            expect((await call('POST', '/user/data', { password: '111222' }, token)).status).toBe(200);
+        });
+
+        it('unlocks with a passkey (PRF output) and forgets devices', async () => {
+            const token = await signIn('sub-keys');
+            const unlock = (await call('POST', '/user/security/unlock', { method: 'pin', pin: '111222', remember: true }, token)).body.data;
+            const prfInput = b64(crypto.getRandomValues(new Uint8Array(32)));
+            const prfOutput = b64(crypto.getRandomValues(new Uint8Array(32)));
+            const added = await call('POST', '/user/security/passkeys', {
+                password: unlock.unlock_token, credential_id: 'cred_ABCDEFGHIJKLMNOP', prf_input: prfInput, prf_output: prfOutput, label: 'Pixel',
+            }, token);
+            expect(added.status).toBe(200);
+            const viaPasskey = await call('POST', '/user/security/unlock', { method: 'passkey', credential_id: 'cred_ABCDEFGHIJKLMNOP', prf_output: prfOutput }, token);
+            expect((await call('POST', '/user/data', { password: viaPasskey.body.data.unlock_token }, token)).status).toBe(200);
+            const wrong = await call('POST', '/user/security/unlock', { method: 'passkey', credential_id: 'cred_ABCDEFGHIJKLMNOP', prf_output: b64(new Uint8Array(32)) }, token);
+            expect(wrong.status).toBe(403);
+            const status = (await call('GET', '/user/security-password/status', undefined, token)).body.data;
+            expect(status.passkeys[0]).toMatchObject({ credential_id: 'cred_ABCDEFGHIJKLMNOP', prf_input: prfInput, label: 'Pixel' });
+
+            // Lost phone: everything but this device must unlock again.
+            await call('POST', '/user/security/devices/revoke-others', { keep_id: unlock.token_id }, token);
+            expect((await call('POST', '/user/data', { password: viaPasskey.body.data.unlock_token }, token)).status).toBe(403);
+            expect((await call('POST', '/user/data', { password: unlock.unlock_token }, token)).status).toBe(200);
+            // Stop remembering this device: a session token replaces the device one.
+            const swapped = await call('POST', '/user/security/token', { password: unlock.unlock_token, remember: false }, token);
+            expect(swapped.body.data.remembered).toBe(false);
+            expect((await call('POST', '/user/data', { password: unlock.unlock_token }, token)).status).toBe(403);
+            expect((await call('GET', '/user/security-password/status', undefined, token)).body.data.devices).toHaveLength(0);
+            unlock.token_id = swapped.body.data.token_id;
+            unlock.unlock_token = swapped.body.data.unlock_token;
+            await call('DELETE', `/user/security/devices/${unlock.token_id}`, undefined, token);
+            expect((await call('POST', '/user/data', { password: unlock.unlock_token }, token)).status).toBe(403);
+        });
+
+        it('pauses after repeated wrong PINs', async () => {
+            const token = await signIn('sub-throttle');
+            await call('POST', '/user/security-password', { password: '999999' }, token);
+            for (let i = 0; i < 10; i++) {
+                expect((await call('POST', '/user/security/unlock', { method: 'pin', pin: '000000' }, token)).status).toBe(403);
+            }
+            expect((await call('POST', '/user/security/unlock', { method: 'pin', pin: '999999' }, token)).status).toBe(429);
+        });
+
+        it('upgrades an account whose snapshot was encrypted with the PIN itself', async () => {
+            const { pinKey, aesEncrypt, gzip, encodeJson, toB64, utf8 } = await import('./crypto');
+            const token = await signIn('sub-legacy');
+            const me = (await call('GET', '/user/me', undefined, token)).body.data;
+            const salt = crypto.getRandomValues(new Uint8Array(16));
+            const key = await pinKey('424242', salt, 10_000);
+            const payload = toB64(await aesEncrypt(key, await gzip(encodeJson({ events: ['legacy'] }))));
+            await env.DB.batch([
+                env.DB.prepare('UPDATE users SET pin_salt = ?, pin_check = ?, key_version = 1 WHERE id = ?')
+                    .bind(toB64(salt), toB64(await aesEncrypt(key, utf8('hrt-tracker-pin-check-v1'))), me.user_id),
+                env.DB.prepare('INSERT INTO user_data (user_id, payload, is_encrypted, size_bytes, updated_at, revision) VALUES (?, ?, 1, ?, ?, 1)')
+                    .bind(me.user_id, payload, payload.length, new Date().toISOString()),
+            ]);
+            expect((await call('POST', '/user/security/unlock', { method: 'pin', pin: '000000' }, token)).status).toBe(403);
+            const unlocked = await call('POST', '/user/security/unlock', { method: 'pin', pin: '424242' }, token);
+            expect(unlocked.status).toBe(200);
+            expect((await call('POST', '/user/data', { password: unlocked.body.data.unlock_token }, token)).body.data.data).toEqual({ events: ['legacy'] });
+            expect((await call('POST', '/user/data', { password: '424242' }, token)).body.data.data).toEqual({ events: ['legacy'] });
+        });
+    });
+
     it('daily cleanup runs', async () => {
         await expect(scheduledCleanup(env)).resolves.toBeUndefined();
     });

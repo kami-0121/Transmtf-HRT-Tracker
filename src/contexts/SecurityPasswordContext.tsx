@@ -2,6 +2,22 @@ import React, { createContext, useContext, useState, useCallback, useEffect, use
 import { useAuth } from './AuthContext';
 import apiClient from '../api/client';
 import { getSecurityPassword, clearSecurityPassword, saveSecurityPassword } from '../utils/crypto';
+import { CLOUD_BACKEND } from '../api/config';
+import type { ApiResponse, SecurityPasswordStatusResponse, UnlockGrant } from '../api/types';
+import { loadRememberedUnlock, saveRememberedUnlock, clearRememberedUnlock } from '../utils/unlockStore';
+import { getPasskeySecret, PasskeyCancelledError } from '../utils/passkey';
+
+// This fork's own backend unlocks with short-lived tokens (PIN, passkey or
+// recovery key → server/keys.ts); the original backend takes the PIN itself.
+const TOKEN_UNLOCK = CLOUD_BACKEND === 'd1';
+
+type UnlockResult = { success: boolean; error?: string };
+
+/** Map a failed unlock response to the gate's messages. */
+const unlockError = (response: ApiResponse<unknown>): string =>
+  response.status === 429 ? 'too many attempts'
+    : response.status === 403 ? (response.error || 'Invalid security password')
+    : (response.error || 'Verification failed');
 
 interface SecurityPasswordContextType {
   hasSecurityPassword: boolean | null; // null = loading, true/false = has/hasn't
@@ -10,8 +26,20 @@ interface SecurityPasswordContextType {
   passwordVerificationFailed: boolean; // True if auto-verification from cookie failed
   isAutoVerifying: boolean; // True if currently attempting auto-verification from cookie
   checkSecurityPassword: () => Promise<void>;
-  verifySecurityPassword: (password: string) => Promise<{ success: boolean; error?: string }>;
+  verifySecurityPassword: (password: string, remember?: boolean) => Promise<{ success: boolean; error?: string }>;
   clearVerification: () => void;
+  /** D1 backend: passkeys, recovery key and remembered devices of the account. */
+  status: SecurityPasswordStatusResponse | null;
+  refreshStatus: () => Promise<void>;
+  /** D1 backend: id of this browser's unlock token, and until when it is remembered (null = this session only). */
+  unlockTokenId: string | null;
+  rememberedUntil: number | null;
+  unlockWithPasskey: (remember?: boolean) => Promise<UnlockResult>;
+  recoverWithKey: (recoveryKey: string, newPin: string, remember?: boolean) => Promise<UnlockResult>;
+  /** Adopt a token the server just issued (e.g. after setting the PIN). */
+  acceptGrant: (grant: UnlockGrant) => void;
+  /** The server stopped accepting our token (expired / revoked): ask to unlock again. */
+  invalidateUnlock: () => void;
 }
 
 const SecurityPasswordContext = createContext<SecurityPasswordContextType | undefined>(undefined);
@@ -23,6 +51,9 @@ export const SecurityPasswordProvider: React.FC<{ children: React.ReactNode }> =
   const [securityPassword, setSecurityPassword] = useState<string | null>(null);
   const [passwordVerificationFailed, setPasswordVerificationFailed] = useState(false);
   const [isAutoVerifying, setIsAutoVerifying] = useState(false); // Track auto-verification state
+  const [status, setStatus] = useState<SecurityPasswordStatusResponse | null>(null);
+  const [unlockTokenId, setUnlockTokenId] = useState<string | null>(null);
+  const [rememberedUntil, setRememberedUntil] = useState<number | null>(null);
   // In-flight check marker keyed by session generation: an old session's check
   // must never suppress the new session's check (F18 re-review).
   const checkingRef = useRef<{ generation: number } | null>(null);
@@ -43,6 +74,96 @@ export const SecurityPasswordProvider: React.FC<{ children: React.ReactNode }> =
   useEffect(() => {
     passwordVerificationFailedRef.current = passwordVerificationFailed;
   }, [passwordVerificationFailed]);
+
+  // ── D1 backend: unlock tokens ──
+  const applyGrant = useCallback((grant: UnlockGrant, username: string | undefined) => {
+    setIsVerified(true);
+    setSecurityPassword(grant.unlock_token);
+    setUnlockTokenId(grant.token_id);
+    setRememberedUntil(grant.remembered ? grant.expires_at : null);
+    setPasswordVerificationFailed(false);
+    passwordVerificationFailedRef.current = false;
+    if (!username) return;
+    if (grant.remembered) saveRememberedUnlock(username, { token: grant.unlock_token, id: grant.token_id, expiresAt: grant.expires_at });
+    else clearRememberedUnlock(username);
+  }, []);
+
+  /**
+   * Start-up unlock without asking: a token remembered on this device (7 days),
+   * else the PIN an older version kept in a 10-year cookie — converted once
+   * into a remembered token, then the cookie is deleted.
+   */
+  const autoUnlock = async (username: string, generation: number) => {
+    const stale = () => !isAuthenticatedRef.current || getSessionGeneration() !== generation;
+    const remembered = loadRememberedUnlock(username);
+    if (remembered) {
+      const check = await apiClient.getUserData({ password: remembered.token });
+      if (stale()) return;
+      if (check.success) {
+        applyGrant({ unlock_token: remembered.token, token_id: remembered.id, expires_at: remembered.expiresAt, remembered: true }, username);
+        return;
+      }
+      if (check.status === 403) clearRememberedUnlock(username);
+      else return; // offline / server busy: keep it, the PIN gate can still be used
+    }
+    const legacyPin = await getSecurityPassword(username);
+    if (stale() || !legacyPin) return;
+    const grant = await apiClient.unlock({ method: 'pin', pin: legacyPin, remember: true });
+    if (stale()) return;
+    if (grant.success && grant.data) applyGrant(grant.data, username);
+    if (grant.success || grant.status === 403) await clearSecurityPassword(username).catch(() => {});
+  };
+
+  const refreshStatus = useCallback(async () => {
+    if (!isAuthenticatedRef.current) return;
+    const response = await apiClient.getSecurityPasswordStatus();
+    if (response.success && response.data) {
+      setStatus(response.data);
+      setHasSecurityPassword(response.data.has_security_password);
+    }
+  }, []);
+
+  const runUnlock = useCallback(async (request: () => Promise<ApiResponse<UnlockGrant>>): Promise<UnlockResult> => {
+    const generation = getSessionGeneration();
+    const response = await request();
+    if (getSessionGeneration() !== generation || !isAuthenticatedRef.current) {
+      return { success: false, error: 'Verification aborted: session changed' };
+    }
+    if (response.success && response.data) {
+      applyGrant(response.data, user?.username);
+      return { success: true };
+    }
+    if (response.status === 403) {
+      setPasswordVerificationFailed(true);
+      passwordVerificationFailedRef.current = true;
+    }
+    return { success: false, error: unlockError(response) };
+  }, [applyGrant, getSessionGeneration, user?.username]);
+
+  const unlockWithPasskey = useCallback(async (remember = false): Promise<UnlockResult> => {
+    const passkeys = status?.passkeys ?? [];
+    if (!passkeys.length) return { success: false, error: 'No passkey' };
+    try {
+      const secret = await getPasskeySecret(passkeys.map(p => ({ credentialId: p.credential_id, prfInput: p.prf_input })));
+      return runUnlock(() => apiClient.unlock({ method: 'passkey', credential_id: secret.credentialId, prf_output: secret.prfOutput, remember }));
+    } catch (error) {
+      if (error instanceof PasskeyCancelledError) return { success: false, error: 'cancelled' };
+      return { success: false, error: error instanceof Error ? error.message : 'Passkey failed' };
+    }
+  }, [status, runUnlock]);
+
+  const recoverWithKey = useCallback((recoveryKey: string, newPin: string, remember = false) =>
+    runUnlock(() => apiClient.recoverWithKey({ recovery_key: recoveryKey, new_password: newPin, remember })), [runUnlock]);
+
+  const acceptGrant = useCallback((grant: UnlockGrant) => applyGrant(grant, user?.username), [applyGrant, user?.username]);
+
+  const invalidateUnlock = useCallback(() => {
+    clearRememberedUnlock(user?.username);
+    setIsVerified(false);
+    setSecurityPassword(null);
+    setUnlockTokenId(null);
+    setRememberedUntil(null);
+  }, [user?.username]);
 
   // Check if user has security password
   const checkSecurityPassword = useCallback(async () => {
@@ -78,6 +199,13 @@ export const SecurityPasswordProvider: React.FC<{ children: React.ReactNode }> =
 
       if (response.success && response.data) {
         setHasSecurityPassword(response.data.has_security_password);
+        setStatus(response.data);
+
+        if (TOKEN_UNLOCK && response.data.has_security_password && user?.username && !passwordVerificationFailedRef.current) {
+          setIsAutoVerifying(true);
+          await autoUnlock(user.username, generation);
+          return; // finally clears the auto-verify flag
+        }
 
         // Try to auto-load password from cookie ONLY ONCE
         if (response.data.has_security_password && user?.username && !passwordVerificationFailedRef.current) {
@@ -162,10 +290,11 @@ export const SecurityPasswordProvider: React.FC<{ children: React.ReactNode }> =
   }, [isAuthenticated, user, getSessionGeneration]);
 
   // Verify security password
-  const verifySecurityPassword = useCallback(async (password: string): Promise<{ success: boolean; error?: string }> => {
+  const verifySecurityPassword = useCallback(async (password: string, remember = false): Promise<{ success: boolean; error?: string }> => {
     if (password.length !== 6 || !/^\d{6}$/.test(password)) {
       return { success: false, error: 'Password must be 6 digits' };
     }
+    if (TOKEN_UNLOCK) return runUnlock(() => apiClient.unlock({ method: 'pin', pin: password, remember }));
 
     try {
       // Capture the session this verification belongs to; a stale success must
@@ -213,12 +342,16 @@ export const SecurityPasswordProvider: React.FC<{ children: React.ReactNode }> =
       console.error('Verification error:', error);
       return { success: false, error: error instanceof Error ? error.message : 'Verification failed' };
     }
-  }, [user, getSessionGeneration]);
+  }, [user, getSessionGeneration, runUnlock]);
 
   // Clear verification state
   const clearVerification = useCallback(async () => {
     setIsVerified(false);
     setSecurityPassword(null);
+    setUnlockTokenId(null);
+    setRememberedUntil(null);
+    setStatus(null);
+    clearRememberedUnlock(user?.username);
     setPasswordVerificationFailed(false);
     passwordVerificationFailedRef.current = false;
 
@@ -243,6 +376,9 @@ export const SecurityPasswordProvider: React.FC<{ children: React.ReactNode }> =
   useEffect(() => {
     setIsVerified(false);
     setSecurityPassword(null);
+    setUnlockTokenId(null);
+    setRememberedUntil(null);
+    setStatus(null);
     setPasswordVerificationFailed(false);
     passwordVerificationFailedRef.current = false;
     setIsAutoVerifying(false);
@@ -311,6 +447,14 @@ export const SecurityPasswordProvider: React.FC<{ children: React.ReactNode }> =
         checkSecurityPassword,
         verifySecurityPassword,
         clearVerification,
+        status,
+        refreshStatus,
+        unlockTokenId,
+        rememberedUntil,
+        unlockWithPasskey,
+        recoverWithKey,
+        acceptGrant,
+        invalidateUnlock,
       }}
     >
       {children}
