@@ -7,3 +7,6 @@ interface ImportMetaEnv {
     /** "true" enables accounts / cloud sync at build time (see src/api/config.ts). */
     readonly VITE_CLOUD_ENABLED?: string;
 }
+
+/** package.json version, injected by vite.config.ts. */
+declare const __APP_VERSION__: string;

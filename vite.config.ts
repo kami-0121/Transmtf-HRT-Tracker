@@ -2,10 +2,16 @@ import path from 'path';
 import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
+import pkg from './package.json';
 
 export default defineConfig(({ mode }) => {
     const env = loadEnv(mode, '.', '');
     return {
+      // Single source for the version shown in Settings: package.json
+      // (scripts/set_version.py keeps Tauri in step).
+      define: {
+        __APP_VERSION__: JSON.stringify(pkg.version),
+      },
       server: {
         port: 3000,
         host: '0.0.0.0',
@@ -16,8 +22,8 @@ export default defineConfig(({ mode }) => {
           registerType: 'autoUpdate',
           includeAssets: ['favicon.ico', 'icon.svg'],
           manifest: {
-            name: 'HRT Tracker',
-            short_name: 'HRT Tracker',
+            name: 'AtDo HRT',
+            short_name: 'AtDo HRT',
             description: 'Track your HRT dosage and simulate E2 levels',
             theme_color: '#ffffff',
             background_color: '#ffffff',

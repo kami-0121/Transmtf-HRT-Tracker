@@ -218,7 +218,7 @@ const Login: React.FC = () => {
               {t('login.title') || 'Sign In'}
             </h1>
             <p className="text-sm sm:text-base" style={{ color: 'var(--text-secondary)' }}>
-              {t('login.subtitle') || 'Welcome back to Transmtf HRT Tracker'}
+              {t('login.subtitle') || 'Welcome back to AtDo HRT'}
             </p>
           </div>
 

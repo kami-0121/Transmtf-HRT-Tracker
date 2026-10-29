@@ -1,4 +1,4 @@
-# 部署到 Cloudflare Workers（D1 雲端存檔）
+# AtDo HRT：部署到 Cloudflare Workers（D1 雲端存檔）
 
 此 fork 由一個 Cloudflare Worker 同時提供：
 
@@ -28,22 +28,22 @@
 ## 一次性設定（Cloudflare Workers Builds，Git 自動部署）
 
 1. Cloudflare Dashboard → **Workers & Pages** → **Create** → **Import a repository**，連結 GitHub 並選擇 `kami-0121/Transmtf-HRT-Tracker`。
-2. Worker 名稱填 **`transmtf-hrt-tracker`**（必須與 `wrangler.toml` 的 `name` 相同）。
+2. Worker 名稱填 **`atdo-hrt`**（必須與 `wrangler.toml` 的 `name` 相同）。
 3. 建置設定：
    - Build command：`npm test && npm run build`（測試失敗就不部署）
    - Deploy command：`npx wrangler deploy`
 4. Production branch：選要上線的分支（建議合併到 `main` 後以 `main` 為 production）。
-5. 第一次部署時 wrangler 會自動建立名為 `hrt-tracker` 的 D1 資料庫並綁定為 `DB`；資料表由 Worker 在第一次收到 API 請求時自動建立（`server/schema.ts`），不需手動 migration。
-   - 若你的帳號不支援自動建立：先執行 `npx wrangler d1 create hrt-tracker`，把輸出的 `database_id` 加到 `wrangler.toml` 的 `[[d1_databases]]`。
+5. 第一次部署時 wrangler 會自動建立名為 `atdo-hrt` 的 D1 資料庫並綁定為 `DB`；資料表由 Worker 在第一次收到 API 請求時自動建立（`server/schema.ts`），不需手動 migration。
+   - 若你的帳號不支援自動建立：先執行 `npx wrangler d1 create atdo-hrt`，把輸出的 `database_id` 加到 `wrangler.toml` 的 `[[d1_databases]]`。
 
-網址：`https://transmtf-hrt-tracker.<你的子網域>.workers.dev`（可在 Worker 的 **Settings → Domains & Routes** 綁定自己的網域）。
+網址：`https://atdo-hrt.<你的子網域>.workers.dev`（可在 Worker 的 **Settings → Domains & Routes** 綁定自己的網域）。
 
 ## 登入方式：只有 Google
 
 和 AtDo 一樣，**只能用 Google 登入**，沒有帳號密碼的註冊／登入（不必保管、也不會外洩密碼）。第一次用 Google 登入時自動建立帳號。OAuth 2.0 授權碼 + PKCE，只要求 `openid` 權限，**不索取 email 或姓名**，資料庫只存 Google 帳號 id 的雜湊。
 
 1. [Google Cloud Console](https://console.cloud.google.com/apis/credentials) → 建立憑證 → **OAuth 用戶端 ID** → 應用程式類型選「網頁應用程式」。
-2. 「已授權的重新導向 URI」加入：`https://<你的網址>/auth/oidc/callback`（例如 `https://transmtf-hrt-tracker.<子網域>.workers.dev/auth/oidc/callback`；有自訂網域就兩個都加）。
+2. 「已授權的重新導向 URI」加入：`https://<你的網址>/auth/oidc/callback`（例如 `https://atdo-hrt.<子網域>.workers.dev/auth/oidc/callback`；有自訂網域就兩個都加）。
 3. OAuth 同意畫面：範圍只需要 `openid`，不需要送審。
 4. `GOOGLE_CLIENT_ID` 已寫在 `wrangler.toml`（用戶端 ID 本來就公開在 Google 授權網址上，不是祕密）。
    **用戶端密鑰不可放進 repo**：Cloudflare Dashboard → Worker → Settings → Variables and Secrets → 新增，類型選 **Secret**，名稱 `GOOGLE_CLIENT_SECRET`；或執行 `npx wrangler secret put GOOGLE_CLIENT_SECRET`。

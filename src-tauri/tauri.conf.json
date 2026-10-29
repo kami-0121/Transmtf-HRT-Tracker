@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/1",
   "package": {
-    "productName": "Transmtf HRT Tracker",
-    "version": "1.3.0"
+    "productName": "AtDo HRT",
+    "version": "1.0.0"
   },
   "build": {
     "beforeDevCommand": "npm run dev -- --host",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Transmtf HRT Tracker",
+        "title": "AtDo HRT",
         "width": 1000,
         "height": 800,
         "minWidth": 420,
@@ -25,7 +25,7 @@
     ],
     "bundle": {
       "active": true,
-      "identifier": "com.smirnovayama.hrttracker",
+      "identifier": "cc.atdo.hrt",
       "icon": [
         "icons/32x32.png",
         "icons/128x128.png",

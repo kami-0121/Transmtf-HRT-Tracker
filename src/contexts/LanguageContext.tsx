@@ -22,7 +22,7 @@ export const LanguageProvider = ({ children }: { children: React.ReactNode }) =>
 
     useEffect(() => {
         localStorage.setItem('hrt-lang', lang);
-        document.title = lang === 'zh-TW' ? "HRT 紀錄" : lang === 'zh' ? "HRT 记录" : "Transmtf HRT Tracker";
+        document.title = "AtDo HRT";
         if (isInitialLangRef.current) {
             isInitialLangRef.current = false;
             return;

@@ -204,7 +204,7 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
               {user?.displayName && user?.username !== user?.displayName && (
                 <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>@{user.username}</p>
               )}
-              <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>{t('account.member') || 'Transmtf HRT Tracker Member'}</p>
+              <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>{t('account.member') || 'AtDo HRT Member'}</p>
               {CLOUD_BACKEND === 'external' && <p className="mt-1 text-xs" style={{ color: 'var(--text-tertiary)' }}>
                 {t('account.avatarOAuthOnly') || 'Avatar is synced automatically via third-party login and cannot be uploaded here.'}{' '}
                 <a
