@@ -1,7 +1,7 @@
 [package]
-name = "atdo-hrt"
+name = "atdo-dose"
 version = "1.0.0"
-description = "AtDo HRT desktop app (fork of Transmtf HRT Tracker)"
+description = "AtDo Dose desktop app (fork of Transmtf HRT Tracker)"
 authors = ["SmirnovaOyama"]
 license = "MIT"
 edition = "2021"

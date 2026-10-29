@@ -1,7 +1,7 @@
-# Cloudflare Workers deployment of AtDo HRT (fork of Transmtf HRT Tracker).
+# Cloudflare Workers deployment of AtDo Dose (fork of Transmtf HRT Tracker).
 # `name` must match the Worker you create in the Cloudflare dashboard
 # (Workers & Pages → Create → Import a repository).
-name = "atdo-hrt"
+name = "atdo-dose"
 main = "worker.ts"
 # Keep variables set in the dashboard (e.g. REGISTRATION_DISABLED) when
 # Workers Builds runs `wrangler deploy`; without this they are removed.
@@ -26,7 +26,7 @@ head_sampling_rate = 1
 # the Worker creates its tables on first use (server/schema.ts).
 [[d1_databases]]
 binding = "DB"
-database_name = "atdo-hrt"
+database_name = "atdo-dose"
 
 # Daily housekeeping (worker.ts `scheduled`): purge expired sessions and old
 # rate-limit rows. 03:15 UTC = 11:15 Taipei.

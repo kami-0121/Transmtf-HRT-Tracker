@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/1",
   "package": {
-    "productName": "AtDo HRT",
+    "productName": "AtDo Dose",
     "version": "1.0.0"
   },
   "build": {
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "AtDo HRT",
+        "title": "AtDo Dose",
         "width": 1000,
         "height": 800,
         "minWidth": 420,
@@ -25,7 +25,7 @@
     ],
     "bundle": {
       "active": true,
-      "identifier": "cc.atdo.hrt",
+      "identifier": "cc.atdo.dose",
       "icon": [
         "icons/32x32.png",
         "icons/128x128.png",

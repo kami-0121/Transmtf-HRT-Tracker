@@ -1,6 +1,6 @@
-# AtDo HRT
+# AtDo Dose
 
-AtDo HRT 是 [Transmtf HRT Tracker](https://github.com/TransmtfTeam/Transmtf-HRT-Tracker)（HRT Recorder Web）的 fork，使用獨立的名稱與版本號（從 1.0.0 起算，不延續原專案的 1.3.0）。
+AtDo Dose（App 內顯示為 AtDo HRT）是 [Transmtf HRT Tracker](https://github.com/TransmtfTeam/Transmtf-HRT-Tracker)（HRT Recorder Web）的 fork，使用獨立的名稱與版本號（從 1.0.0 起算，不延續原專案的 1.3.0）。
 
 A privacy-focused, web-based tool for simulating and tracking estradiol levels during Hormone Replacement Therapy (HRT).<br>
 
