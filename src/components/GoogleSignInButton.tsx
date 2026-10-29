@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Loader2 } from 'lucide-react';
 import { useTranslation } from '../contexts/LanguageContext';
-import { startGoogleSignIn } from '../api/googleSignIn';
+import { startGoogleSignIn, googleSignInAvailable } from '../api/googleSignIn';
 
 // Google's multicolour "G" (brand guidelines: white button, logo on the left).
 const GoogleLogo = () => (
@@ -16,14 +16,28 @@ const GoogleLogo = () => (
 const GoogleSignInButton: React.FC<{ onError?: (message: string) => void }> = ({ onError }) => {
     const { t } = useTranslation();
     const [loading, setLoading] = useState(false);
+    // null = still asking the server; false = the Worker has no Google credentials.
+    const [available, setAvailable] = useState<boolean | null>(null);
+    useEffect(() => {
+        let alive = true;
+        googleSignInAvailable().then(ok => { if (alive) setAvailable(ok); });
+        return () => { alive = false; };
+    }, []);
     const start = async () => {
         setLoading(true);
         const error = await startGoogleSignIn();
         if (error) {
             setLoading(false);
-            onError?.(error);
+            onError?.(/not configured/i.test(error) ? t('login.googleNotConfigured') : error);
         }
     };
+    if (available === false) {
+        return (
+            <div className="rounded-xl border px-3 py-2.5 text-xs sm:text-sm text-center" style={{ borderColor: 'var(--border-primary)', color: 'var(--text-secondary)' }}>
+                {t('login.googleNotConfigured')}
+            </div>
+        );
+    }
     return (
         <button
             type="button"

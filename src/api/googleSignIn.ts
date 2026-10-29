@@ -13,3 +13,15 @@ export async function startGoogleSignIn(): Promise<string | null> {
     window.location.href = response.data.auth_url;
     return null;
 }
+
+let availability: Promise<boolean> | null = null;
+
+/** Whether the server has Google sign-in configured (asked once per page load). */
+export function googleSignInAvailable(): Promise<boolean> {
+    if (!availability) {
+        availability = apiClient.getOIDCConfig()
+            .then(r => !!(r.success && r.data?.oidc_enabled))
+            .catch(() => true);   // unknown (offline): keep the button, the click reports errors
+    }
+    return availability;
+}

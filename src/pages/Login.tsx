@@ -179,13 +179,7 @@ const Login: React.FC = () => {
               </p>
             </div>
 
-            {oidcEnabled ? (
-              <GoogleSignInButton onError={setError} />
-            ) : (
-              <div className="rounded-xl border px-3 py-2.5 text-xs sm:text-sm text-center" style={{ borderColor: 'var(--border-primary)', color: 'var(--text-secondary)' }}>
-                {t('login.googleNotConfigured')}
-              </div>
-            )}
+            <GoogleSignInButton onError={setError} />
 
             <p className="mt-3 text-xs text-center" style={{ color: 'var(--text-tertiary)' }}>
               {t('login.googlePrivacy')}
