@@ -75,6 +75,15 @@ export const MIGRATIONS: string[][] = [
             expires         INTEGER NOT NULL
         )`,
     ],
+    // v4: profile shown in the app: an editable display name (defaults to the
+    // Google name), a custom avatar (small data URL) over the Google photo, and
+    // whether the overview greets the user.
+    [
+        `ALTER TABLE users ADD COLUMN display_name TEXT`,
+        `ALTER TABLE users ADD COLUMN avatar TEXT`,
+        `ALTER TABLE users ADD COLUMN google_picture TEXT`,
+        `ALTER TABLE users ADD COLUMN greet INTEGER NOT NULL DEFAULT 1`,
+    ],
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

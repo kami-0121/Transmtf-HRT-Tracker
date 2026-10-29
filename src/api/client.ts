@@ -32,6 +32,8 @@ import type {
   SetLoginPasswordRequest,
   RemoveLoginPasswordRequest,
   UserMeResponse,
+  UserProfile,
+  UpdateProfileRequest,
 } from './types';
 
 import { API_BASE_URL } from './config';
@@ -586,6 +588,14 @@ class ApiClient {
 
   async getMe(): Promise<ApiResponse<UserMeResponse>> {
     return this.request<UserMeResponse>('/user/me');
+  }
+
+  /** D1 backend: edit display name / avatar / greeting. */
+  async updateProfile(data: UpdateProfileRequest): Promise<ApiResponse<UserProfile>> {
+    return this.request<UserProfile>('/user/profile', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    });
   }
 }
 

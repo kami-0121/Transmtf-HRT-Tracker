@@ -200,4 +200,29 @@ export interface UserMeResponse {
   user_id: number;
   /** D1 backend: false for accounts created with Google sign-in. */
   has_password?: boolean;
+  /** D1 backend profile (see UserProfile). */
+  display_name?: string;
+  avatar_url?: string | null;
+  has_custom_avatar?: boolean;
+  google_avatar_url?: string | null;
+  greet?: boolean;
+}
+
+/** D1 backend: the user's editable profile. */
+export interface UserProfile {
+  display_name: string;
+  /** Custom avatar (data URL) or the Google photo; null when neither. */
+  avatar_url: string | null;
+  has_custom_avatar: boolean;
+  /** The Google photo (what "use Google photo" falls back to). */
+  google_avatar_url: string | null;
+  /** Greet the user by name on the overview. */
+  greet: boolean;
+}
+
+export interface UpdateProfileRequest {
+  display_name?: string;
+  /** Data URL, or null to fall back to the Google photo. */
+  avatar?: string | null;
+  greet?: boolean;
 }

@@ -53,7 +53,11 @@ describe.skipIf(!sqlite)('cloud-backup API (D1)', () => {
     let env: ApiEnv;
     let keys: CryptoKeyPair;
     let jwk: JsonWebKey & { kid: string };
-    const google = { sub: 'sub-alice', badSignature: false, tokenBody: null as URLSearchParams | null };
+    const google = {
+        sub: 'sub-alice', name: 'Alice Example' as string | undefined,
+        picture: 'https://lh3.googleusercontent.com/a/alice' as string | undefined,
+        badSignature: false, tokenBody: null as URLSearchParams | null,
+    };
 
     const signIdToken = async (claims: Record<string, unknown>) => {
         const h = b64url(enc.encode(JSON.stringify({ alg: 'RS256', kid: 'k1' })));
@@ -83,6 +87,7 @@ describe.skipIf(!sqlite)('cloud-backup API (D1)', () => {
                 return Response.json({
                     id_token: await signIdToken({
                         iss: 'https://accounts.google.com', aud: CLIENT_ID, sub: google.sub,
+                        name: google.name, picture: google.picture,
                         exp: Math.floor(Date.now() / 1000) + 600,
                     }),
                 });
@@ -146,7 +151,7 @@ describe.skipIf(!sqlite)('cloud-backup API (D1)', () => {
             const start = await call('GET', '/auth/oidc/authorize');
             const url = new URL(start.body.data.auth_url);
             expect(url.origin).toBe('https://accounts.google.com');
-            expect(url.searchParams.get('scope')).toBe('openid');
+            expect(url.searchParams.get('scope')).toBe('openid profile');
             expect(url.searchParams.get('code_challenge_method')).toBe('S256');
             expect(url.searchParams.get('redirect_uri')).toBe('http://localhost/auth/oidc/callback');
 
@@ -203,6 +208,41 @@ describe.skipIf(!sqlite)('cloud-backup API (D1)', () => {
             const res = await handleApi(new Request('http://localhost/api/auth/oidc/config'), off);
             expect(((await res.json()) as any).data.oidc_enabled).toBe(false);
             expect((await handleApi(new Request('http://localhost/api/auth/oidc/authorize'), off)).status).toBe(503);
+        });
+    });
+
+    describe('profile', () => {
+        it('starts from the Google name and photo, and can be edited', async () => {
+            google.name = 'Dana';
+            google.picture = 'https://lh3.googleusercontent.com/a/dana';
+            const login = await (async () => { google.sub = 'sub-dana'; return googleLogin(); })();
+            expect(login.body.data).toMatchObject({ display_name: 'Dana', avatar_url: google.picture, greet: true });
+            const token = login.body.data.tokens.access_token;
+
+            const avatar = 'data:image/webp;base64,UklGRhIAAABXRUJQVlA4';
+            const put = await call('PUT', '/user/profile', { display_name: '  小  D \u0007 ', avatar, greet: false }, token);
+            expect(put.body.data).toMatchObject({ display_name: '小 D', avatar_url: avatar, has_custom_avatar: true, greet: false });
+            expect((await call('GET', '/user/me', undefined, token)).body.data).toMatchObject({ display_name: '小 D', greet: false });
+
+            // Back to the Google photo; a later Google sign-in refreshes it but keeps the custom name.
+            await call('PUT', '/user/profile', { avatar: null }, token);
+            google.picture = 'https://lh3.googleusercontent.com/a/dana-new';
+            expect((await googleLogin()).body.data).toMatchObject({ display_name: '小 D', avatar_url: google.picture, has_custom_avatar: false });
+        });
+
+        it('rejects bad input', async () => {
+            const token = await signIn('sub-dana');
+            expect((await call('PUT', '/user/profile', { display_name: '   ' }, token)).status).toBe(400);
+            expect((await call('PUT', '/user/profile', { avatar: 'https://evil.example/x.png' }, token)).status).toBe(400);
+            expect((await call('PUT', '/user/profile', { avatar: 'data:image/svg+xml;base64,PHN2Zz4=' }, token)).status).toBe(400);
+            expect((await call('PUT', '/user/profile', { greet: 'yes' }, token)).status).toBe(400);
+            expect((await call('PUT', '/user/profile', { display_name: 'x'.repeat(50) }, token)).body.data.display_name).toHaveLength(32);
+        });
+
+        it('ignores photos that are not on Google\'s image host', async () => {
+            google.sub = 'sub-eve';
+            google.picture = 'https://evil.example/eve.png';
+            expect((await googleLogin()).body.data.avatar_url).toBeNull();
         });
     });
 

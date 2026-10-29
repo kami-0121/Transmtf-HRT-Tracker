@@ -182,6 +182,10 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     // undecided (new account on a device holding someone else's data), nothing
     // moves — no pulls, pushes or conflict prompts.
     if (localStorage.getItem('hrt-data-ownership-pending') === '1') return false;
+    // Wait until we know whether the account has a security PIN (null =
+    // still asking the server). Syncing before that sent no PIN and the
+    // server answered "Invalid security password" on every app start.
+    if (hasSecurityPassword === null) return false;
     if (hasSecurityPassword && !isVerified) return false;
     if (hasSecurityPassword && passwordVerificationFailed) return false;
     if (hasSecurityPassword && !securityPassword) return false;
@@ -194,7 +198,12 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const reportFailure = useCallback((status: number | undefined, error: string | undefined) => {
     const code = status ?? 0;
     failureStatusRef.current = code;
-    setSyncError(code === 0 ? 'sync.offline' : code === 429 || code >= 500 ? 'sync.busy' : (error || 'Sync failed'));
+    setSyncError(
+      code === 0 ? 'sync.offline'
+        : code === 429 || code >= 500 ? 'sync.busy'
+        : /security password/i.test(error || '') ? 'sync.pinInvalid'
+        : (error || 'Sync failed'),
+    );
   }, []);
 
   // ── getLocalDataSnapshot ──
@@ -1008,10 +1017,11 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     };
   }, [isAuthenticated, runSync, schedulePush, flushPush, shouldPullFromCloud]);
 
-  // Sync becomes possible later (security PIN verified): run once then —
-  // the old 3-second poll used to cover this implicitly.
+  // Sync becomes possible later — the PIN status arrived (no PIN), or the
+  // PIN was verified: run once then.
   useEffect(() => {
-    if (isAuthenticated && hasSecurityPassword && isVerified && securityPassword) runSync();
+    if (!isAuthenticated) return;
+    if (hasSecurityPassword === false || (hasSecurityPassword && isVerified && securityPassword)) runSync();
   }, [isAuthenticated, hasSecurityPassword, isVerified, securityPassword, runSync]);
 
   return (

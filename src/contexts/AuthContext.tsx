@@ -1,7 +1,7 @@
-import { CLOUD_ENABLED } from '../api/config';
+import { CLOUD_ENABLED, CLOUD_BACKEND } from '../api/config';
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import apiClient from '../api/client';
-import type { AuthTokens } from '../api/types';
+import type { AuthTokens, UpdateProfileRequest, UserProfile } from '../api/types';
 import { clearSecurityPassword } from '../utils/crypto';
 import { deleteCookie, getCookie, setCookie } from '../utils/cookies';
 import { setLogoutInProgress } from '../utils/authSessionState';
@@ -11,6 +11,12 @@ interface User {
   username: string;
   displayName?: string;
   avatarUrl?: string;
+  /** D1 backend: a custom avatar is set (otherwise avatarUrl is the Google photo). */
+  hasCustomAvatar?: boolean;
+  /** D1 backend: the Google photo, shown when no custom avatar is set. */
+  googleAvatarUrl?: string;
+  /** D1 backend: greet the user by name on the overview. */
+  greet?: boolean;
 }
 
 interface AuthContextType {
@@ -26,6 +32,8 @@ interface AuthContextType {
   refreshAccessToken: () => Promise<boolean>;
   /** Live session generation; increments on every login/logout/account switch. Async tasks capture it to detect stale sessions. */
   getSessionGeneration: () => number;
+  /** D1 backend: save display name / avatar / greeting; resolves with an error message on failure. */
+  updateProfile: (patch: UpdateProfileRequest) => Promise<string | null>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -36,6 +44,33 @@ const USERNAME_STORAGE_KEY = 'hrt-username';
 const DISPLAY_NAME_STORAGE_KEY = 'hrt-display-name';
 const AVATAR_URL_STORAGE_KEY = 'hrt-avatar-url';
 const TOKEN_COOKIE_DAYS = 3650;
+// Profile (name, avatar, greeting) cached for instant display; the server
+// copy wins. localStorage, not a cookie: a custom avatar is a data URL far
+// larger than a cookie may be.
+const PROFILE_STORAGE_KEY = 'hrt-profile';
+
+const readStoredProfile = (): Partial<User> => {
+  try {
+    const value = JSON.parse(localStorage.getItem(PROFILE_STORAGE_KEY) || '{}');
+    return value && typeof value === 'object' ? value : {};
+  } catch {
+    return {};
+  }
+};
+const storeProfile = (profile: Partial<User>) => {
+  try {
+    localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(profile));
+  } catch {
+    // Quota: the profile is simply fetched again next time.
+  }
+};
+const profileFields = (p: UserProfile): Partial<User> => ({
+  displayName: p.display_name,
+  avatarUrl: p.avatar_url ?? undefined,
+  hasCustomAvatar: p.has_custom_avatar,
+  googleAvatarUrl: p.google_avatar_url ?? undefined,
+  greet: p.greet,
+});
 
 /**
  * Token Storage Strategy:
@@ -103,6 +138,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     clearStoredValue(USERNAME_STORAGE_KEY);
     clearStoredValue(DISPLAY_NAME_STORAGE_KEY);
     clearStoredValue(AVATAR_URL_STORAGE_KEY);
+    localStorage.removeItem(PROFILE_STORAGE_KEY);
 
     // FINAL-REVIEW FIX (blocker 1): the local wipe happens SYNCHRONOUSLY,
     // BEFORE any network call. Previously it sat behind `await
@@ -211,7 +247,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const storedDisplayName = getStoredValue(DISPLAY_NAME_STORAGE_KEY) || undefined;
       const storedAvatarUrl = getStoredValue(AVATAR_URL_STORAGE_KEY) || undefined;
       setAccessToken(storedAccessToken);
-      setUser({ username: storedUsername, displayName: storedDisplayName, avatarUrl: storedAvatarUrl });
+      setUser({ username: storedUsername, displayName: storedDisplayName, avatarUrl: storedAvatarUrl, ...readStoredProfile() });
       apiClient.setAccessToken(storedAccessToken);
       setIsLoading(false);
     } else if (storedRefreshToken && storedUsername) {
@@ -229,7 +265,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           const storedDisplayName = getStoredValue(DISPLAY_NAME_STORAGE_KEY) || undefined;
           const storedAvatarUrl = getStoredValue(AVATAR_URL_STORAGE_KEY) || undefined;
           setAccessToken(access_token);
-          setUser({ username: storedUsername, displayName: storedDisplayName, avatarUrl: storedAvatarUrl });
+          setUser({ username: storedUsername, displayName: storedDisplayName, avatarUrl: storedAvatarUrl, ...readStoredProfile() });
           apiClient.setAccessToken(access_token);
           setStoredValue(TOKEN_STORAGE_KEY, access_token);
           setStoredValue(REFRESH_TOKEN_STORAGE_KEY, refresh_token);
@@ -370,6 +406,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     setAccessToken(access_token);
     setUser({ username, displayName, avatarUrl });
+    storeProfile({ displayName, avatarUrl });
     apiClient.setAccessToken(access_token);
 
     setStoredValue(TOKEN_STORAGE_KEY, access_token);
@@ -382,6 +419,31 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     else clearStoredValue(AVATAR_URL_STORAGE_KEY);
     updateDataOwnershipFlag(username);
   };
+
+  // D1 backend: pull the current profile once a session is up (it may have
+  // been edited on another device).
+  const sessionUsername = user?.username;
+  useEffect(() => {
+    if (CLOUD_BACKEND !== 'd1' || !accessToken || !sessionUsername) return;
+    const generation = sessionGenerationRef.current;
+    apiClient.getMe().then((response) => {
+      if (sessionGenerationRef.current !== generation || !response.success || !response.data?.display_name) return;
+      const fields = profileFields(response.data as UserProfile);
+      storeProfile(fields);
+      setUser((current) => (current ? { ...current, ...fields } : current));
+    });
+  }, [accessToken, sessionUsername]);
+
+  const updateProfile = useCallback(async (patch: UpdateProfileRequest): Promise<string | null> => {
+    const generation = sessionGenerationRef.current;
+    const response = await apiClient.updateProfile(patch);
+    if (sessionGenerationRef.current !== generation) return 'Session changed';
+    if (!response.success || !response.data) return response.error || 'Failed to save profile';
+    const fields = profileFields(response.data);
+    storeProfile(fields);
+    setUser((current) => (current ? { ...current, ...fields } : current));
+    return null;
+  }, []);
 
   return (
     <AuthContext.Provider
@@ -397,6 +459,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         logout,
         refreshAccessToken,
         getSessionGeneration,
+        updateProfile,
       }}
     >
       {children}

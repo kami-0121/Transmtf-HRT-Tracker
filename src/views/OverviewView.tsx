@@ -1,6 +1,8 @@
 import React, { useMemo, useState, useRef, useLayoutEffect } from 'react';
 import { Activity, Info, Camera, Syringe, Pill, Droplet, Sticker, Plus } from 'lucide-react';
 import { useTranslation } from '../contexts/LanguageContext';
+import { useAuth } from '../contexts/AuthContext';
+import { CLOUD_BACKEND } from '../api/config';
 import { useTheme } from '../contexts/ThemeContext';
 import ResultChart from '../components/ResultChart';
 import ShareImageModal from '../components/ShareImageModal';
@@ -202,6 +204,9 @@ const OverviewView: React.FC<OverviewViewProps> = ({
   onAddRegimenDose,
 }) => {
   const { t, lang } = useTranslation();
+  // Greet by name like AtDo (profile setting on this fork's own backend).
+  const { user } = useAuth();
+  const greetingName = CLOUD_BACKEND === 'd1' && user?.greet !== false ? user?.displayName : undefined;
   const { isDark, colors } = useTheme();
   const { regimens, gelProducts } = useAppData();
   const [shareImageOpen, setShareImageOpen] = useState(false);
@@ -439,6 +444,11 @@ const OverviewView: React.FC<OverviewViewProps> = ({
   return (
     <>
       <header className="relative overflow-x-hidden px-3 md:px-8 pt-4 md:pt-6 pb-3 md:pb-4">
+        {greetingName && (
+          <p className="mb-2.5 md:mb-3 px-1 text-lg md:text-xl font-bold tracking-tight truncate" style={{ color: 'var(--text-primary)' }}>
+            {t('overview.greeting').replace('{name}', greetingName)}
+          </p>
+        )}
         {/* Hero + side cards. Phones stack everything; tablets (md) keep the
             hero full-width and lay the three side cards out in one row;
             from lg the side cards move into a right-hand column that

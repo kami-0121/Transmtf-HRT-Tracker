@@ -40,11 +40,11 @@
 
 ## 登入方式：只有 Google
 
-和 AtDo 一樣，**只能用 Google 登入**，沒有帳號密碼的註冊／登入（不必保管、也不會外洩密碼）。第一次用 Google 登入時自動建立帳號。OAuth 2.0 授權碼 + PKCE，只要求 `openid` 權限，**不索取 email 或姓名**，資料庫只存 Google 帳號 id 的雜湊。
+和 AtDo 一樣，**只能用 Google 登入**，沒有帳號密碼的註冊／登入（不必保管、也不會外洩密碼）。第一次用 Google 登入時自動建立帳號。OAuth 2.0 授權碼 + PKCE，要求 `openid profile` 權限：Google 帳號 id（只存雜湊）以及名稱與頭像，作為預設的顯示名稱與頭像（使用者可在「設定 › 帳號」點卡片自行修改，自訂頭像縮成 160px 存在 D1）。**不索取 email**。
 
 1. [Google Cloud Console](https://console.cloud.google.com/apis/credentials) → 建立憑證 → **OAuth 用戶端 ID** → 應用程式類型選「網頁應用程式」。
 2. 「已授權的重新導向 URI」加入：`https://<你的網址>/auth/oidc/callback`（例如 `https://atdo-dose.<子網域>.workers.dev/auth/oidc/callback`；有自訂網域就兩個都加）。
-3. OAuth 同意畫面：範圍只需要 `openid`，不需要送審。
+3. OAuth 同意畫面：範圍只需要 `openid` 與 `profile`（皆為非敏感範圍），不需要送審。
 4. `GOOGLE_CLIENT_ID` 已寫在 `wrangler.toml`（用戶端 ID 本來就公開在 Google 授權網址上，不是祕密）。
    **用戶端密鑰不可放進 repo**：Cloudflare Dashboard → Worker → Settings → Variables and Secrets → 新增，類型選 **Secret**，名稱 `GOOGLE_CLIENT_SECRET`；或執行 `npx wrangler secret put GOOGLE_CLIENT_SECRET`。
 5. 重新部署後，登入頁會出現「使用 Google 登入」。沒設定密鑰時，登入頁會顯示「Google 登入尚未設定」。

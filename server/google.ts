@@ -1,7 +1,8 @@
 /**
  * Google sign-in (OAuth 2.0 authorization code + PKCE), after AtDo's
- * src/api/google.ts. Only the `openid` scope is requested: a stable user id is
- * all we need, so no e-mail address or name ever reaches the database.
+ * src/api/google.ts. Scopes `openid profile`: a stable user id plus the Google
+ * name and photo, used as the account's default display name and avatar (both
+ * editable). No e-mail address is requested.
  *
  * Google is the only way to sign in on this backend. The flow fits the
  * frontend's existing OIDC pages (Login / OIDCCallback):
@@ -46,7 +47,7 @@ export async function buildAuthorizeUrl(env: GoogleEnv, origin: string) {
         client_id: env.GOOGLE_CLIENT_ID!,
         redirect_uri: redirectUri(origin),
         response_type: 'code',
-        scope: 'openid',
+        scope: 'openid profile',
         state,
         code_challenge: challenge,
         code_challenge_method: 'S256',
@@ -67,8 +68,14 @@ async function signingKey(kid: string): Promise<JsonWebKey | undefined> {
     return jwks.keys.get(kid);
 }
 
-/** Verifies an RS256 Google ID token; returns its `sub`. */
-export async function verifyIdToken(idToken: string, clientId: string): Promise<string> {
+export interface GoogleIdentity {
+    sub: string;
+    name?: string;
+    picture?: string;
+}
+
+/** Verifies an RS256 Google ID token; returns the identity claims. */
+export async function verifyIdToken(idToken: string, clientId: string): Promise<GoogleIdentity> {
     const [h, p, sig] = idToken.split('.');
     if (!h || !p || !sig) throw new Error('malformed id_token');
     const header = JSON.parse(new TextDecoder().decode(fromB64url(h))) as { alg?: string; kid?: string };
@@ -79,18 +86,24 @@ export async function verifyIdToken(idToken: string, clientId: string): Promise<
     const valid = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, fromB64url(sig), utf8(`${h}.${p}`));
     if (!valid) throw new Error('bad id_token signature');
     const claims = JSON.parse(new TextDecoder().decode(fromB64url(p))) as {
-        iss?: string; aud?: string | string[]; exp?: number; sub?: string;
+        iss?: string; aud?: string | string[]; exp?: number; sub?: string; name?: unknown; picture?: unknown;
     };
     const audOk = Array.isArray(claims.aud) ? claims.aud.includes(clientId) : claims.aud === clientId;
     if (!claims.iss || !GOOGLE_ISSUERS.includes(claims.iss)) throw new Error('bad issuer');
     if (!audOk) throw new Error('bad audience');
     if (!claims.exp || claims.exp * 1000 < Date.now() - 60_000) throw new Error('id_token expired');
     if (!claims.sub) throw new Error('id_token without sub');
-    return claims.sub;
+    return {
+        sub: claims.sub,
+        name: typeof claims.name === 'string' ? claims.name : undefined,
+        // Only Google's own image host, so the avatar can never point elsewhere.
+        picture: typeof claims.picture === 'string' && /^https:\/\/[a-z0-9.-]+\.googleusercontent\.com\//.test(claims.picture)
+            ? claims.picture : undefined,
+    };
 }
 
-/** Exchanges the authorization code; returns the verified Google subject. */
-export async function exchangeCode(env: GoogleEnv, origin: string, code: string, verifier: string): Promise<string> {
+/** Exchanges the authorization code; returns the verified Google identity. */
+export async function exchangeCode(env: GoogleEnv, origin: string, code: string, verifier: string): Promise<GoogleIdentity> {
     const res = await fetch(TOKEN_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },

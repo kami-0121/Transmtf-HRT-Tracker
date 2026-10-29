@@ -19,6 +19,7 @@ import {
 import apiClient from '../api/client';
 import { CLOUD_BACKEND } from '../api/config';
 import GoogleSignInButton from '../components/GoogleSignInButton';
+import ProfileModal from '../components/ProfileModal';
 
 const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   const { user, logout, isAuthenticated } = useAuth();
@@ -28,6 +29,9 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   const navigate = useNavigate();
 
   const [avatarAvailable, setAvatarAvailable] = useState(true);
+  // D1 backend: tapping the account card edits name / avatar / greeting.
+  const [showProfileModal, setShowProfileModal] = useState(false);
+  const profileEditable = CLOUD_BACKEND === 'd1';
   // D1 backend: Google is the only sign-in, so there is no password to change.
   const hasLoginPassword = CLOUD_BACKEND !== 'd1';
 
@@ -65,6 +69,10 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
 
   const handleAvatarClick = () => {
     if (!isAuthenticated) return;
+    if (profileEditable) {
+      setShowProfileModal(true);
+      return;
+    }
     showDialog('alert', t('account.avatarSetHint') || 'To set or change your avatar, visit transmtf.com/profile and sign in again.');
   };
 
@@ -166,7 +174,14 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   return (
     <div className={embedded ? '' : 'min-h-full px-4 py-6'}>
       <div className="mx-auto w-full max-w-2xl space-y-6">
-        <div className="rounded-2xl glass-card p-6 shadow-sm">
+        <div
+          className={`rounded-2xl glass-card p-6 shadow-sm ${profileEditable ? 'cursor-pointer transition hover:bg-[var(--bg-card-hover)]' : ''}`}
+          onClick={profileEditable ? () => setShowProfileModal(true) : undefined}
+          role={profileEditable ? 'button' : undefined}
+          tabIndex={profileEditable ? 0 : undefined}
+          onKeyDown={profileEditable ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setShowProfileModal(true); } } : undefined}
+          aria-label={profileEditable ? t('profile.title') : undefined}
+        >
           <div className="flex items-center gap-4">
             <button
               type="button"
@@ -181,9 +196,10 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
                     src={user.avatarUrl}
                     alt="Avatar"
                     className="h-full w-full object-cover"
+                    referrerPolicy="no-referrer"
                     onError={() => {/* silently fallback */}}
                   />
-                ) : user?.username ? (
+                ) : user?.username && !profileEditable ? (
                   <>
                     <img
                       src={`${apiClient.getAvatarUrl(user.username)}`}
@@ -201,10 +217,14 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
             </button>
             <div className="flex-1">
               <h2 className="text-xl font-bold" style={{ color: 'var(--text-primary)' }}>{user?.displayName || user?.username}</h2>
-              {user?.displayName && user?.username !== user?.displayName && (
+              {/* The generated google_xxxx account id is not worth showing. */}
+              {!profileEditable && user?.displayName && user?.username !== user?.displayName && (
                 <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>@{user.username}</p>
               )}
               <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>{t('account.member') || 'AtDo HRT Member'}</p>
+              {profileEditable && (
+                <p className="mt-0.5 text-xs" style={{ color: 'var(--text-tertiary)' }}>{t('profile.tapToEdit')}</p>
+              )}
               {CLOUD_BACKEND === 'external' && <p className="mt-1 text-xs" style={{ color: 'var(--text-tertiary)' }}>
                 {t('account.avatarOAuthOnly') || 'Avatar is synced automatically via third-party login and cannot be uploaded here.'}{' '}
                 <a
@@ -309,6 +329,8 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
           {t('account.logout') || 'Logout'}
         </button>
       </div>
+
+      {showProfileModal && <ProfileModal onClose={() => setShowProfileModal(false)} />}
 
       {showPasswordModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">

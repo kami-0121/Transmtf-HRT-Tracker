@@ -5,7 +5,8 @@
  *
  *   auth      Google sign-in (OIDC endpoints, server/google.ts) · refresh · logout
  *             · sessions (list / revoke)
- *   user      me · data (get / put / revision) · security PIN (status / set / change)
+ *   user      me · profile (name / avatar / greeting) · data (get / put / revision)
+ *             · security PIN (status / set / change)
  *
  * Sign-in is Google only (as in AtDo): no usernames/passwords to register,
  * leak or reset. The first Google sign-in creates the account.
@@ -105,6 +106,10 @@ interface UserRow {
     password_iter: number;
     pin_salt: string | null;
     pin_check: string | null;
+    display_name: string | null;
+    avatar: string | null;
+    google_picture: string | null;
+    greet: number;
 }
 interface SessionRow {
     id: string;
@@ -267,7 +272,7 @@ async function startAuthorization(env: ApiEnv, request: Request) {
     return ok({ auth_url: authUrl, state });
 }
 
-/** Consumes the pending authorization (single use) and returns the Google subject hash. */
+/** Consumes the pending authorization (single use) and returns the verified Google identity. */
 async function finishAuthorization(env: ApiEnv, body: Record<string, unknown>) {
     requireGoogle(env);
     const code = str(body.code);
@@ -280,20 +285,20 @@ async function finishAuthorization(env: ApiEnv, body: Record<string, unknown>) {
         throw new HttpError(400, 'Sign-in expired or invalid, please try again');
     }
     try {
-        return await subjectHash(await exchangeCode(env, row.origin, code, row.verifier));
+        return await exchangeCode(env, row.origin, code, row.verifier);
     } catch (e) {
         console.error('Google sign-in failed', e);
         throw new HttpError(401, 'Google sign-in failed');
     }
 }
 
-async function createGoogleUser(env: ApiEnv, subject: string): Promise<number> {
+async function createGoogleUser(env: ApiEnv, subject: string, name: string | null): Promise<number> {
     for (let attempt = 0; attempt < 5; attempt++) {
         const username = `google_${randomToken(6).toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 8)}`;
         if (username.length < 10 || await getUserByName(env, username)) continue;
         const res = await env.DB.prepare(
-            `INSERT INTO users (username, password_hash, password_salt, password_iter, created_at) VALUES (?, '', '', 0, ?)`
-        ).bind(username, nowIso()).run();
+            `INSERT INTO users (username, password_hash, password_salt, password_iter, created_at, display_name) VALUES (?, '', '', 0, ?, ?)`
+        ).bind(username, nowIso(), name).run();
         const userId = Number(res.meta.last_row_id);
         await env.DB.prepare(`INSERT INTO user_identities (provider, subject_hash, user_id, created_at) VALUES ('google', ?, ?, ?)`)
             .bind(subject, userId, nowIso()).run();
@@ -301,6 +306,28 @@ async function createGoogleUser(env: ApiEnv, subject: string): Promise<number> {
     }
     throw new HttpError(500, 'Could not create account');
 }
+
+// ── profile ──────────────────────────────────────────────────────────────────
+
+const MAX_DISPLAY_NAME = 32;
+// The client sends a square ~160 px JPEG/WebP; this bounds the stored row.
+const MAX_AVATAR_CHARS = 150_000;
+const AVATAR_RE = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+=*$/;
+
+/** Collapse whitespace, drop control characters, cap the length; null when empty. */
+function cleanDisplayName(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const name = value.replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim();
+    return name ? Array.from(name).slice(0, MAX_DISPLAY_NAME).join('') : null;
+}
+
+const profileOf = (user: UserRow) => ({
+    display_name: user.display_name || user.username,
+    avatar_url: user.avatar || user.google_picture || null,
+    has_custom_avatar: !!user.avatar,
+    google_avatar_url: user.google_picture || null,
+    greet: user.greet !== 0,
+});
 
 // ── routes ───────────────────────────────────────────────────────────────────
 
@@ -315,18 +342,23 @@ const routes: [string, RegExp, Handler][] = [
     ['GET', /^\/api\/auth\/oidc\/authorize$/, async (env, request) => startAuthorization(env, request)],
 
     ['POST', /^\/api\/auth\/oidc\/callback$/, async (env, request) => {
-        const subject = await finishAuthorization(env, await readJson(request));
+        const google = await finishAuthorization(env, await readJson(request));
+        const subject = await subjectHash(google.sub);
         const linked = await env.DB.prepare(`SELECT user_id FROM user_identities WHERE provider = 'google' AND subject_hash = ?`)
             .bind(subject).first<{ user_id: number }>();
         let userId = linked?.user_id;
         const isNew = !userId;
         if (!userId) {
             if (env.REGISTRATION_DISABLED === 'true') throw new HttpError(403, 'Registration is disabled');
-            userId = await createGoogleUser(env, subject);
+            userId = await createGoogleUser(env, subject, cleanDisplayName(google.name));
         }
+        // Keep the Google photo current (it is the avatar unless a custom one is
+        // set); accounts from before profiles get the Google name once.
+        await env.DB.prepare('UPDATE users SET google_picture = ?, display_name = COALESCE(display_name, ?) WHERE id = ?')
+            .bind(google.picture ?? null, cleanDisplayName(google.name), userId).run();
         const user = await getUserById(env, userId);
         if (!user) throw new HttpError(401, 'Account not found');
-        return ok({ tokens: await issueTokens(env, request, user.id), is_new_user: isNew, username: user.username });
+        return ok({ tokens: await issueTokens(env, request, user.id), is_new_user: isNew, username: user.username, ...profileOf(user) });
     }],
 
     ['POST', /^\/api\/auth\/refresh$/, async (env, request) => {
@@ -373,7 +405,32 @@ const routes: [string, RegExp, Handler][] = [
 
     ['GET', /^\/api\/user\/me$/, async (env, request) => {
         const { user } = await authenticate(env, request);
-        return ok({ username: user.username, user_id: user.id, has_password: false });
+        return ok({ username: user.username, user_id: user.id, has_password: false, ...profileOf(user) });
+    }],
+
+    // Edit the profile: { display_name?, avatar? (data URL, or null for the
+    // Google photo), greet? }; omitted fields stay as they are.
+    ['PUT', /^\/api\/user\/profile$/, async (env, request) => {
+        const { user } = await authenticate(env, request);
+        const body = await readJson(request);
+        const next = { display_name: user.display_name, avatar: user.avatar, greet: user.greet };
+        if ('display_name' in body) {
+            const name = cleanDisplayName(body.display_name);
+            if (!name) throw new HttpError(400, 'Display name is required');
+            next.display_name = name;
+        }
+        if ('avatar' in body) {
+            if (body.avatar === null || body.avatar === '') next.avatar = null;
+            else if (typeof body.avatar === 'string' && body.avatar.length <= MAX_AVATAR_CHARS && AVATAR_RE.test(body.avatar)) next.avatar = body.avatar;
+            else throw new HttpError(400, 'Avatar must be a JPEG, PNG or WebP image under 100 KB');
+        }
+        if ('greet' in body) {
+            if (typeof body.greet !== 'boolean') throw new HttpError(400, 'greet must be a boolean');
+            next.greet = body.greet ? 1 : 0;
+        }
+        await env.DB.prepare('UPDATE users SET display_name = ?, avatar = ?, greet = ? WHERE id = ?')
+            .bind(next.display_name, next.avatar, next.greet, user.id).run();
+        return ok(profileOf({ ...user, ...next }));
     }],
 
     ['GET', /^\/api\/user\/security-password\/status$/, async (env, request) => {
