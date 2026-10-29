@@ -52,6 +52,8 @@ const SYNC_LOCK_NAME = 'hrt-cloud-sync';
 const isRetryable = (status: number) => status === 0 || status === 429 || status >= 500;
 /** Window event other modules dispatch to request a sync (e.g. ownership resolved). */
 export const SYNC_REQUEST_EVENT = 'hrt-sync-request';
+/** Window event asking MainLayout to show the "whose data is this" choice again. */
+export const OWNERSHIP_PROMPT_EVENT = 'hrt-ownership-prompt';
 
 // Record the cloud baseline = the cloud state we last successfully synced with.
 // This lets us distinguish "local-only changes since baseline" (safe to push) from
@@ -141,7 +143,7 @@ function pullWouldClearLocalList(localData: Record<string, any>, cloudData: Reco
 
 export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { isAuthenticated, user, getSessionGeneration } = useAuth();
-  const { hasSecurityPassword, isVerified, securityPassword, passwordVerificationFailed } = useSecurityPassword();
+  const { hasSecurityPassword, isVerified, securityPassword, passwordVerificationFailed, checkSecurityPassword } = useSecurityPassword();
   const [isSyncing, setIsSyncing] = useState(false);
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
@@ -176,33 +178,39 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, [user]);
 
   // ── common guards ──
-  const canSync = useCallback(() => {
-    if (!isAuthenticated || isLogoutInProgress()) return false;
+  // Why a sync cannot run right now: null = it can; 'busy' = one is running;
+  // a 'sync.*' key = waiting on the user or the server (shown on the card).
+  const blockReason = useCallback((): string | null => {
+    if (!isAuthenticated || isLogoutInProgress()) return 'busy';
     // FINAL-REVIEW (blocker 1): while the ownership of the local records is
     // undecided (new account on a device holding someone else's data), nothing
     // moves — no pulls, pushes or conflict prompts.
-    if (localStorage.getItem('hrt-data-ownership-pending') === '1') return false;
+    if (localStorage.getItem('hrt-data-ownership-pending') === '1') return 'sync.blockedOwnership';
     // Wait until we know whether the account has a security PIN (null =
     // still asking the server). Syncing before that sent no PIN and the
     // server answered "Invalid security password" on every app start.
-    if (hasSecurityPassword === null) return false;
-    if (hasSecurityPassword && !isVerified) return false;
-    if (hasSecurityPassword && passwordVerificationFailed) return false;
-    if (hasSecurityPassword && !securityPassword) return false;
-    if (conflictPendingRef.current) return false;
-    if (isSyncingRef.current) return false;
-    return true;
+    if (hasSecurityPassword === null) return 'sync.waitingPin';
+    if (hasSecurityPassword && (!isVerified || passwordVerificationFailed || !securityPassword)) return 'sync.pinInvalid';
+    if (conflictPendingRef.current) return 'sync.blockedConflict';
+    if (isSyncingRef.current) return 'busy';
+    return null;
   }, [isAuthenticated, hasSecurityPassword, isVerified, securityPassword, passwordVerificationFailed]);
 
   // Offline / busy get a friendly message and an automatic retry (runSync).
   const reportFailure = useCallback((status: number | undefined, error: string | undefined) => {
     const code = status ?? 0;
-    failureStatusRef.current = code;
+    // 401 here means the access token could not be renewed just now (e.g. the
+    // network was not back yet when the phone woke up); a failed renewal that
+    // really ends the session logs out instead. Retry like an offline failure.
+    failureStatusRef.current = code === 401 ? 0 : code;
     setSyncError(
-      code === 0 ? 'sync.offline'
+      code === 401 ? 'sync.authRetry'
+        : code === 0 ? 'sync.offline'
         : code === 429 || code >= 500 ? 'sync.busy'
         : /security password/i.test(error || '') ? 'sync.pinInvalid'
-        : (error || 'Sync failed'),
+        // Anything else: keep the server's words plus the status, so a
+        // screenshot is enough to tell what went wrong.
+        : `${error || 'Sync failed'} (HTTP ${code})`,
     );
   }, []);
 
@@ -505,7 +513,12 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   //  Called both by the 3-second poll AND by local-data-change.
   // ════════════════════════════════════════════════════════════
   const performSync = useCallback(async () => {
-    if (!canSync()) return;
+    const blocked = blockReason();
+    if (blocked) {
+      // Show why instead of a stale error from an earlier attempt.
+      if (blocked !== 'busy') setSyncError(blocked);
+      return;
+    }
 
     // F02: bind this sync to the session (and account) that started it.
     const generation = getSessionGeneration();
@@ -779,7 +792,7 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       isSyncingRef.current = false;
       setIsSyncing(false);
     }
-  }, [canSync, hasSecurityPassword, securityPassword, getLocalDataSnapshot, pushLocalDataToCloud, applyCloudToLocal, getSessionGeneration, updatePendingConflict, reportFailure]);
+  }, [blockReason, hasSecurityPassword, securityPassword, getLocalDataSnapshot, pushLocalDataToCloud, applyCloudToLocal, getSessionGeneration, updatePendingConflict, reportFailure]);
 
   // ── Resolve conflict ──
   const resolveConflict = useCallback(async (
@@ -963,7 +976,18 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     pushTimerRef.current = setTimeout(flushPush, delay);
   }, [flushPush]);
 
-  const syncNow = useCallback(() => { flushPush(); }, [flushPush]);
+  // Manual "back up now": also clears whatever is holding sync back that a
+  // tap can fix — ask the PIN status again, or reopen the ownership choice.
+  const syncNow = useCallback(() => {
+    retryAttemptRef.current = 0;
+    const blocked = blockReason();
+    if (blocked === 'sync.waitingPin') {
+      checkSecurityPassword();
+    } else if (blocked === 'sync.blockedOwnership') {
+      window.dispatchEvent(new CustomEvent(OWNERSHIP_PROMPT_EVENT));
+    }
+    flushPush();
+  }, [flushPush, blockReason, checkSecurityPassword]);
 
   useEffect(() => {
     if (!isAuthenticated || isLogoutInProgress()) return;

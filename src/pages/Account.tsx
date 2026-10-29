@@ -251,8 +251,10 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
           <div className="space-y-2 text-sm">
             <div className="flex items-center justify-between">
               <span style={{ color: 'var(--text-secondary)' }}>{t('account.status') || 'Status'}:</span>
-              <span className={`font-medium ${isSyncing ? 'text-blue-600' : 'text-green-600'}`}>
-                {isSyncing ? (t('account.syncing') || 'Syncing...') : (t('account.synced') || 'Synced')}
+              <span className={`font-medium ${isSyncing ? 'text-blue-600' : syncError ? 'text-amber-600' : 'text-green-600'}`}>
+                {isSyncing ? (t('account.syncing') || 'Syncing...')
+                  : syncError ? t('account.syncNotDone')
+                  : (t('account.synced') || 'Synced')}
               </span>
             </div>
             {lastSyncTime && (

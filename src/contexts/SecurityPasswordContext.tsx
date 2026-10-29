@@ -112,7 +112,8 @@ export const SecurityPasswordProvider: React.FC<{ children: React.ReactNode }> =
               setSecurityPassword(savedPassword);
               setPasswordVerificationFailed(false);
             } else {
-              if (verifyResponse.status === 401) {
+              // 403 from this fork's server, 401 from the original backend
+              if (verifyResponse.status === 401 || verifyResponse.status === 403) {
                 // Cookie password is invalid, clear it and mark as failed
                 console.warn('Auto-verification failed - cookie password is invalid');
 
@@ -201,7 +202,7 @@ export const SecurityPasswordProvider: React.FC<{ children: React.ReactNode }> =
 
         return { success: true };
       } else {
-        if (response.status === 401) {
+        if (response.status === 401 || response.status === 403) {
           // Password is wrong - DO NOT retry automatically
           setPasswordVerificationFailed(true);
           return { success: false, error: response.error || 'Invalid password' };
@@ -254,6 +255,22 @@ export const SecurityPasswordProvider: React.FC<{ children: React.ReactNode }> =
 
     checkSecurityPassword();
   }, [checkSecurityPassword, isLoading]);
+
+  // Cloud sync waits for this status (null = unknown). If the first check
+  // failed (offline, server hiccup), ask again when the connection or the
+  // app comes back instead of staying unknown for the whole session.
+  useEffect(() => {
+    if (!isAuthenticated || hasSecurityPassword !== null) return;
+    const retry = () => { if (document.visibilityState === 'visible') checkSecurityPassword(); };
+    const timer = setInterval(retry, 30_000);
+    window.addEventListener('online', retry);
+    document.addEventListener('visibilitychange', retry);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener('online', retry);
+      document.removeEventListener('visibilitychange', retry);
+    };
+  }, [isAuthenticated, hasSecurityPassword, checkSecurityPassword]);
 
   // Clear verification on ACTUAL logout (not initial load or auth refresh)
   useEffect(() => {

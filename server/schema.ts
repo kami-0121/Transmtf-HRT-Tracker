@@ -84,6 +84,18 @@ export const MIGRATIONS: string[][] = [
         `ALTER TABLE users ADD COLUMN google_picture TEXT`,
         `ALTER TABLE users ADD COLUMN greet INTEGER NOT NULL DEFAULT 1`,
     ],
+    // v5: a token refresh no longer cuts off what was just valid. The
+    // previous access token keeps working until it expires, and the previous
+    // refresh token for a short grace period, so requests in flight during a
+    // refresh, and two tabs / the PWA refreshing at once, do not fail.
+    [
+        `ALTER TABLE sessions ADD COLUMN prev_access_hash TEXT`,
+        `ALTER TABLE sessions ADD COLUMN prev_access_expires INTEGER`,
+        `ALTER TABLE sessions ADD COLUMN prev_refresh_hash TEXT`,
+        `ALTER TABLE sessions ADD COLUMN prev_refresh_until INTEGER`,
+        `CREATE INDEX IF NOT EXISTS idx_sessions_prev_access ON sessions(prev_access_hash)`,
+        `CREATE INDEX IF NOT EXISTS idx_sessions_prev_refresh ON sessions(prev_refresh_hash)`,
+    ],
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

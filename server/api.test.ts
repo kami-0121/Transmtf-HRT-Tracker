@@ -246,6 +246,46 @@ describe.skipIf(!sqlite)('cloud-backup API (D1)', () => {
         });
     });
 
+    describe('token refresh', () => {
+        it('keeps the replaced tokens usable so concurrent refreshes do not sign anyone out', async () => {
+            google.sub = 'sub-refresh';
+            const tokens = (await googleLogin()).body.data.tokens;
+            const first = await call('POST', '/auth/refresh', { refresh_token: tokens.refresh_token });
+            // A request that was in flight with the old access token still works.
+            expect((await call('GET', '/user/me', undefined, tokens.access_token)).status).toBe(200);
+            // Two tabs (or tab + installed PWA) refresh with the same token at once.
+            const [a, b] = await Promise.all([
+                call('POST', '/auth/refresh', { refresh_token: first.body.data.refresh_token }),
+                call('POST', '/auth/refresh', { refresh_token: first.body.data.refresh_token }),
+            ]);
+            expect(a.status).toBe(200);
+            expect(b.status).toBe(200);
+            // The latest pair works.
+            expect((await call('GET', '/user/me', undefined, b.body.data.access_token)).status).toBe(200);
+            expect((await call('POST', '/auth/refresh', { refresh_token: b.body.data.refresh_token })).status).toBe(200);
+        });
+
+        it('stops accepting a replaced refresh token after the grace period', async () => {
+            google.sub = 'sub-refresh-2';
+            const tokens = (await googleLogin()).body.data.tokens;
+            expect((await call('POST', '/auth/refresh', { refresh_token: tokens.refresh_token })).status).toBe(200);
+            const later = Date.now() + 3 * 60 * 1000;
+            vi.spyOn(Date, 'now').mockReturnValue(later);
+            try {
+                expect((await call('POST', '/auth/refresh', { refresh_token: tokens.refresh_token })).status).toBe(401);
+            } finally {
+                vi.restoreAllMocks();
+            }
+        });
+
+        it('answers a wrong security PIN with 403, not "signed out"', async () => {
+            const token = await signIn('sub-pin');
+            expect((await call('POST', '/user/security-password', { password: '123456' }, token)).status).toBe(200);
+            expect((await call('POST', '/user/data', { password: '000000' }, token)).status).toBe(403);
+            expect((await call('POST', '/user/data', { password: '123456' }, token)).status).toBe(200);
+        });
+    });
+
     it('daily cleanup runs', async () => {
         await expect(scheduledCleanup(env)).resolves.toBeUndefined();
     });

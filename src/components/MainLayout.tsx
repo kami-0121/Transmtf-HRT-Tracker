@@ -4,7 +4,7 @@ import { Settings, Activity, Calendar, User } from 'lucide-react';
 import { useTranslation } from '../contexts/LanguageContext';
 import { useDialog } from '../contexts/DialogContext';
 import { useAuth } from '../contexts/AuthContext';
-import { SYNC_REQUEST_EVENT } from '../contexts/CloudSyncContext';
+import { SYNC_REQUEST_EVENT, OWNERSHIP_PROMPT_EVENT } from '../contexts/CloudSyncContext';
 import { API_ORIGIN } from '../api/config';
 import { useAppData, PER_DOSE_WEIGHT_MIGRATION_EVENT } from '../contexts/AppDataContext';
 import { formatDate, formatTime } from '../utils/helpers';
@@ -111,6 +111,13 @@ const MainLayout: React.FC = () => {
     // until the user decides what should happen to them — otherwise the new
     // account's first sync would upload the previous account's records.
     const ownershipPromptShownRef = useRef(false);
+    const [ownershipPromptRequest, setOwnershipPromptRequest] = useState(0);
+    // "Back up now" while the choice is pending asks for the prompt again.
+    useEffect(() => {
+        const onRequest = () => setOwnershipPromptRequest((n) => n + 1);
+        window.addEventListener(OWNERSHIP_PROMPT_EVENT, onRequest);
+        return () => window.removeEventListener(OWNERSHIP_PROMPT_EVENT, onRequest);
+    }, []);
     useEffect(() => {
         if (!isAuthenticated || ownershipPromptShownRef.current) return;
         if (localStorage.getItem('hrt-data-ownership-pending') !== '1') return;
@@ -134,7 +141,7 @@ const MainLayout: React.FC = () => {
             // reappears on the next mount.
             ownershipPromptShownRef.current = false;
         })();
-    }, [isAuthenticated, showDialog, t]);
+    }, [isAuthenticated, showDialog, t, ownershipPromptRequest]);
 
     const navItems = useMemo(() => [
         { id: 'home' as ViewKey, label: t('nav.home'), icon: Activity },

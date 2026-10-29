@@ -51,6 +51,9 @@ const PIN_CHECK_TEXT = 'hrt-tracker-pin-check-v1';
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_STORED_BYTES = 1_900_000;          // D1 row limit is 2 MB
 const LAST_USED_RESOLUTION_MS = 60 * 60 * 1000;
+// A refresh token that was just rotated is still accepted this long (another
+// tab or the installed PWA may refresh with it at the same moment).
+const REFRESH_GRACE_MS = 2 * 60 * 1000;
 // Slow sync uploads at most every few seconds; anything far above this is a
 // runaway client or abuse (the client backs off and retries later on 429).
 const DATA_WRITES_PER_MINUTE = 30;
@@ -114,8 +117,14 @@ interface UserRow {
 interface SessionRow {
     id: string;
     user_id: number;
+    access_hash: string;
     access_expires: number;
+    refresh_hash: string;
     refresh_expires: number;
+    prev_access_hash: string | null;
+    prev_access_expires: number | null;
+    prev_refresh_hash: string | null;
+    prev_refresh_until: number | null;
     device_info: string | null;
     ip_address: string | null;
     created_at: string;
@@ -140,9 +149,13 @@ async function issueTokens(env: ApiEnv, request: Request, userId: number, sessio
     const accessHash = await sha256Hex(access);
     const refreshHash = await sha256Hex(refresh);
     if (sessionId) {
+        // The tokens being replaced stay usable a little longer (schema v5).
         await env.DB.prepare(
-            'UPDATE sessions SET access_hash = ?, access_expires = ?, refresh_hash = ?, refresh_expires = ?, last_used_at = ?, ip_address = ? WHERE id = ?'
-        ).bind(accessHash, now + ACCESS_TTL_MS, refreshHash, now + REFRESH_TTL_MS, nowIso(), clientIp(request), sessionId).run();
+            `UPDATE sessions SET prev_access_hash = access_hash, prev_access_expires = access_expires,
+                prev_refresh_hash = refresh_hash, prev_refresh_until = ?,
+                access_hash = ?, access_expires = ?, refresh_hash = ?, refresh_expires = ?, last_used_at = ?, ip_address = ?
+             WHERE id = ?`
+        ).bind(now + REFRESH_GRACE_MS, accessHash, now + ACCESS_TTL_MS, refreshHash, now + REFRESH_TTL_MS, nowIso(), clientIp(request), sessionId).run();
     } else {
         await env.DB.prepare(
             'INSERT INTO sessions (id, user_id, access_hash, access_expires, refresh_hash, refresh_expires, device_info, ip_address, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
@@ -158,9 +171,11 @@ async function authenticate(env: ApiEnv, request: Request): Promise<AuthContext>
     const header = request.headers.get('Authorization') || '';
     const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
     if (!token) throw new HttpError(401, 'Unauthorized');
-    const session = await env.DB.prepare('SELECT * FROM sessions WHERE access_hash = ?')
-        .bind(await sha256Hex(token)).first<SessionRow>();
-    if (!session || session.access_expires < Date.now()) throw new HttpError(401, 'Unauthorized');
+    const hash = await sha256Hex(token);
+    const session = await env.DB.prepare('SELECT * FROM sessions WHERE access_hash = ?1 OR prev_access_hash = ?1')
+        .bind(hash).first<SessionRow>();
+    const expires = session?.access_hash === hash ? session.access_expires : session?.prev_access_expires ?? 0;
+    if (!session || expires < Date.now()) throw new HttpError(401, 'Unauthorized');
     const user = await getUserById(env, session.user_id);
     if (!user) throw new HttpError(401, 'Unauthorized');
     // Coarse last-used tracking keeps D1 writes rare.
@@ -174,12 +189,12 @@ async function authenticate(env: ApiEnv, request: Request): Promise<AuthContext>
 
 async function pinKeyFor(user: UserRow, pin: string): Promise<CryptoKey> {
     if (!user.pin_salt || !user.pin_check) throw new HttpError(400, 'No security password set');
-    if (!PIN_RE.test(pin)) throw new HttpError(401, 'Invalid security password');
+    if (!PIN_RE.test(pin)) throw new HttpError(403, 'Invalid security password');
     const key = await pinKey(pin, fromB64(user.pin_salt), PIN_ITERATIONS);
     try {
         await aesDecrypt(key, fromB64(user.pin_check));
     } catch {
-        throw new HttpError(401, 'Invalid security password');
+        throw new HttpError(403, 'Invalid security password');
     }
     return key;
 }
@@ -195,7 +210,7 @@ async function packData(value: unknown, key: CryptoKey | null): Promise<{ payloa
 async function unpackData(row: DataRow, key: CryptoKey | null): Promise<unknown> {
     let bytes = fromB64(row.payload);
     if (row.is_encrypted) {
-        if (!key) throw new HttpError(401, 'Security password required');
+        if (!key) throw new HttpError(403, 'Security password required');
         bytes = await aesDecrypt(key, bytes);
     }
     return decodeJson(await gunzip(bytes));
@@ -365,9 +380,13 @@ const routes: [string, RegExp, Handler][] = [
         const body = await readJson(request);
         const token = str(body.refresh_token);
         if (!token) throw new HttpError(400, 'refresh_token required');
-        const session = await env.DB.prepare('SELECT * FROM sessions WHERE refresh_hash = ?')
-            .bind(await sha256Hex(token)).first<SessionRow>();
-        if (!session || session.refresh_expires < Date.now()) throw new HttpError(401, 'Invalid refresh token');
+        const hash = await sha256Hex(token);
+        const session = await env.DB.prepare('SELECT * FROM sessions WHERE refresh_hash = ?1 OR prev_refresh_hash = ?1')
+            .bind(hash).first<SessionRow>();
+        const valid = session && (session.refresh_hash === hash
+            ? session.refresh_expires >= Date.now()
+            : (session.prev_refresh_until ?? 0) >= Date.now());
+        if (!session || !valid) throw new HttpError(401, 'Invalid refresh token');
         return ok(await issueTokens(env, request, session.user_id, session.id));
     }],
 
