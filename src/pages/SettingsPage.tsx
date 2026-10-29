@@ -23,6 +23,7 @@ import {
     Monitor,
     Brain,
     ChevronRight,
+    Heart, Mail, Globe,
 } from 'lucide-react';
 import Account from './Account';
 import RegimenManager from '../components/RegimenManager';
@@ -30,7 +31,7 @@ import type { Regimen } from '../utils/regimens';
 
 import { decryptData } from '../../logic';
 import { computeDataHash } from '../utils/dataHash';
-import { CLOUD_ENABLED } from '../api/config';
+import { CLOUD_ENABLED, CLOUD_BACKEND } from '../api/config';
 import { readBloodReports, sanitizeBloodReports, BLOOD_REPORTS_KEY } from '../utils/bloodTests';
 import { readRegimens, sanitizeRegimens, REGIMENS_KEY } from '../utils/regimens';
 import { writeCustomGelProducts } from '../utils/doseForm';
@@ -708,7 +709,7 @@ const SettingsPage: React.FC = () => {
                             onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-card-hover)'}
                             onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
                         >
-                            <Github size={20} style={{ color: 'var(--text-secondary)' }} />
+                            <Heart className="text-pink-500" size={20} />
                             <div>
                                 <p className="text-sm font-bold">{t('drawer.github')}</p>
                                 <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>{t('drawer.github_desc')}</p>
@@ -733,7 +734,51 @@ const SettingsPage: React.FC = () => {
                             </div>
                         </button>
 
-                        {CLOUD_ENABLED && <button
+                        {/* This fork: credits and contact */}
+                        <div className="flex items-center gap-3 px-4 py-4" style={{ color: 'var(--text-primary)' }}>
+                            <Github size={20} style={{ color: 'var(--text-secondary)' }} />
+                            <div className="flex-1 min-w-0">
+                                <p className="text-sm font-bold">{t('about.fork')}</p>
+                                <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>{t('about.fork_desc')}</p>
+                            </div>
+                            <div className="flex shrink-0 gap-2">
+                                {[
+                                    { href: 'https://github.com/kami-0121', label: t('about.fork_github'), Icon: Github },
+                                    { href: 'https://kimi.ing', label: t('about.fork_blog'), Icon: Globe },
+                                ].map(({ href, label, Icon }) => (
+                                    <button
+                                        key={href}
+                                        onClick={() => {
+                                            showDialog('confirm', t('about.external_confirm').replace('{host}', new URL(href).host), () => {
+                                                window.open(href, '_blank', 'noopener');
+                                            });
+                                        }}
+                                        className="inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition btn-press-glass"
+                                        style={{ borderColor: 'var(--border-primary)', color: 'var(--text-secondary)' }}
+                                    >
+                                        <Icon size={14} />
+                                        {label}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+
+                        <a
+                            href="mailto:support@atdo.cc"
+                            className="flex w-full items-center gap-3 px-4 py-4 text-left transition btn-press-glass"
+                            style={{ color: 'var(--text-primary)' }}
+                            onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-card-hover)'}
+                            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                        >
+                            <Mail size={20} style={{ color: 'var(--text-secondary)' }} />
+                            <div>
+                                <p className="text-sm font-bold">{t('about.contact_me')}</p>
+                                <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>{t('about.contact_me_desc')}</p>
+                            </div>
+                        </a>
+
+                        {/* Usage statistics come from the original project's server only. */}
+                        {CLOUD_ENABLED && CLOUD_BACKEND === 'external' && <button
                             onClick={() => setIsStatisticsOpen(true)}
                             className="flex w-full items-center gap-3 px-4 py-4 text-left transition btn-press-glass"
                             style={{ color: 'var(--text-primary)' }}

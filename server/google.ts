@@ -3,12 +3,10 @@
  * src/api/google.ts. Only the `openid` scope is requested: a stable user id is
  * all we need, so no e-mail address or name ever reaches the database.
  *
- * The flow fits the existing frontend OIDC pages (Login / Register /
- * OIDCCallback / AccountOIDC):
- *   GET  /api/auth/oidc/authorize        → { auth_url, state }   (login)
- *   GET  /api/auth/oidc/bind/authorize   → { auth_url, state }   (link to the signed-in account)
- *   POST /api/auth/oidc/callback         { code, state } → tokens
- *   POST /api/auth/oidc/bind/callback    { code, state }
+ * Google is the only way to sign in on this backend. The flow fits the
+ * frontend's existing OIDC pages (Login / OIDCCallback):
+ *   GET  /api/auth/oidc/authorize   → { auth_url, state }
+ *   POST /api/auth/oidc/callback    { code, state } → tokens (first sign-in creates the account)
  * The PKCE verifier stays on the server (oauth_states, 10 min, single use);
  * the browser only keeps `state` to match the redirect.
  */

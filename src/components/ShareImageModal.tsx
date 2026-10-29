@@ -527,7 +527,7 @@ const ShareImageModal: React.FC<Props> = ({
                                         fontWeight: 800,
                                         letterSpacing: '-0.01em',
                                     }}>
-                                        Transmtf HRT Tracker
+                                        AtDo HRT
                                     </div>
                                 </div>
                             </div>

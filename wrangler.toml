@@ -1,7 +1,7 @@
-# Cloudflare Workers deployment of this fork.
+# Cloudflare Workers deployment of AtDo Dose (fork of Transmtf HRT Tracker).
 # `name` must match the Worker you create in the Cloudflare dashboard
 # (Workers & Pages → Create → Import a repository).
-name = "transmtf-hrt-tracker"
+name = "atdo-dose"
 main = "worker.ts"
 # Keep variables set in the dashboard (e.g. REGISTRATION_DISABLED) when
 # Workers Builds runs `wrangler deploy`; without this they are removed.
@@ -26,7 +26,7 @@ head_sampling_rate = 1
 # the Worker creates its tables on first use (server/schema.ts).
 [[d1_databases]]
 binding = "DB"
-database_name = "hrt-tracker"
+database_name = "atdo-dose"
 
 # Daily housekeeping (worker.ts `scheduled`): purge expired sessions and old
 # rate-limit rows. 03:15 UTC = 11:15 Taipei.
@@ -42,10 +42,8 @@ CLOUD_ENABLED = "true"
 # Secret in the dashboard (Worker → Settings → Variables and Secrets) or with
 # `npx wrangler secret put GOOGLE_CLIENT_SECRET`.
 GOOGLE_CLIENT_ID = "549548693796-jv8rdl1onarnvhbinu3iufjrbgd8m6ml.apps.googleusercontent.com"
-# Optional hardening (set in the dashboard; keep secrets out of this file):
-#   TURNSTILE_SECRET_KEY (secret) + VITE_TURNSTILE_SITE_KEY → CAPTCHA on register/login
-#   REGISTRATION_DISABLED = "true" → close sign-ups
-#   PASSWORD_PBKDF2_ITERATIONS → login password hashing cost (default 100000)
+# Set in the dashboard (keep secrets out of this file):
+#   REGISTRATION_DISABLED = "true" → no new accounts (first-time Google sign-ins)
 #   GOOGLE_CLIENT_SECRET (secret) → enables "Sign in with Google"
 #   (redirect URI: https://<host>/auth/oidc/callback, see docs/DEPLOY_WORKERS.md)
 # To use an external backend instead of D1, set VITE_API_BASE_URL.

@@ -226,7 +226,7 @@ const Register: React.FC = () => {
               {t('register.title') || 'Create Account'}
             </h1>
             <p className="text-sm sm:text-base" style={{ color: 'var(--text-secondary)' }}>
-              {t('register.subtitle') || 'Join Transmtf HRT Tracker to sync your data'}
+              {t('register.subtitle') || 'Join AtDo HRT to sync your data'}
             </p>
           </div>
 

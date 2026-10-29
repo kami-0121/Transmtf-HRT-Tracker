@@ -68,7 +68,6 @@ describe.skipIf(!sqlite)('cloud-backup API (D1)', () => {
             DB: fakeD1(new sqlite!.DatabaseSync(':memory:')),
             GOOGLE_CLIENT_ID: CLIENT_ID,
             GOOGLE_CLIENT_SECRET: 'secret',
-            PASSWORD_PBKDF2_ITERATIONS: '10000',
         };
         keys = await crypto.subtle.generateKey(
             { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
@@ -104,16 +103,19 @@ describe.skipIf(!sqlite)('cloud-backup API (D1)', () => {
         }), env);
         return { status: res.status, headers: res.headers, body: await res.json() as any };
     };
-    const register = async (name: string) =>
-        (await call('POST', '/auth/register', { username: name, password: 'abc12345' })).body.data.access_token as string;
     const googleLogin = async () => {
         const start = await call('GET', '/auth/oidc/authorize');
         return call('POST', '/auth/oidc/callback', { code: 'good-code', state: start.body.data.state });
     };
+    /** Signs in as a (new) Google user and returns an access token. */
+    const signIn = async (sub: string) => {
+        google.sub = sub;
+        return (await googleLogin()).body.data.tokens.access_token as string;
+    };
 
     describe('snapshot revisions', () => {
         it('accepts uploads based on the current revision and refuses stale ones', async () => {
-            const token = await register('occ_user');
+            const token = await signIn('sub-occ');
             const empty = await call('POST', '/user/data', {}, token);
             expect(empty.body.data).toMatchObject({ data: null, revision: 0 });
             expect(empty.headers.get('X-Content-Type-Options')).toBe('nosniff');
@@ -131,7 +133,7 @@ describe.skipIf(!sqlite)('cloud-backup API (D1)', () => {
         });
 
         it('rate limits uploads', async () => {
-            const token = await register('busy_user');
+            const token = await signIn('sub-busy');
             let last;
             for (let i = 0; i < 31; i++) last = await call('PUT', '/user/data', { data: { events: [i] } }, token);
             expect(last!.status).toBe(429);
@@ -139,7 +141,8 @@ describe.skipIf(!sqlite)('cloud-backup API (D1)', () => {
     });
 
     describe('Google sign-in', () => {
-        it('creates a passwordless account on first sign-in and reuses it after', async () => {
+        it('creates an account on first sign-in and reuses it after', async () => {
+            google.sub = 'sub-alice';
             const start = await call('GET', '/auth/oidc/authorize');
             const url = new URL(start.body.data.auth_url);
             expect(url.origin).toBe('https://accounts.google.com');
@@ -156,41 +159,35 @@ describe.skipIf(!sqlite)('cloud-backup API (D1)', () => {
 
             const again = await googleLogin();
             expect(again.body.data).toMatchObject({ is_new_user: false, username: first.body.data.username });
-
             const token = again.body.data.tokens.access_token;
             expect((await call('GET', '/user/me', undefined, token)).body.data.has_password).toBe(false);
-            const pw = await call('POST', '/auth/login', { username: first.body.data.username, password: 'whatever1' });
-            expect(pw.status).toBe(400);
-            expect(pw.body.error).toMatch(/oidc/i);
-            // Sensitive actions need no password on a passwordless account.
             expect((await call('DELETE', '/auth/sessions', {}, token)).body.data.revoked_count).toBe(1);
-        });
 
-        it('sets and removes a login password', async () => {
-            const login = await googleLogin();
-            const token = login.body.data.tokens.access_token;
-            expect((await call('POST', '/user/password', { password: 'newpass123' }, token)).status).toBe(200);
-            expect((await call('POST', '/auth/login', { username: login.body.data.username, password: 'newpass123' })).status).toBe(200);
-            expect((await call('DELETE', '/user/password', { password: 'newpass123' }, token)).status).toBe(200);
-            expect((await call('GET', '/user/me', undefined, token)).status).toBe(401);   // all sessions ended
-        });
-
-        it('links Google to a password account, once and only to one account', async () => {
-            const bob = await register('bob_user');
             google.sub = 'sub-bob';
-            const loginState = (await call('GET', '/auth/oidc/authorize')).body.data.state;
-            expect((await call('POST', '/auth/oidc/bind/callback', { code: 'good-code', state: loginState }, bob)).status).toBe(400);
+            expect((await googleLogin()).body.data.username).not.toBe(first.body.data.username);
+        });
 
-            const bind = await call('GET', '/auth/oidc/bind/authorize', undefined, bob);
-            expect((await call('POST', '/auth/oidc/bind/callback', { code: 'good-code', state: bind.body.data.state }, bob)).status).toBe(200);
-            expect((await call('GET', '/auth/oidc/bind/status', undefined, bob)).body.data).toMatchObject({ bound: true, has_password: true });
-            expect((await call('GET', '/auth/oidc/bind/authorize', undefined, bob)).status).toBe(409);
-            expect((await googleLogin()).body.data.username).toBe('bob_user');
+        it('has no username/password accounts', async () => {
+            const token = await signIn('sub-alice');
+            expect((await call('POST', '/auth/register', { username: 'someone', password: 'abc12345' })).status).toBe(410);
+            expect((await call('POST', '/auth/login', { username: 'someone', password: 'abc12345' })).status).toBe(410);
+            expect((await call('POST', '/user/password', { password: 'abc12345' }, token)).status).toBe(410);
+            expect((await call('GET', '/auth/oidc/bind/status', undefined, token)).status).toBe(410);
+        });
 
-            const carol = await register('carol_user');
-            google.sub = 'sub-alice';
-            const bind2 = await call('GET', '/auth/oidc/bind/authorize', undefined, carol);
-            expect((await call('POST', '/auth/oidc/bind/callback', { code: 'good-code', state: bind2.body.data.state }, carol)).status).toBe(409);
+        it('honours closed registration for new Google accounts only', async () => {
+            const closed = { ...env, REGISTRATION_DISABLED: 'true' };
+            const signInWith = async (sub: string) => {
+                google.sub = sub;
+                const start = await handleApi(new Request('http://localhost/api/auth/oidc/authorize'), closed);
+                const { state } = ((await start.json()) as any).data;
+                return handleApi(new Request('http://localhost/api/auth/oidc/callback', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code: 'good-code', state }),
+                }), closed);
+            };
+            expect((await signInWith('sub-alice')).status).toBe(200);
+            expect((await signInWith('sub-newcomer')).status).toBe(403);
         });
 
         it('rejects forged tokens and bad codes', async () => {

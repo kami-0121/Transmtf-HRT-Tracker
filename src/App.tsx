@@ -10,7 +10,6 @@ import { CLOUD_ENABLED, CLOUD_BACKEND } from './api/config';
 import MainLayout from './components/MainLayout';
 import SecurityPasswordGate from './components/SecurityPasswordGate';
 import OIDCBindingGate from './components/OIDCBindingGate';
-import AnnouncementModal from './components/AnnouncementModal';
 import SyncConflictModal from './components/SyncConflictModal';
 import OverviewPage from './pages/OverviewPage';
 import HistoryPage from './pages/HistoryPage';
@@ -58,7 +57,6 @@ const App = () => (
                 <SecurityPasswordGate />
                 {/* The original server requires linking Transmtf; Google on D1 is optional. */}
                 {CLOUD_BACKEND === 'external' && <OIDCBindingGate />}
-                <AnnouncementModal />
                 <SyncConflictOverlay />
                 <Routes>
                     {/* All routes use MainLayout for unified layout */}
@@ -74,7 +72,8 @@ const App = () => (
 
                         {/* Auth pages (cloud features only; local mode goes back to settings) */}
                         <Route path="login" element={CLOUD_ENABLED ? <Login /> : <Navigate to="/settings" replace />} />
-                        <Route path="register" element={CLOUD_ENABLED ? <Register /> : <Navigate to="/settings" replace />} />
+                        {/* No registration on this fork's own backend: the first Google sign-in creates the account. */}
+                        <Route path="register" element={!CLOUD_ENABLED ? <Navigate to="/settings" replace /> : CLOUD_BACKEND === 'd1' ? <Navigate to="/login" replace /> : <Register />} />
 
                         {/* Legacy alias */}
                         <Route path="account" element={<Navigate to="/settings" replace />} />

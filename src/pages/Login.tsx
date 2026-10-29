@@ -3,7 +3,8 @@ import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { useTranslation } from '../contexts/LanguageContext';
 import TurnstileModal from '../components/TurnstileModal';
-import { TURNSTILE_SITE_KEY } from '../api/config';
+import { TURNSTILE_SITE_KEY, CLOUD_BACKEND } from '../api/config';
+import GoogleSignInButton from '../components/GoogleSignInButton';
 import apiClient from '../api/client';
 import { Shield, Loader2 } from 'lucide-react';
 
@@ -162,6 +163,51 @@ const Login: React.FC = () => {
     }
   };
 
+  // This fork's own backend (D1): Google is the only way to sign in.
+  if (CLOUD_BACKEND === 'd1') {
+    return (
+      <div className="w-full min-h-full flex items-center justify-center p-3 sm:p-4"
+        style={{ background: `linear-gradient(135deg, var(--accent-50) 0%, var(--bg-secondary) 50%, var(--bg-primary) 100%)` }}>
+        <div className="w-full max-w-sm">
+          <div className="rounded-2xl sm:rounded-3xl glass-card p-5 sm:p-6">
+            <div className="text-center mb-5">
+              <h1 className="text-2xl sm:text-3xl font-bold mb-1 sm:mb-2" style={{ color: 'var(--text-primary)' }}>
+                {t('login.title') || 'Sign In'}
+              </h1>
+              <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+                {t('login.googleOnlyDesc')}
+              </p>
+            </div>
+
+            {oidcEnabled ? (
+              <GoogleSignInButton onError={setError} />
+            ) : (
+              <div className="rounded-xl border px-3 py-2.5 text-xs sm:text-sm text-center" style={{ borderColor: 'var(--border-primary)', color: 'var(--text-secondary)' }}>
+                {t('login.googleNotConfigured')}
+              </div>
+            )}
+
+            <p className="mt-3 text-xs text-center" style={{ color: 'var(--text-tertiary)' }}>
+              {t('login.googlePrivacy')}
+            </p>
+
+            {error && (
+              <div className="mt-4 bg-red-50 border border-red-200 text-red-700 px-3 py-2 rounded-xl text-xs sm:text-sm">
+                {error}
+              </div>
+            )}
+
+            <div className="mt-4 text-center">
+              <Link to="/" className="text-gray-500 hover:text-gray-700 text-xs sm:text-sm transition">
+                {t('login.continueWithout') || 'Continue without account'}
+              </Link>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="w-full min-h-full flex items-center justify-center p-3 sm:p-4"
       style={{ background: `linear-gradient(135deg, var(--accent-50) 0%, var(--bg-secondary) 50%, var(--bg-primary) 100%)` }}>
@@ -172,7 +218,7 @@ const Login: React.FC = () => {
               {t('login.title') || 'Sign In'}
             </h1>
             <p className="text-sm sm:text-base" style={{ color: 'var(--text-secondary)' }}>
-              {t('login.subtitle') || 'Welcome back to Transmtf HRT Tracker'}
+              {t('login.subtitle') || 'Welcome back to AtDo HRT'}
             </p>
           </div>
 

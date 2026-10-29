@@ -1,4 +1,4 @@
-# 部署到 Cloudflare Workers（D1 雲端存檔）
+# AtDo Dose：部署到 Cloudflare Workers（D1 雲端存檔）
 
 此 fork 由一個 Cloudflare Worker 同時提供：
 
@@ -28,50 +28,42 @@
 ## 一次性設定（Cloudflare Workers Builds，Git 自動部署）
 
 1. Cloudflare Dashboard → **Workers & Pages** → **Create** → **Import a repository**，連結 GitHub 並選擇 `kami-0121/Transmtf-HRT-Tracker`。
-2. Worker 名稱填 **`transmtf-hrt-tracker`**（必須與 `wrangler.toml` 的 `name` 相同）。
+2. Worker 名稱填 **`atdo-dose`**（必須與 `wrangler.toml` 的 `name` 相同）。
 3. 建置設定：
    - Build command：`npm test && npm run build`（測試失敗就不部署）
    - Deploy command：`npx wrangler deploy`
 4. Production branch：選要上線的分支（建議合併到 `main` 後以 `main` 為 production）。
-5. 第一次部署時 wrangler 會自動建立名為 `hrt-tracker` 的 D1 資料庫並綁定為 `DB`；資料表由 Worker 在第一次收到 API 請求時自動建立（`server/schema.ts`），不需手動 migration。
-   - 若你的帳號不支援自動建立：先執行 `npx wrangler d1 create hrt-tracker`，把輸出的 `database_id` 加到 `wrangler.toml` 的 `[[d1_databases]]`。
+5. 第一次部署時 wrangler 會自動建立名為 `atdo-dose` 的 D1 資料庫並綁定為 `DB`；資料表由 Worker 在第一次收到 API 請求時自動建立（`server/schema.ts`），不需手動 migration。
+   - 若你的帳號不支援自動建立：先執行 `npx wrangler d1 create atdo-dose`，把輸出的 `database_id` 加到 `wrangler.toml` 的 `[[d1_databases]]`。
 
-網址：`https://transmtf-hrt-tracker.<你的子網域>.workers.dev`（可在 Worker 的 **Settings → Domains & Routes** 綁定自己的網域）。
+網址：`https://atdo-dose.<你的子網域>.workers.dev`（可在 Worker 的 **Settings → Domains & Routes** 綁定自己的網域）。
 
-## 建議的安全設定（Dashboard → Worker → Settings → Variables and Secrets）
+## 登入方式：只有 Google
 
-| 變數 | 用途 |
-|---|---|
-| `TURNSTILE_SECRET_KEY`（Secret）＋ `VITE_TURNSTILE_SITE_KEY` | 註冊／登入加上人機驗證（在 Cloudflare Turnstile 建立 widget，網域填你的網址） |
-| `REGISTRATION_DISABLED = "true"` | 自己帳號建好後關閉註冊，避免陌生人使用 |
-| `PASSWORD_PBKDF2_ITERATIONS` | 登入密碼雜湊成本（預設 100000） |
-| `CLOUD_ENABLED = "false"` | 改回純本機模式（不顯示帳號、不發任何請求） |
-| `GOOGLE_CLIENT_SECRET`（Secret） | 啟用 Google 登入（`GOOGLE_CLIENT_ID` 已在 wrangler.toml，見下方） |
-
-> Workers **免費方案**每個請求的 CPU 時間上限是 10 ms。登入／註冊時的密碼雜湊（PBKDF2 100000 次）可能超過，偶爾出現錯誤 1102。若遇到，可改用 Workers Paid，或把 `PASSWORD_PBKDF2_ITERATIONS` 調低（不低於 10000；已存在帳號會在下次登入時自動改用新設定）。一般同步請求不做密碼雜湊。
-
-## Google 登入（選用）
-
-參考 AtDo：OAuth 2.0 授權碼 + PKCE，只要求 `openid` 權限，**不索取 email 或姓名**，資料庫只存 Google 帳號 id 的雜湊。
+和 AtDo 一樣，**只能用 Google 登入**，沒有帳號密碼的註冊／登入（不必保管、也不會外洩密碼）。第一次用 Google 登入時自動建立帳號。OAuth 2.0 授權碼 + PKCE，只要求 `openid` 權限，**不索取 email 或姓名**，資料庫只存 Google 帳號 id 的雜湊。
 
 1. [Google Cloud Console](https://console.cloud.google.com/apis/credentials) → 建立憑證 → **OAuth 用戶端 ID** → 應用程式類型選「網頁應用程式」。
-2. 「已授權的重新導向 URI」加入：`https://<你的網址>/auth/oidc/callback`（例如 `https://transmtf-hrt-tracker.<子網域>.workers.dev/auth/oidc/callback`；有自訂網域就兩個都加）。
+2. 「已授權的重新導向 URI」加入：`https://<你的網址>/auth/oidc/callback`（例如 `https://atdo-dose.<子網域>.workers.dev/auth/oidc/callback`；有自訂網域就兩個都加）。
 3. OAuth 同意畫面：範圍只需要 `openid`，不需要送審。
 4. `GOOGLE_CLIENT_ID` 已寫在 `wrangler.toml`（用戶端 ID 本來就公開在 Google 授權網址上，不是祕密）。
    **用戶端密鑰不可放進 repo**：Cloudflare Dashboard → Worker → Settings → Variables and Secrets → 新增，類型選 **Secret**，名稱 `GOOGLE_CLIENT_SECRET`；或執行 `npx wrangler secret put GOOGLE_CLIENT_SECRET`。
-5. 重新部署後，登入／註冊頁會出現「使用 Google 登入」。
+5. 重新部署後，登入頁會出現「使用 Google 登入」。沒設定密鑰時，登入頁會顯示「Google 登入尚未設定」。
 
-使用方式：
-- **Google 直接登入**：第一次會自動建立帳號（沒有登入密碼，帳號名稱為 `google_xxxx`）；`REGISTRATION_DISABLED = "true"` 時不會為新的 Google 帳號開戶。
-- **綁定到既有帳號**：設定 › 帳號 › Google 登入 › 綁定，之後兩種方式都能登入；一個 Google 帳號只能綁一個帳號。
-- 只用 Google 的帳號可在同一頁另外設定登入密碼；有綁 Google 的帳號也可以移除密碼（會登出所有裝置）。
-- 本機開發：在專案根目錄建 `.dev.vars`（已加入 .gitignore）寫入上述兩個變數。
+本機開發：在專案根目錄建 `.dev.vars`（已加入 .gitignore）寫入 `GOOGLE_CLIENT_ID`、`GOOGLE_CLIENT_SECRET`。
+
+## 其他設定（Dashboard → Worker → Settings → Variables and Secrets）
+
+| 變數 | 用途 |
+|---|---|
+| `GOOGLE_CLIENT_SECRET`（Secret） | 啟用 Google 登入（必要） |
+| `REGISTRATION_DISABLED = "true"` | 不再為第一次登入的 Google 帳號開戶（已有帳號照常使用），例如只想自己用時 |
+| `CLOUD_ENABLED = "false"` | 改回純本機模式（不顯示帳號、不發任何請求） |
 
 ## 伺服器端保護
 
 - 每位使用者每分鐘最多 30 次上傳（超過回 429，App 會稍後自動重試）。
 - API 回應帶安全標頭（禁止嵌入、禁止 MIME 推測、不送 Referrer）；頁面禁止被嵌入 iframe。
-- 每日排程（`wrangler.toml` 的 `[triggers]`，UTC 03:15）清除過期登入與舊的限速紀錄。
+- 每日排程（`wrangler.toml` 的 `[triggers]`，UTC 03:15）清除過期登入、未完成的 Google 授權與舊的限速紀錄。
 - 資料表版本化升級（`server/schema.ts` 的 `MIGRATIONS`），舊資料庫第一次收到請求時自動升級，不需手動 migration。
 
 ## 本機開發與測試

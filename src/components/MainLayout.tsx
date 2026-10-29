@@ -226,7 +226,7 @@ const MainLayout: React.FC = () => {
                         style={{ borderColor: 'var(--border-primary)' }}>
                         <img src="/favicon.ico" alt="logo" className="h-full w-full object-cover" />
                     </div>
-                    <p className="hidden xl:block text-sm font-black tracking-tight whitespace-nowrap" style={{ color: 'var(--text-primary)' }}>Transmtf HRT Tracker</p>
+                    <p className="hidden xl:block text-sm font-black tracking-tight whitespace-nowrap" style={{ color: 'var(--text-primary)' }}>AtDo HRT</p>
                 </div>
 
                 <nav aria-label={t('nav.aria_primary')} className="flex shrink-0 items-center gap-1">
