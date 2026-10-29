@@ -3,6 +3,9 @@
 # (Workers & Pages → Create → Import a repository).
 name = "transmtf-hrt-tracker"
 main = "worker.ts"
+# Keep variables set in the dashboard (e.g. REGISTRATION_DISABLED) when
+# Workers Builds runs `wrangler deploy`; without this they are removed.
+keep_vars = true
 compatibility_date = "2025-12-04"
 
 [assets]
@@ -34,10 +37,15 @@ crons = ["15 3 * * *"]
 # Accounts + cloud backup served by this Worker from D1 (server/api.ts).
 # "false" = local-only app (no account UI, no requests).
 CLOUD_ENABLED = "true"
+# Google sign-in: the OAuth client ID is public (it appears in every Google
+# authorization URL). The client SECRET must never be committed: set it as a
+# Secret in the dashboard (Worker → Settings → Variables and Secrets) or with
+# `npx wrangler secret put GOOGLE_CLIENT_SECRET`.
+GOOGLE_CLIENT_ID = "549548693796-jv8rdl1onarnvhbinu3iufjrbgd8m6ml.apps.googleusercontent.com"
 # Optional hardening (set in the dashboard; keep secrets out of this file):
 #   TURNSTILE_SECRET_KEY (secret) + VITE_TURNSTILE_SITE_KEY → CAPTCHA on register/login
 #   REGISTRATION_DISABLED = "true" → close sign-ups
 #   PASSWORD_PBKDF2_ITERATIONS → login password hashing cost (default 100000)
-#   GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET (secret) → "Sign in with Google"
+#   GOOGLE_CLIENT_SECRET (secret) → enables "Sign in with Google"
 #   (redirect URI: https://<host>/auth/oidc/callback, see docs/DEPLOY_WORKERS.md)
 # To use an external backend instead of D1, set VITE_API_BASE_URL.

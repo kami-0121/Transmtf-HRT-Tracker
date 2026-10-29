@@ -46,7 +46,7 @@
 | `REGISTRATION_DISABLED = "true"` | 自己帳號建好後關閉註冊，避免陌生人使用 |
 | `PASSWORD_PBKDF2_ITERATIONS` | 登入密碼雜湊成本（預設 100000） |
 | `CLOUD_ENABLED = "false"` | 改回純本機模式（不顯示帳號、不發任何請求） |
-| `GOOGLE_CLIENT_ID` ＋ `GOOGLE_CLIENT_SECRET`（Secret） | 啟用 Google 登入（見下方） |
+| `GOOGLE_CLIENT_SECRET`（Secret） | 啟用 Google 登入（`GOOGLE_CLIENT_ID` 已在 wrangler.toml，見下方） |
 
 > Workers **免費方案**每個請求的 CPU 時間上限是 10 ms。登入／註冊時的密碼雜湊（PBKDF2 100000 次）可能超過，偶爾出現錯誤 1102。若遇到，可改用 Workers Paid，或把 `PASSWORD_PBKDF2_ITERATIONS` 調低（不低於 10000；已存在帳號會在下次登入時自動改用新設定）。一般同步請求不做密碼雜湊。
 
@@ -57,9 +57,8 @@
 1. [Google Cloud Console](https://console.cloud.google.com/apis/credentials) → 建立憑證 → **OAuth 用戶端 ID** → 應用程式類型選「網頁應用程式」。
 2. 「已授權的重新導向 URI」加入：`https://<你的網址>/auth/oidc/callback`（例如 `https://transmtf-hrt-tracker.<子網域>.workers.dev/auth/oidc/callback`；有自訂網域就兩個都加）。
 3. OAuth 同意畫面：範圍只需要 `openid`，不需要送審。
-4. Cloudflare Dashboard → Worker → Settings → Variables and Secrets：
-   - `GOOGLE_CLIENT_ID`（一般變數）
-   - `GOOGLE_CLIENT_SECRET`（**Secret**）
+4. `GOOGLE_CLIENT_ID` 已寫在 `wrangler.toml`（用戶端 ID 本來就公開在 Google 授權網址上，不是祕密）。
+   **用戶端密鑰不可放進 repo**：Cloudflare Dashboard → Worker → Settings → Variables and Secrets → 新增，類型選 **Secret**，名稱 `GOOGLE_CLIENT_SECRET`；或執行 `npx wrangler secret put GOOGLE_CLIENT_SECRET`。
 5. 重新部署後，登入／註冊頁會出現「使用 Google 登入」。
 
 使用方式：
