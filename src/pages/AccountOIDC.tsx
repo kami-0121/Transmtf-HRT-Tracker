@@ -138,7 +138,7 @@ const AccountOIDC: React.FC = () => {
       <div className="mx-auto w-full max-w-2xl space-y-6">
         <div className="flex items-center gap-3">
           <Link
-            to="/profile"
+            to="/settings"
             className="flex items-center gap-1 text-sm transition"
             style={{ color: 'var(--text-secondary)' }}
           >

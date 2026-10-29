@@ -634,7 +634,7 @@ const ShareImageModal: React.FC<Props> = ({
                                     )}
                                     {hasPersonalModel && rawE2 > 0 && (
                                         <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px', whiteSpace: 'nowrap' }}>
-                                            <span style={{ fontSize: '13px', fontWeight: 800, color: palette.textTertiary, textTransform: 'uppercase', letterSpacing: '0.1em' }}>Raw</span>
+                                            <span style={{ fontSize: '13px', fontWeight: 800, color: palette.textTertiary, textTransform: 'uppercase', letterSpacing: '0.1em' }}>{t('chart.label_raw')}</span>
                                             <span style={{ fontSize: '17px', fontWeight: 700, color: palette.textSecondary }}>
                                                 {rawE2.toFixed(1)} pg/mL
                                             </span>
@@ -642,13 +642,13 @@ const ShareImageModal: React.FC<Props> = ({
                                     )}
                                     {!hasDoseHistory && baselineLevel !== null && (
                                         <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px', whiteSpace: 'nowrap' }}>
-                                            <span style={{ fontSize: '13px', fontWeight: 800, color: '#2dd4bf', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Baseline</span>
+                                            <span style={{ fontSize: '13px', fontWeight: 800, color: '#2dd4bf', textTransform: 'uppercase', letterSpacing: '0.1em' }}>{t('chart.label_baseline')}</span>
                                             <span style={{ fontSize: '17px', fontWeight: 700, color: '#14b8a6' }}>{baselineLevel.toFixed(1)} pg/mL</span>
                                         </div>
                                     )}
                                     {hasDoseHistory && !hasPersonalModel && baselineE2PGmL != null && baselineE2PGmL > 0 && (
                                         <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px', whiteSpace: 'nowrap' }}>
-                                            <span style={{ fontSize: '13px', fontWeight: 800, color: '#2dd4bf', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Endogenous</span>
+                                            <span style={{ fontSize: '13px', fontWeight: 800, color: '#2dd4bf', textTransform: 'uppercase', letterSpacing: '0.1em' }}>{t('chart.label_endogenous')}</span>
                                             <span style={{ fontSize: '17px', fontWeight: 700, color: '#14b8a6' }}>{endoNow.toFixed(1)} pg/mL</span>
                                         </div>
                                     )}
@@ -713,7 +713,7 @@ const ShareImageModal: React.FC<Props> = ({
                                             )}
                                             {rawCPA > 0 && rawCPA !== personalCPA && (
                                                 <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px', whiteSpace: 'nowrap' }}>
-                                                    <span style={{ fontSize: '13px', fontWeight: 800, color: palette.textTertiary, textTransform: 'uppercase', letterSpacing: '0.1em' }}>Base</span>
+                                                    <span style={{ fontSize: '13px', fontWeight: 800, color: palette.textTertiary, textTransform: 'uppercase', letterSpacing: '0.1em' }}>{t('chart.label_base')}</span>
                                                     <span style={{ fontSize: '17px', fontWeight: 700, color: palette.textSecondary }}>{rawCPA.toFixed(2)} {aaUnit}</span>
                                                 </div>
                                             )}

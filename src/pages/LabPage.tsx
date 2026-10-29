@@ -1,17 +1,10 @@
 import React from 'react';
-import { useOutletContext } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { useAppData } from '../contexts/AppDataContext';
-import { LabResult } from '../../logic';
 import LabView from '../views/LabView';
 
-interface OutletContext {
-    onAddLabResult: () => void;
-    onEditLabResult: (result: LabResult) => void;
-    onClearLabResults: () => void;
-}
-
 const LabPage: React.FC = () => {
-    const { onAddLabResult, onEditLabResult, onClearLabResults } = useOutletContext<OutletContext>();
+    const navigate = useNavigate();
     const {
         labResults,
         personalModel,
@@ -47,9 +40,7 @@ const LabPage: React.FC = () => {
             onSetCalibrationModel={setCalibrationModel}
             calibrationMode={calibrationMode}
             onSetCalibrationMode={setCalibrationMode}
-            onAddLabResult={onAddLabResult}
-            onEditLabResult={onEditLabResult}
-            onClearLabResults={onClearLabResults}
+            onBack={() => navigate('/settings')}
         />
     );
 };

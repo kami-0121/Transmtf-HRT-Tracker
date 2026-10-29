@@ -25,6 +25,7 @@ import {
 } from '../../logic';
 import { Calendar, X, Clock, Info, Save, Trash2, Bookmark, Check, Pencil } from 'lucide-react';
 import { useFocusTrap } from '../hooks/useFocusTrap';
+import { regimenToEvent, type Regimen } from '../utils/regimens';
 
 interface DoseTemplate {
     id: string;
@@ -132,9 +133,29 @@ export interface DoseFormModalProps {
     eventToEdit?: DoseEvent | null;
     onSave: (event: DoseEvent) => void;
     onDelete?: (id: string) => void;
+    /**
+     * Regimen (藥物方案) mode: the same form defines a reusable dose instead of
+     * a record — no time / weight, a name field, and patch removal excluded.
+     * The result is delivered through `onSaveRegimen` (time/weight ignored).
+     */
+    regimenMode?: boolean;
+    regimenToEdit?: Regimen | null;
+    onSaveRegimen?: (event: DoseEvent, name: string) => void;
 }
 
-const DoseFormModal: React.FC<DoseFormModalProps> = ({ isOpen, onClose, eventToEdit, onSave, onDelete }) => {
+const DoseFormModal: React.FC<DoseFormModalProps> = ({ isOpen, onClose, eventToEdit: eventToEditProp, onSave, onDelete, regimenMode = false, regimenToEdit = null, onSaveRegimen }) => {
+    // In regimen mode the regimen being edited is presented to the form as a
+    // synthetic event, so every route-specific field restores exactly as for a record.
+    const eventToEdit = useMemo<DoseEvent | null>(
+        () => regimenMode
+            ? (regimenToEdit ? regimenToEvent(regimenToEdit, Date.now() / 3600000, 0, regimenToEdit.id) : null)
+            : (eventToEditProp ?? null),
+        [regimenMode, regimenToEdit, eventToEditProp]
+    );
+    const [regimenName, setRegimenName] = useState('');
+    useEffect(() => {
+        if (isOpen && regimenMode) setRegimenName(regimenToEdit?.name ?? '');
+    }, [isOpen, regimenMode, regimenToEdit]);
     const { t, lang } = useTranslation();
     const { showDialog } = useDialog();
     const { events: allEvents, gelProducts } = useAppData();
@@ -722,7 +743,7 @@ const DoseFormModal: React.FC<DoseFormModalProps> = ({ isOpen, onClose, eventToE
             extras[ExtraKey.patchInstanceId] = eventId;
         }
 
-        if (route === Route.patchRemove) {
+        if (route === Route.patchRemove && !regimenMode) {
             // Nothing active at the chosen time → the removal would pair with no
             // apply and silently remove nothing; block instead of saving garbage.
             if (patchRemoveCandidates.length === 0) {
@@ -750,6 +771,13 @@ const DoseFormModal: React.FC<DoseFormModalProps> = ({ isOpen, onClose, eventToE
         // Silently remember the last-used dose *per drug* (keyed by route+ester)
         // so one compound's dose never prefills onto another, plus which drug was
         // used last so the modal re-opens on it.
+        if (regimenMode) {
+            onSaveRegimen?.(newEvent, regimenName);
+            setIsSaving(false);
+            onClose();
+            return;
+        }
+
         if (!eventToEdit) {
             // Key the memo by the compound actually saved (effectiveEster), so the
             // memory can never disagree with the stored event.
@@ -765,6 +793,11 @@ const DoseFormModal: React.FC<DoseFormModalProps> = ({ isOpen, onClose, eventToE
         setIsSaving(false);
         onClose();
     };
+
+    // A regimen can never be a patch removal (it would pair with nothing).
+    useEffect(() => {
+        if (regimenMode && route === Route.patchRemove) setRoute(Route.sublingual);
+    }, [regimenMode, route]);
 
     // Calculate availableEsters unconditionally (shared with BatchDoseModal)
     const availableEsters = useMemo(() => getAvailableEsters(route), [route]);
@@ -855,7 +888,9 @@ const DoseFormModal: React.FC<DoseFormModalProps> = ({ isOpen, onClose, eventToE
                 <div className="px-3 py-2 sm:p-6 md:p-8 border-b flex justify-between items-center shrink-0"
                     style={{ borderColor: 'var(--border-secondary)', background: 'var(--bg-card-hover)' }}>
                     <h3 id="dose-modal-title" className="text-base sm:text-xl font-semibold" style={{ color: 'var(--text-primary)' }}>
-                        {eventToEdit ? t('modal.dose.edit_title') : t('modal.dose.add_title')}
+                        {regimenMode
+                            ? (eventToEdit ? t('regimen.edit_title') : t('regimen.add_title'))
+                            : (eventToEdit ? t('modal.dose.edit_title') : t('modal.dose.add_title'))}
                     </h3>
                     <button onClick={onClose} aria-label={t('btn.close')} className="relative p-1.5 sm:p-2 rounded-full transition after:absolute after:-inset-2 after:content-['']"
                         style={{ background: 'var(--bg-card)', color: 'var(--text-secondary)' }}>
@@ -864,51 +899,69 @@ const DoseFormModal: React.FC<DoseFormModalProps> = ({ isOpen, onClose, eventToE
                 </div>
 
                 <div className="p-4 sm:p-6 space-y-3 sm:space-y-6 flex-1 overflow-y-auto">
-                    {/* Basic information flows by each field's intrinsic width. */}
-                    <div className="flex flex-wrap items-start gap-x-4 gap-y-3 sm:gap-y-6">
-                        {/* Time */}
-                        <div className="max-w-full flex-none space-y-2">
-                            <label className="block text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>{t('field.time')}</label>
-                            <div className="flex max-w-full items-center gap-2 sm:gap-3">
-                                <input
-                                    ref={dateInputRef}
-                                    type="datetime-local"
-                                    value={dateStr}
-                                    onChange={e => setDateStr(e.target.value)}
-                                    className="min-w-0 max-w-full bg-transparent p-0 font-mono text-lg sm:text-xl font-bold focus:outline-none focus:ring-0"
-                                    style={{ color: 'var(--text-primary)', border: 'none' }}
-                                />
-                                <button
-                                    type="button"
-                                    onClick={() => dateInputRef.current?.focus()}
-                                    aria-label={t('field.time')}
-                                    className="shrink-0 rounded-lg p-2 transition-colors"
-                                    style={{ background: 'var(--bg-card-hover)', color: 'var(--text-secondary)' }}
-                                >
-                                    <Calendar size={18} />
-                                </button>
-                            </div>
-                        </div>
-
-                        {/* Body weight */}
-                        <div className="min-w-[120px] flex-[1_1_120px] space-y-2">
-                            <label className="block text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
-                                {t('field.weight')} <span className="normal-case">({t('field.weight_unit')})</span>
-                            </label>
+                    {regimenMode ? (
+                        <div className="space-y-2">
+                            <label className="block text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>{t('regimen.name')}</label>
                             <input
-                                type="number"
-                                inputMode="decimal"
-                                min="20"
-                                max="300"
-                                step="0.1"
-                                value={weightStr}
-                                onChange={e => setWeightStr(e.target.value)}
-                                className="w-full min-w-0 rounded-xl p-3 font-mono text-base font-bold outline-none focus:ring-2 focus:ring-[var(--accent-300)]"
+                                type="text"
+                                value={regimenName}
+                                maxLength={60}
+                                onChange={e => setRegimenName(e.target.value)}
+                                placeholder={t('regimen.name_placeholder')}
+                                className="w-full rounded-xl p-3 text-base font-bold outline-none focus:ring-2 focus:ring-[var(--accent-300)]"
                                 style={{ background: 'var(--bg-card-hover)', border: '1px solid var(--border-primary)', color: 'var(--text-primary)' }}
-                                placeholder="70"
                             />
+                            <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-tertiary)' }}>{t('regimen.form_hint')}</p>
                         </div>
-                    </div>
+                    ) : (
+                    <>
+                    {/* Basic information flows by each field's intrinsic width. */}
+                      <div className="flex flex-wrap items-start gap-x-4 gap-y-3 sm:gap-y-6">
+                          {/* Time */}
+                          <div className="max-w-full flex-none space-y-2">
+                              <label className="block text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>{t('field.time')}</label>
+                              <div className="flex max-w-full items-center gap-2 sm:gap-3">
+                                  <input
+                                      ref={dateInputRef}
+                                      type="datetime-local"
+                                      value={dateStr}
+                                      onChange={e => setDateStr(e.target.value)}
+                                      className="min-w-0 max-w-full bg-transparent p-0 font-mono text-lg sm:text-xl font-bold focus:outline-none focus:ring-0"
+                                      style={{ color: 'var(--text-primary)', border: 'none' }}
+                                  />
+                                  <button
+                                      type="button"
+                                      onClick={() => dateInputRef.current?.focus()}
+                                      aria-label={t('field.time')}
+                                      className="shrink-0 rounded-lg p-2 transition-colors"
+                                      style={{ background: 'var(--bg-card-hover)', color: 'var(--text-secondary)' }}
+                                  >
+                                      <Calendar size={18} />
+                                  </button>
+                              </div>
+                          </div>
+  
+                          {/* Body weight */}
+                          <div className="min-w-[120px] flex-[1_1_120px] space-y-2">
+                              <label className="block text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
+                                  {t('field.weight')} <span className="normal-case">({t('field.weight_unit')})</span>
+                              </label>
+                              <input
+                                  type="number"
+                                  inputMode="decimal"
+                                  min="20"
+                                  max="300"
+                                  step="0.1"
+                                  value={weightStr}
+                                  onChange={e => setWeightStr(e.target.value)}
+                                  className="w-full min-w-0 rounded-xl p-3 font-mono text-base font-bold outline-none focus:ring-2 focus:ring-[var(--accent-300)]"
+                                  style={{ background: 'var(--bg-card-hover)', border: '1px solid var(--border-primary)', color: 'var(--text-primary)' }}
+                                  placeholder="70"
+                              />
+                          </div>
+                      </div>
+                    </>
+                    )}
 
                     {/* Medication information. A single available compound leaves no empty column. */}
                     <div className={`grid min-w-0 grid-cols-1 gap-3 sm:gap-6 md:gap-4 ${availableEsters.length > 1 ? 'md:grid-cols-2' : ''}`}>
@@ -917,7 +970,7 @@ const DoseFormModal: React.FC<DoseFormModalProps> = ({ isOpen, onClose, eventToE
                             label={t('field.route')}
                             value={route}
                             onChange={(val) => setRoute(val as Route)}
-                            options={ROUTE_DISPLAY_ORDER.map(r => ({
+                            options={ROUTE_DISPLAY_ORDER.filter(r => !regimenMode || r !== Route.patchRemove).map(r => ({
                                 value: r,
                                 label: t(`route.${r}`),
                                 icon: getRouteIcon(r)
@@ -1254,7 +1307,7 @@ const DoseFormModal: React.FC<DoseFormModalProps> = ({ isOpen, onClose, eventToE
                 </div>
 
                     {/* Template panel (new-record mode only) */}
-                {!eventToEdit && showPanel && (
+                {!eventToEdit && !regimenMode && showPanel && (
                     <div className="absolute inset-x-0 bottom-[88px] border-t shadow-lg rounded-b-none z-10 flex flex-col max-h-72"
                         style={{ background: 'var(--bg-card)', borderColor: 'var(--border-primary)' }}>
                         <div className="flex items-center justify-between px-5 py-3 border-b shrink-0" style={{ borderColor: 'var(--border-secondary)' }}>
@@ -1374,7 +1427,7 @@ const DoseFormModal: React.FC<DoseFormModalProps> = ({ isOpen, onClose, eventToE
                             <Trash2 size={20} />
                         </button>
                     )}
-                    {!eventToEdit && (
+                    {!eventToEdit && !regimenMode && (
                         <button
                             onClick={() => setShowPanel(p => !p)}
                             aria-label={t('template.title')}

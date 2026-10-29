@@ -9,6 +9,8 @@ import {
 import { pkWorker, PKWorkerCancelledError } from '../workers/pkWorkerClient';
 import { computeDataHash } from '../utils/dataHash';
 import { GEL_PRODUCTS_KEY, readCustomGelProducts, writeCustomGelProducts } from '../utils/doseForm';
+import { BLOOD_REPORTS_KEY, readBloodReports, sanitizeBloodReports, type BloodReport } from '../utils/bloodTests';
+import { REGIMENS_KEY, readRegimens, sanitizeRegimens, type Regimen } from '../utils/regimens';
 import { backfillEventWeights, eventsNeedWeightMigration, latestEventWeight, DEFAULT_WEIGHT_KG } from '../utils/weight';
 
 const PERSONAL_MODEL_KEY = 'hrt-personal-model';
@@ -73,6 +75,12 @@ interface AppDataContextType {
     /** User-created custom transdermal-gel products (cloud-synced). Presets live in code. */
     gelProducts: GelProductSpec[];
     setGelProducts: React.Dispatch<React.SetStateAction<GelProductSpec[]>>;
+    /** Multi-analyte blood reports (E2 lives in labResults under the same id). Cloud-synced. */
+    bloodReports: BloodReport[];
+    setBloodReports: React.Dispatch<React.SetStateAction<BloodReport[]>>;
+    /** Saved medication regimens for one-tap logging. Cloud-synced. */
+    regimens: Regimen[];
+    setRegimens: React.Dispatch<React.SetStateAction<Regimen[]>>;
     resetPersonalModel: () => void;
     /**
      * True while any PK compute request (simulation / personal-model replay /
@@ -210,6 +218,8 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         return raw === '1' || raw.toLowerCase() === 'true';
     });
     const [gelProducts, setGelProducts] = useState<GelProductSpec[]>(() => readCustomGelProducts());
+    const [bloodReports, setBloodReports] = useState<BloodReport[]>(() => readBloodReports());
+    const [regimens, setRegimens] = useState<Regimen[]>(() => readRegimens());
     const [testosteroneModelEnabled, setTestosteroneModelEnabled] = useState<boolean>(() => {
         const raw = localStorage.getItem(TESTOSTERONE_MODEL_KEY);
         if (raw === null) return true;
@@ -235,6 +245,8 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         applyE2LearningToCPA: false,
         applyCPAInhibitionToE2: false,
         gelProducts: false,
+        bloodReports: false,
+        regimens: false,
     });
     const isInitialLoadRef = useRef({
         events: true,
@@ -244,6 +256,8 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         applyE2LearningToCPA: true,
         applyCPAInhibitionToE2: true,
         gelProducts: true,
+        bloodReports: true,
+        regimens: true,
     });
 
     const markExternalUpdate = (key: keyof typeof suppressLocalUpdateRef.current) => {
@@ -310,6 +324,14 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         writeCustomGelProducts(gelProducts);
         finalizeLocalUpdate('gelProducts', GEL_PRODUCTS_KEY);
     }, [gelProducts]);
+    useEffect(() => {
+        localStorage.setItem(BLOOD_REPORTS_KEY, JSON.stringify(bloodReports));
+        finalizeLocalUpdate('bloodReports', BLOOD_REPORTS_KEY);
+    }, [bloodReports]);
+    useEffect(() => {
+        localStorage.setItem(REGIMENS_KEY, JSON.stringify(regimens));
+        finalizeLocalUpdate('regimens', REGIMENS_KEY);
+    }, [regimens]);
 
     useEffect(() => {
         const lang = localStorage.getItem('hrt-lang') || 'en';
@@ -319,9 +341,9 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         const themeMode = localStorage.getItem(THEME_MODE_KEY) || (darkMode ? 'dark' : 'light');
         const gelProductsRaw = localStorage.getItem(GEL_PRODUCTS_KEY);
         const gelProductsParsed = gelProductsRaw ? JSON.parse(gelProductsRaw) : [];
-        const hash = computeDataHash({ events, weight: latestEventWeight(events), labResults, lang, calibrationModel, calibrationMode, applyE2LearningToCPA, applyCPAInhibitionToE2, themeColor, themeMode, darkMode, gelProducts: gelProductsParsed });
+        const hash = computeDataHash({ events, weight: latestEventWeight(events), labResults, lang, calibrationModel, calibrationMode, applyE2LearningToCPA, applyCPAInhibitionToE2, themeColor, themeMode, darkMode, gelProducts: gelProductsParsed, bloodReports, regimens });
         localStorage.setItem('hrt-data-hash', hash);
-    }, [events, labResults, calibrationModel, calibrationMode, applyE2LearningToCPA, applyCPAInhibitionToE2, gelProducts]);
+    }, [events, labResults, calibrationModel, calibrationMode, applyE2LearningToCPA, applyCPAInhibitionToE2, gelProducts, bloodReports, regimens]);
 
     // Update current time every minute
     useEffect(() => {
@@ -340,9 +362,13 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
             markExternalUpdate('events');
             markExternalUpdate('labResults');
             markExternalUpdate('gelProducts');
+            markExternalUpdate('bloodReports');
+            markExternalUpdate('regimens');
             setEvents([]);
             setLabResults([]);
             setGelProducts([]);
+            setBloodReports([]);
+            setRegimens([]);
         };
         window.addEventListener('hrt-clear-local-data', handleClearLocalData);
         return () => window.removeEventListener('hrt-clear-local-data', handleClearLocalData);
@@ -350,7 +376,7 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
 
     useEffect(() => {
         const handleStorageChange = (e: StorageEvent) => {
-            const syncKeys = ['hrt-events', 'hrt-lab-results', 'hrt-calibration-model', CALIBRATION_MODE_KEY, APPLY_E2_LEARNING_TO_CPA_KEY, APPLY_CPA_INHIBITION_TO_E2_KEY, THEME_COLOR_KEY, THEME_MODE_KEY, DARK_MODE_KEY, GEL_PRODUCTS_KEY];
+            const syncKeys = ['hrt-events', 'hrt-lab-results', 'hrt-calibration-model', CALIBRATION_MODE_KEY, APPLY_E2_LEARNING_TO_CPA_KEY, APPLY_CPA_INHIBITION_TO_E2_KEY, THEME_COLOR_KEY, THEME_MODE_KEY, DARK_MODE_KEY, GEL_PRODUCTS_KEY, BLOOD_REPORTS_KEY, REGIMENS_KEY];
             const isCloudSync = e.key === 'hrt-data-synced';
             const isOtherTabSync = e.storageArea === localStorage && e.key && syncKeys.includes(e.key);
             if (!isCloudSync && !isOtherTabSync) {
@@ -387,6 +413,20 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
                 }
                 const saved = localStorage.getItem('hrt-lab-results');
                 setLabResults(saved ? JSON.parse(saved) : []);
+            }
+
+            if (e.key === BLOOD_REPORTS_KEY || isCloudSync) {
+                if (isCloudSync || isOtherTabSync) markExternalUpdate('bloodReports');
+                try {
+                    setBloodReports(sanitizeBloodReports(JSON.parse(localStorage.getItem(BLOOD_REPORTS_KEY) || '[]')));
+                } catch { setBloodReports([]); }
+            }
+
+            if (e.key === REGIMENS_KEY || isCloudSync) {
+                if (isCloudSync || isOtherTabSync) markExternalUpdate('regimens');
+                try {
+                    setRegimens(sanitizeRegimens(JSON.parse(localStorage.getItem(REGIMENS_KEY) || '[]')));
+                } catch { setRegimens([]); }
             }
 
             if (e.key === 'hrt-calibration-model' && isOtherTabSync) {
@@ -702,6 +742,10 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         setCalibrationMode,
         gelProducts,
         setGelProducts,
+        bloodReports,
+        setBloodReports,
+        regimens,
+        setRegimens,
         resetPersonalModel,
         isComputing,
         baselineE2PGmL,

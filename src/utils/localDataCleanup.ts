@@ -23,6 +23,8 @@ export function clearAllLocalMedicalData(): void {
     // per-drug dose memory can all reveal treatment details.
     localStorage.removeItem('hrt-personal-model');
     localStorage.removeItem('hrt-gel-products');
+    localStorage.removeItem('hrt-blood-reports');
+    localStorage.removeItem('hrt-regimens');
     localStorage.removeItem('hrt-dose-templates');
     localStorage.removeItem('hrt-dose-by-drug');
     localStorage.removeItem('hrt-dose-last-drug');
@@ -56,6 +58,8 @@ export function hasLocalMedicalData(): boolean {
         if (nonEmptyArray('hrt-events')) return true;
         if (nonEmptyArray('hrt-lab-results')) return true;
         if (nonEmptyArray('hrt-gel-products')) return true;
+        if (nonEmptyArray('hrt-blood-reports')) return true;
+        if (nonEmptyArray('hrt-regimens')) return true;
         if (localStorage.getItem('hrt-personal-model')) return true;
         const weight = localStorage.getItem('hrt-weight');
         if (weight && Number.isFinite(parseFloat(weight)) && parseFloat(weight) > 0) return true;

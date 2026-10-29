@@ -154,15 +154,30 @@ function interpAt(timeH: number[], values: number[], h: number): number | undefi
     return Number.isFinite(v) ? v : undefined;
 }
 
-const CustomTooltip = ({ active, payload, label, t, lang, aaLabel = 'CPA', aaUnit = 'ng/mL', aaColor = '#8b5cf6', aaShowPersonal = true }: any) => {
+/**
+ * Reports the hovered chart point to the parent instead of drawing a floating
+ * tooltip (which covered the curves). Renders nothing itself.
+ */
+const TooltipReporter = ({ active, payload, label, onReport }: any) => {
+    const point = active && payload && payload.length ? payload[0].payload : null;
+    const key = point ? `${label}|${point.isLabResult ? 'lab' : 'sim'}` : '';
+    useEffect(() => {
+        onReport(point ? { label, point } : null);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [key]);
+    return null;
+};
+
+/** Point details shown in a panel below the chart (hovered point, or "now"). */
+const CustomTooltip = ({ active, payload, label, t, lang, aaLabel = 'CPA', aaUnit = 'ng/mL', aaColor = '#8b5cf6', aaShowPersonal = true, isNow = false }: any) => {
     if (active && payload && payload.length) {
         // If it's a lab result point
         if (payload[0].payload.isLabResult) {
             const data = payload[0].payload;
             return (
-                <div className="bg-[var(--bg-card)]/90 backdrop-blur-sm px-3 py-2 rounded-xl border border-teal-100/50 dark:border-teal-800/50 shadow-sm">
-                    <p className="text-[10px] font-medium mb-0.5 flex items-center gap-1" style={{ color: 'var(--text-tertiary)' }}>
-                        <FlaskConical size={10} />
+                <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+                    <p className="w-full text-[11px] font-semibold flex items-center gap-1" style={{ color: 'var(--text-tertiary)' }}>
+                        <FlaskConical size={11} />
                         {formatDate(new Date(label), lang)} {formatTime(new Date(label))}
                     </p>
                     <div className="flex items-baseline gap-1">
@@ -193,8 +208,9 @@ const CustomTooltip = ({ active, payload, label, t, lang, aaLabel = 'CPA', aaUni
         const cpaCiHigh = dataPoint.cpaCi95High;
 
         return (
-            <div className="bg-[var(--bg-card)]/90 backdrop-blur-sm px-3 py-2 rounded-xl border border-pink-100/50 dark:border-pink-800/50 shadow-sm">
-                <p className="text-[10px] font-medium mb-0.5" style={{ color: 'var(--text-tertiary)' }}>
+            <div className="flex flex-wrap items-start gap-x-5 gap-y-1.5">
+                <p className="w-full text-[11px] font-semibold flex items-center gap-1.5" style={{ color: 'var(--text-tertiary)' }}>
+                    {isNow && <span className="px-1.5 py-0.5 rounded-md text-[9px] font-bold uppercase" style={{ background: 'var(--accent-50)', color: 'var(--accent-500)' }}>{t('chart.now')}</span>}
                     {formatDate(new Date(label), lang)} {formatTime(new Date(label))}
                 </p>
                 {concE2 > 0 && (
@@ -217,7 +233,7 @@ const CustomTooltip = ({ active, payload, label, t, lang, aaLabel = 'CPA', aaUni
                         </div>
                         {ci68Low !== undefined && ci68High !== undefined && (
                             <div className="flex items-center gap-1 ml-1 mt-0.5">
-                                <span className="text-[8px] font-bold text-rose-300 uppercase w-8">{t('chart.ci68_band')}</span>
+                                <span className="text-[8px] font-bold text-rose-300 uppercase whitespace-nowrap">{t('chart.ci68_band')}</span>
                                 <span className="text-[9px] text-rose-400 font-medium">
                                     {ci68Low.toFixed(0)} – {ci68High.toFixed(0)}
                                     <span className="text-[8px] font-normal text-rose-300 ml-0.5">pg/mL</span>
@@ -226,7 +242,7 @@ const CustomTooltip = ({ active, payload, label, t, lang, aaLabel = 'CPA', aaUni
                         )}
                         {ciLow !== undefined && ciHigh !== undefined && (
                             <div className="flex items-center gap-1 ml-1 mt-0.5">
-                                <span className="text-[8px] font-bold uppercase w-8" style={{ color: 'var(--text-tertiary)' }}>{t('chart.ci_band')}</span>
+                                <span className="text-[8px] font-bold uppercase whitespace-nowrap" style={{ color: 'var(--text-tertiary)' }}>{t('chart.ci_band')}</span>
                                 <span className="text-[9px] font-medium" style={{ color: 'var(--text-secondary)' }}>
                                     {ciLow.toFixed(0)} – {ciHigh.toFixed(0)}
                                     <span className="text-[8px] font-normal ml-0.5" style={{ color: 'var(--text-tertiary)' }}>pg/mL</span>
@@ -247,7 +263,7 @@ const CustomTooltip = ({ active, payload, label, t, lang, aaLabel = 'CPA', aaUni
                 {/* Population CI for non-personalized compounds (BICA): no "personal" label. */}
                 {!aaShowPersonal && concCPA > 0 && cpaCiLow !== undefined && cpaCiHigh !== undefined && (
                     <div className="flex items-center gap-1 ml-1 mt-0.5">
-                        <span className="text-[8px] font-bold uppercase w-12" style={{ color: 'var(--text-tertiary)' }}>{t('chart.cpa_pop_range')}</span>
+                        <span className="text-[8px] font-bold uppercase whitespace-nowrap" style={{ color: 'var(--text-tertiary)' }}>{t('chart.cpa_pop_range')}</span>
                         <span className="text-[9px] font-medium" style={{ color: 'var(--text-secondary)' }}>
                             {cpaCiLow.toFixed(2)} – {cpaCiHigh.toFixed(2)}
                             <span className="text-[8px] font-normal ml-0.5" style={{ color: 'var(--text-tertiary)' }}>{aaUnit}</span>
@@ -265,7 +281,7 @@ const CustomTooltip = ({ active, payload, label, t, lang, aaLabel = 'CPA', aaUni
                         </div>
                         {cpaCiLow !== undefined && cpaCiHigh !== undefined && (
                             <div className="flex items-center gap-1 ml-1 mt-0.5">
-                                <span className="text-[8px] font-bold uppercase w-8" style={{ color: 'var(--text-tertiary)' }}>{t('chart.ci_band')}</span>
+                                <span className="text-[8px] font-bold uppercase whitespace-nowrap" style={{ color: 'var(--text-tertiary)' }}>{t('chart.ci_band')}</span>
                                 <span className="text-[9px] font-medium" style={{ color: 'var(--text-secondary)' }}>
                                     {cpaCiLow.toFixed(2)} – {cpaCiHigh.toFixed(2)}
                                     <span className="text-[8px] font-normal ml-0.5" style={{ color: 'var(--text-tertiary)' }}>{aaUnit}</span>
@@ -315,6 +331,8 @@ const ResultChart = ({ sim, events, labResults = [], simCI, baselineE2PGmL, nowH
     const hasE2Personal = !!simCI && simCI.e2Adjusted.length > 0;
     const { t, lang } = useTranslation();
     const [xDomain, setXDomain] = useState<[number, number] | null>(null);
+    // Point under the cursor (reported by TooltipReporter); null = show "now".
+    const [hoverPoint, setHoverPoint] = useState<{ label: number; point: any } | null>(null);
     const initializedRef = useRef(false);
     const pendingDomainRef = useRef<[number, number] | null>(null);
     const rafUpdateRef = useRef<number | null>(null);
@@ -807,8 +825,8 @@ const ResultChart = ({ sim, events, labResults = [], simCI, baselineE2PGmL, nowH
                     {onShareImage && (
                         <button
                             onClick={onShareImage}
-                            title="Share as Image"
-                            aria-label="Share as Image"
+                            title={t('chart.share_image')}
+                            aria-label={t('chart.share_image')}
                             className="p-1.5 rounded-lg hover:bg-[var(--bg-card-hover)] transition-all"
                             style={{ color: 'var(--text-secondary)' }}
                         >
@@ -888,7 +906,7 @@ const ResultChart = ({ sim, events, labResults = [], simCI, baselineE2PGmL, nowH
                         />
                         )}
                         <Tooltip
-                            content={<CustomTooltip t={t} lang={lang} aaLabel={aaLabel} aaUnit={aaUnit} aaColor={aaColor} aaShowPersonal={aaPersonalized} />}
+                            content={<TooltipReporter onReport={setHoverPoint} />}
                             cursor={{ stroke: '#f6c4d7', strokeWidth: 1, strokeDasharray: '4 4' }}
                             trigger="hover"
                         />
@@ -903,7 +921,7 @@ const ResultChart = ({ sim, events, labResults = [], simCI, baselineE2PGmL, nowH
                                 stroke="#14b8a6"
                                 strokeDasharray="4 3"
                                 strokeWidth={1.2}
-                                label={{ value: `Endogenous ${baselineE2PGmL.toFixed(1)}`, position: 'insideTopLeft', fontSize: 9, fill: '#14b8a6', fontWeight: 600 }}
+                                label={{ value: `${t('chart.label_endogenous')} ${baselineE2PGmL.toFixed(1)}`, position: 'insideTopLeft', fontSize: 9, fill: '#14b8a6', fontWeight: 600 }}
                             />
                         )}
 
@@ -1184,6 +1202,21 @@ const ResultChart = ({ sim, events, labResults = [], simCI, baselineE2PGmL, nowH
                     </ComposedChart>
                 </ResponsiveContainer>
             </div>
+            {/* Hover details live BELOW the chart so they never cover the curves.
+                Falls back to the current ("now") values when nothing is hovered. */}
+            {(hoverPoint || nowPoint) && (
+                <div className="mx-3 mb-2 min-h-[64px] rounded-xl border px-3 py-2"
+                    aria-live="polite"
+                    style={{ background: 'var(--bg-card-hover)', borderColor: 'var(--border-secondary)' }}>
+                    <CustomTooltip
+                        active
+                        payload={[{ payload: hoverPoint ? hoverPoint.point : nowPoint }]}
+                        label={hoverPoint ? hoverPoint.label : nowPoint!.time}
+                        isNow={!hoverPoint}
+                        t={t} lang={lang} aaLabel={aaLabel} aaUnit={aaUnit} aaColor={aaColor} aaShowPersonal={aaPersonalized}
+                    />
+                </div>
+            )}
             {/* Overview mini-map with draggable handles */}
             {overviewData.length > 1 && (
                 <div

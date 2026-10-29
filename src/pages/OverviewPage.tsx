@@ -3,14 +3,16 @@ import { useOutletContext } from 'react-router-dom';
 import { useAppData } from '../contexts/AppDataContext';
 import { DoseEvent } from '../../logic';
 import OverviewView from '../views/OverviewView';
+import type { Regimen } from '../utils/regimens';
 
 interface OutletContext {
     onAddEvent: () => void;
     onEditEvent: (event: DoseEvent) => void;
+    onAddRegimenDose: (regimen: Regimen) => void;
 }
 
 const OverviewPage: React.FC = () => {
-    const { onAddEvent, onEditEvent } = useOutletContext<OutletContext>();
+    const { onAddEvent, onEditEvent, onAddRegimenDose } = useOutletContext<OutletContext>();
     const { events, labResults, simulation, currentTime, simCI, baselineE2PGmL } = useAppData();
 
     return (
@@ -23,6 +25,7 @@ const OverviewPage: React.FC = () => {
             baselineE2PGmL={baselineE2PGmL}
             onAddEvent={onAddEvent}
             onEditEvent={onEditEvent}
+            onAddRegimenDose={onAddRegimenDose}
         />
     );
 };

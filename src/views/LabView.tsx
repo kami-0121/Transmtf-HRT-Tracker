@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { FlaskConical, Plus, Brain, AlertTriangle, ChevronDown, ChevronUp, CheckCircle2, Cpu, Waves, Clock, History, Sparkles, Info } from 'lucide-react';
+import { FlaskConical, Brain, AlertTriangle, ChevronDown, ChevronUp, ChevronLeft, CheckCircle2, Cpu, Waves, Clock, History, Sparkles, Info } from 'lucide-react';
 import { useTranslation } from '../contexts/LanguageContext';
 import { formatDate, formatTime } from '../utils/helpers';
 import { LabResult, PersonalModelState, EKFDiagnostics, CalibrationModel, CalibrationMode, TESTOSTERONE_MODEL } from '../../logic';
@@ -20,9 +20,8 @@ interface LabViewProps {
   onSetCalibrationModel: (model: CalibrationModel) => void;
   calibrationMode: CalibrationMode;
   onSetCalibrationMode: (mode: CalibrationMode) => void;
-  onAddLabResult: () => void;
-  onEditLabResult: (result: LabResult) => void;
-  onClearLabResults: () => void;
+  /** Navigates back to the settings overview. */
+  onBack?: () => void;
 }
 
 // Compact progress bar for convergence score
@@ -300,32 +299,32 @@ const LabView: React.FC<LabViewProps> = ({
   onSetCalibrationModel,
   calibrationMode,
   onSetCalibrationMode,
-  onAddLabResult,
-  onEditLabResult,
-  onClearLabResults,
+  onBack,
 }) => {
   const { t, lang } = useTranslation();
 
   return (
     <div className="relative space-y-5 pt-6 pb-8">
       <div className="px-4">
-        {/* Title and action share a row while they fit; on narrow phones the
-            button wraps below the title rather than breaking mid-word. */}
-        <div className="w-full p-4 glass-card flex flex-wrap items-center justify-between gap-x-3 gap-y-3">
-          <h2 className="text-xl font-semibold tracking-tight flex items-center gap-3 whitespace-nowrap"
-            style={{ color: 'var(--text-primary)' }}>
-            <FlaskConical size={22} className="shrink-0 text-teal-500" /> {t('lab.title')}
-          </h2>
-          <div className="ml-auto flex shrink-0 items-center gap-3">
+        <div className="w-full p-4 glass-card flex items-center gap-3">
+          {onBack && (
             <button
-              onClick={onAddLabResult}
-              className="inline-flex items-center justify-center gap-2 px-3.5 py-2 h-11 rounded-xl text-white text-sm font-bold whitespace-nowrap btn-press-glass transition glass-btn-primary"
+              onClick={onBack}
+              aria-label={t('btn.back')}
+              className="shrink-0 p-2 rounded-xl btn-press-glass transition"
+              style={{ background: 'var(--bg-card-hover)', color: 'var(--text-secondary)' }}
             >
-              <Plus size={16} />
-              <span>{t('lab.add_title')}</span>
+              <ChevronLeft size={18} />
             </button>
-          </div>
+          )}
+          <h2 className="text-xl font-semibold tracking-tight flex items-center gap-3 min-w-0"
+            style={{ color: 'var(--text-primary)' }}>
+            <Brain size={22} className="shrink-0 text-teal-500" /> {t('calib.page_title')}
+          </h2>
         </div>
+        <p className="mt-2 px-1 text-[11px] leading-relaxed" style={{ color: 'var(--text-tertiary)' }}>
+          {t('calib.page_desc')}
+        </p>
       </div>
 
       {/* Personal model learning panel */}
@@ -523,60 +522,6 @@ const LabView: React.FC<LabViewProps> = ({
         </p>
       </div>
 
-      {labResults.length === 0 ? (
-        <div className="mx-4 text-center py-12 glass-card rounded-3xl border-dashed" style={{ color: 'var(--text-tertiary)' }}>
-          <p>{t('lab.empty')}</p>
-        </div>
-      ) : (
-        <div className="mx-4 glass-card divide-y divide-[var(--border-secondary)] overflow-hidden">
-          {labResults
-            .slice()
-            .sort((a, b) => b.timeH - a.timeH)
-            .map(res => {
-              const d = new Date(res.timeH * 3600000);
-              return (
-                <div
-                  key={res.id}
-                  className="p-4 flex items-center gap-4 transition-all cursor-pointer group relative"
-                  style={{}}
-                  onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-card-hover)'}
-                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                  onClick={() => onEditLabResult(res)}
-                >
-                  <div className="w-12 h-12 rounded-2xl flex items-center justify-center shrink-0" style={{ background: 'var(--accent-50)', border: '1px solid var(--accent-100)' }}>
-                    <FlaskConical style={{ color: 'var(--accent-500)' }} size={18} />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="font-bold text-sm truncate" style={{ color: 'var(--text-primary)' }}>
-                        {res.concValue} {res.unit}
-                      </span>
-                      <span className="font-mono text-[11px] font-medium bg-[var(--bg-secondary)] px-2 py-1 rounded-md border border-[var(--border-secondary)]">
-                        {formatTime(d)}
-                      </span>
-                    </div>
-                    <div className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
-                      {formatDate(d, lang)}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-        </div>
-      )}
-
-      <div className="mx-4 glass-card flex items-center justify-end px-4 py-3">
-        <button
-          onClick={onClearLabResults}
-          disabled={!labResults.length}
-          className={`px-3 py-2 rounded-lg text-xs font-bold transition ${
-            labResults.length ? 'text-red-500 hover:bg-red-50 dark:hover:bg-red-950/30' : 'cursor-not-allowed'
-          }`}
-          style={!labResults.length ? { color: 'var(--text-tertiary)' } : undefined}
-        >
-          {t('lab.clear_all')}
-        </button>
-      </div>
     </div>
   );
 };

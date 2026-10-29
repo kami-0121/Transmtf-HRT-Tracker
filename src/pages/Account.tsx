@@ -18,7 +18,7 @@ import {
 } from 'lucide-react';
 import apiClient from '../api/client';
 
-const Account: React.FC = () => {
+const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   const { user, logout, isAuthenticated } = useAuth();
   const { isSyncing, lastSyncTime, syncError } = useCloudSync();
   const { t } = useTranslation();
@@ -115,7 +115,7 @@ const Account: React.FC = () => {
 
   if (!isAuthenticated) {
     return (
-      <div className="min-h-full px-4 py-6">
+      <div className={embedded ? '' : 'min-h-full px-4 py-6'}>
         <div className="mx-auto w-full max-w-2xl">
           <div className="rounded-2xl glass-card p-8 text-center">
             <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-pink-50 border border-pink-100">
@@ -126,7 +126,7 @@ const Account: React.FC = () => {
               {t('auth.loginPrompt') || 'Login to use cloud sync features'}
             </p>
             <p className="mx-auto mt-1 max-w-lg text-sm" style={{ color: 'var(--text-secondary)' }}>
-              Transmtf HRT Tracker helps you sync treatment history, share records, and secure your personal data.
+              {t('account.intro')}
             </p>
 
             <div className="mt-6 flex flex-col gap-3 sm:flex-row">
@@ -154,7 +154,7 @@ const Account: React.FC = () => {
   }
 
   return (
-    <div className="min-h-full px-4 py-6">
+    <div className={embedded ? '' : 'min-h-full px-4 py-6'}>
       <div className="mx-auto w-full max-w-2xl space-y-6">
         <div className="rounded-2xl glass-card p-6 shadow-sm">
           <div className="flex items-center gap-4">

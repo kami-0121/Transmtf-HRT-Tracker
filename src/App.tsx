@@ -17,7 +17,6 @@ import LabPage from './pages/LabPage';
 import SettingsPage from './pages/SettingsPage';
 import Login from './pages/Login';
 import Register from './pages/Register';
-import Account from './pages/Account';
 import AccountDevices from './pages/AccountDevices';
 import AccountOIDC from './pages/AccountOIDC';
 import SecurityPassword from './pages/SecurityPassword';
@@ -65,16 +64,18 @@ const App = () => (
                         {/* Main app pages */}
                         <Route index element={<OverviewPage />} />
                         <Route path="history" element={<HistoryPage />} />
-                        <Route path="lab" element={<LabPage />} />
                         <Route path="settings" element={<SettingsPage />} />
-                        <Route path="profile" element={<Account />} />
+                        <Route path="settings/calibration" element={<LabPage />} />
+                        {/* 校準 and 我的 were folded into 設定 */}
+                        <Route path="lab" element={<Navigate to="/settings/calibration" replace />} />
+                        <Route path="profile" element={<Navigate to="/settings" replace />} />
 
                         {/* Auth pages */}
                         <Route path="login" element={<Login />} />
                         <Route path="register" element={<Register />} />
 
                         {/* Legacy alias */}
-                        <Route path="account" element={<Navigate to="/profile" replace />} />
+                        <Route path="account" element={<Navigate to="/settings" replace />} />
 
                         {/* Account pages - protected */}
                         <Route path="account/devices" element={<ProtectedRoute><AccountDevices /></ProtectedRoute>} />
