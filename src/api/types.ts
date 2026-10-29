@@ -198,4 +198,6 @@ export interface RemoveLoginPasswordRequest {
 export interface UserMeResponse {
   username: string;
   user_id: number;
+  /** D1 backend: false for accounts created with Google sign-in. */
+  has_password?: boolean;
 }

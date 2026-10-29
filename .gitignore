@@ -34,3 +34,4 @@ src-tauri/target/release
 
 # Wrangler local state
 .wrangler
+.dev.vars

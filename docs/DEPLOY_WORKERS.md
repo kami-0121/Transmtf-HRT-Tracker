@@ -19,6 +19,9 @@
   - 一邊刪除、另一邊修改了同一筆 → 保留修改（不會默默遺失）。
   - 只有找不到基準版本時（例如剛升級後第一次同步）才顯示衝突視窗讓你選。
 - **版本號防覆蓋**：雲端存檔帶有版本號，上傳時附上「根據哪一版修改」；若另一台裝置剛好先上傳，伺服器回 409，App 會重新下載、合併後再上傳。
+- **先問版本號再下載**（參考 AtDo 的增量同步）：定時檢查只送一個很小的請求問「雲端版本號」，跟本機記得的一樣就不下載整份資料；本機有修改就直接上傳。
+- **多分頁不互搶**：同時開好幾個分頁／視窗時，以 Web Locks 確保同一時間只有一個在同步。
+- **失敗自動重試**：連不上（顯示「無法連線到伺服器」）或伺服器忙碌（429／5xx，顯示「伺服器忙碌」）時，依 30 秒、1 分、2 分…最長 15 分鐘自動重試；恢復連線或回到 App 時會立即重試。
 - 已安裝的 PWA 每小時檢查一次新版本，有新版會自動更新。
 - 雲端快照以 gzip 壓縮；設定 6 位數「安全密碼」後，另以該密碼衍生的金鑰 AES-GCM 加密，伺服器不保存安全密碼。**忘記安全密碼將無法還原雲端備份**（本機資料不受影響）。
 
@@ -43,8 +46,27 @@
 | `REGISTRATION_DISABLED = "true"` | 自己帳號建好後關閉註冊，避免陌生人使用 |
 | `PASSWORD_PBKDF2_ITERATIONS` | 登入密碼雜湊成本（預設 100000） |
 | `CLOUD_ENABLED = "false"` | 改回純本機模式（不顯示帳號、不發任何請求） |
+| `GOOGLE_CLIENT_ID` ＋ `GOOGLE_CLIENT_SECRET`（Secret） | 啟用 Google 登入（見下方） |
 
 > Workers **免費方案**每個請求的 CPU 時間上限是 10 ms。登入／註冊時的密碼雜湊（PBKDF2 100000 次）可能超過，偶爾出現錯誤 1102。若遇到，可改用 Workers Paid，或把 `PASSWORD_PBKDF2_ITERATIONS` 調低（不低於 10000；已存在帳號會在下次登入時自動改用新設定）。一般同步請求不做密碼雜湊。
+
+## Google 登入（選用）
+
+參考 AtDo：OAuth 2.0 授權碼 + PKCE，只要求 `openid` 權限，**不索取 email 或姓名**，資料庫只存 Google 帳號 id 的雜湊。
+
+1. [Google Cloud Console](https://console.cloud.google.com/apis/credentials) → 建立憑證 → **OAuth 用戶端 ID** → 應用程式類型選「網頁應用程式」。
+2. 「已授權的重新導向 URI」加入：`https://<你的網址>/auth/oidc/callback`（例如 `https://transmtf-hrt-tracker.<子網域>.workers.dev/auth/oidc/callback`；有自訂網域就兩個都加）。
+3. OAuth 同意畫面：範圍只需要 `openid`，不需要送審。
+4. Cloudflare Dashboard → Worker → Settings → Variables and Secrets：
+   - `GOOGLE_CLIENT_ID`（一般變數）
+   - `GOOGLE_CLIENT_SECRET`（**Secret**）
+5. 重新部署後，登入／註冊頁會出現「使用 Google 登入」。
+
+使用方式：
+- **Google 直接登入**：第一次會自動建立帳號（沒有登入密碼，帳號名稱為 `google_xxxx`）；`REGISTRATION_DISABLED = "true"` 時不會為新的 Google 帳號開戶。
+- **綁定到既有帳號**：設定 › 帳號 › Google 登入 › 綁定，之後兩種方式都能登入；一個 Google 帳號只能綁一個帳號。
+- 只用 Google 的帳號可在同一頁另外設定登入密碼；有綁 Google 的帳號也可以移除密碼（會登出所有裝置）。
+- 本機開發：在專案根目錄建 `.dev.vars`（已加入 .gitignore）寫入上述兩個變數。
 
 ## 伺服器端保護
 
@@ -63,4 +85,4 @@ npm run deploy                        # = npm test && npm run build && npx wrang
 
 ## 這個後端不提供的功能
 
-分享連結、頭像上傳、Transmtf 第三方登入（OIDC）與使用統計（API 回 501，介面自動隱藏）。若要改接相容原專案 API 的完整後端，設定 `VITE_API_BASE_URL`。
+分享連結、頭像上傳與使用統計（API 回 501，介面自動隱藏）。第三方登入改用 Google（原專案的 Transmtf 登入只在接外部後端時使用）。若要改接相容原專案 API 的完整後端，設定 `VITE_API_BASE_URL`。

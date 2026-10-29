@@ -54,6 +54,27 @@ export const MIGRATIONS: string[][] = [
         )`,
         `CREATE INDEX IF NOT EXISTS idx_data_writes ON data_writes(user_id, at)`,
     ],
+    // v3: Google sign-in. Identities are stored as a hash of the provider's
+    // subject; pending authorizations keep the PKCE verifier server-side.
+    // Accounts created through Google have no login password (password_iter 0).
+    [
+        `CREATE TABLE IF NOT EXISTS user_identities (
+            provider        TEXT NOT NULL,
+            subject_hash    TEXT NOT NULL,
+            user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at      TEXT NOT NULL,
+            PRIMARY KEY (provider, subject_hash),
+            UNIQUE (user_id, provider)
+        )`,
+        `CREATE TABLE IF NOT EXISTS oauth_states (
+            state_hash      TEXT PRIMARY KEY,
+            verifier        TEXT NOT NULL,
+            purpose         TEXT NOT NULL,
+            user_id         INTEGER,
+            origin          TEXT NOT NULL,
+            expires         INTEGER NOT NULL
+        )`,
+    ],
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

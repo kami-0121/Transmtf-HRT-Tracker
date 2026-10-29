@@ -6,7 +6,7 @@ import { DialogProvider } from './contexts/DialogContext';
 import { AppDataProvider } from './contexts/AppDataContext';
 import { useAuth } from './contexts/AuthContext';
 import { useCloudSync } from './contexts/CloudSyncContext';
-import { CLOUD_ENABLED } from './api/config';
+import { CLOUD_ENABLED, CLOUD_BACKEND } from './api/config';
 import MainLayout from './components/MainLayout';
 import SecurityPasswordGate from './components/SecurityPasswordGate';
 import OIDCBindingGate from './components/OIDCBindingGate';
@@ -56,7 +56,8 @@ const App = () => (
         <DialogProvider>
             <AppDataProvider>
                 <SecurityPasswordGate />
-                <OIDCBindingGate />
+                {/* The original server requires linking Transmtf; Google on D1 is optional. */}
+                {CLOUD_BACKEND === 'external' && <OIDCBindingGate />}
                 <AnnouncementModal />
                 <SyncConflictOverlay />
                 <Routes>

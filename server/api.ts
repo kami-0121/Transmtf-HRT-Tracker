@@ -4,10 +4,12 @@
  * frontend uses for accounts and cloud sync (src/api/client.ts):
  *
  *   auth      register · login · refresh · logout · sessions (list / revoke)
- *   user      me · data (get / put) · security PIN (status / set / change) · password
+ *             Google sign-in / linking through the OIDC endpoints (server/google.ts)
+ *   user      me · data (get / put / revision) · security PIN (status / set / change)
+ *             · password (change / set / remove)
  *
- * Shares, avatars, OIDC and statistics are not provided (501), and the UI
- * hides them when this backend is in use.
+ * Shares, avatars and statistics are not provided (501), and the UI hides
+ * them when this backend is in use.
  *
  * Security notes
  * - Login passwords: PBKDF2-SHA256 with a per-user salt; the iteration count is
@@ -32,8 +34,11 @@ import {
     pinKey, aesEncrypt, aesDecrypt, gzip, gunzip, encodeJson, decodeJson, utf8,
 } from './crypto';
 import { ensureSchema } from './schema';
+import {
+    googleEnabled, buildAuthorizeUrl, exchangeCode, subjectHash, OAUTH_STATE_TTL_MS, type GoogleEnv,
+} from './google';
 
-export interface ApiEnv {
+export interface ApiEnv extends GoogleEnv {
     DB: D1Database;
     /** Optional: when set, register/login require a valid Turnstile token. */
     TURNSTILE_SECRET_KEY?: string;
@@ -117,7 +122,11 @@ async function hashPassword(password: string, iterations: number) {
     return { hash: toB64(hash), salt: toB64(salt), iterations };
 }
 
+/** Accounts created with Google sign-in have no login password. */
+const hasPassword = (user: UserRow) => user.password_iter > 0 && !!user.password_hash;
+
 async function verifyPassword(password: string, user: UserRow): Promise<boolean> {
+    if (!hasPassword(user)) return false;
     const hash = await pbkdf2(password, fromB64(user.password_salt), user.password_iter);
     return timingSafeEqual(hash, fromB64(user.password_hash));
 }
@@ -302,7 +311,72 @@ export async function scheduledCleanup(env: ApiEnv): Promise<void> {
         env.DB.prepare('DELETE FROM sessions WHERE refresh_expires < ?').bind(now),
         env.DB.prepare('DELETE FROM login_failures WHERE at < ?').bind(now - LOGIN_WINDOW_MS),
         env.DB.prepare('DELETE FROM data_writes WHERE at < ?').bind(now - DATA_WRITES_RETENTION_MS),
+        env.DB.prepare('DELETE FROM oauth_states WHERE expires < ?').bind(now),
     ]);
+}
+
+// ── password confirmation / Google identities ────────────────────────────────
+
+/** Sensitive actions re-check the password; Google-only accounts have none to check. */
+async function confirmPassword(user: UserRow, body: Record<string, unknown>) {
+    if (hasPassword(user) && !(await verifyPassword(str(body.password), user))) {
+        throw new HttpError(403, 'Invalid password');
+    }
+}
+
+const googleIdentity = (env: ApiEnv, userId: number) =>
+    env.DB.prepare(`SELECT user_id FROM user_identities WHERE provider = 'google' AND user_id = ?`)
+        .bind(userId).first<{ user_id: number }>();
+
+function requireGoogle(env: ApiEnv) {
+    if (!googleEnabled(env)) throw new HttpError(503, 'Google sign-in is not configured');
+}
+
+async function startAuthorization(env: ApiEnv, request: Request, purpose: 'login' | 'bind', userId: number | null) {
+    requireGoogle(env);
+    const origin = new URL(request.url).origin;
+    const { authUrl, state, verifier } = await buildAuthorizeUrl(env, origin);
+    await env.DB.batch([
+        env.DB.prepare('DELETE FROM oauth_states WHERE expires < ?').bind(Date.now()),
+        env.DB.prepare('INSERT INTO oauth_states (state_hash, verifier, purpose, user_id, origin, expires) VALUES (?, ?, ?, ?, ?, ?)')
+            .bind(await sha256Hex(state), verifier, purpose, userId, origin, Date.now() + OAUTH_STATE_TTL_MS),
+    ]);
+    return ok({ auth_url: authUrl, state });
+}
+
+/** Consumes the pending authorization (single use) and returns the Google subject hash. */
+async function finishAuthorization(env: ApiEnv, body: Record<string, unknown>, purpose: 'login' | 'bind', userId: number | null) {
+    requireGoogle(env);
+    const code = str(body.code);
+    const state = str(body.state);
+    if (!code || !state) throw new HttpError(400, 'code and state are required');
+    const row = await env.DB.prepare('DELETE FROM oauth_states WHERE state_hash = ? RETURNING verifier, purpose, user_id, origin, expires')
+        .bind(await sha256Hex(state))
+        .first<{ verifier: string; purpose: string; user_id: number | null; origin: string; expires: number }>();
+    if (!row || row.expires < Date.now() || row.purpose !== purpose || (purpose === 'bind' && row.user_id !== userId)) {
+        throw new HttpError(400, 'Sign-in expired or invalid, please try again');
+    }
+    try {
+        return await subjectHash(await exchangeCode(env, row.origin, code, row.verifier));
+    } catch (e) {
+        console.error('Google sign-in failed', e);
+        throw new HttpError(401, 'Google sign-in failed');
+    }
+}
+
+async function createGoogleUser(env: ApiEnv, subject: string): Promise<number> {
+    for (let attempt = 0; attempt < 5; attempt++) {
+        const username = `google_${randomToken(6).toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 8)}`;
+        if (username.length < 10 || await getUserByName(env, username)) continue;
+        const res = await env.DB.prepare(
+            `INSERT INTO users (username, password_hash, password_salt, password_iter, created_at) VALUES (?, '', '', 0, ?)`
+        ).bind(username, nowIso()).run();
+        const userId = Number(res.meta.last_row_id);
+        await env.DB.prepare(`INSERT INTO user_identities (provider, subject_hash, user_id, created_at) VALUES ('google', ?, ?, ?)`)
+            .bind(subject, userId, nowIso()).run();
+        return userId;
+    }
+    throw new HttpError(500, 'Could not create account');
 }
 
 // ── routes ───────────────────────────────────────────────────────────────────
@@ -313,7 +387,47 @@ const routes: [string, RegExp, Handler][] = [
     ['GET', /^\/api\/health$/, async () => ok({ status: 'ok' })],
 
     ['GET', /^\/api\/auth\/oidc\/config$/, async (env) =>
-        ok({ oidc_enabled: false, registration_disabled: env.REGISTRATION_DISABLED === 'true' })],
+        ok({ oidc_enabled: googleEnabled(env), provider: 'google', registration_disabled: env.REGISTRATION_DISABLED === 'true' })],
+
+    ['GET', /^\/api\/auth\/oidc\/authorize$/, async (env, request) => startAuthorization(env, request, 'login', null)],
+
+    ['POST', /^\/api\/auth\/oidc\/callback$/, async (env, request) => {
+        const subject = await finishAuthorization(env, await readJson(request), 'login', null);
+        const linked = await env.DB.prepare(`SELECT user_id FROM user_identities WHERE provider = 'google' AND subject_hash = ?`)
+            .bind(subject).first<{ user_id: number }>();
+        let userId = linked?.user_id;
+        const isNew = !userId;
+        if (!userId) {
+            if (env.REGISTRATION_DISABLED === 'true') throw new HttpError(403, 'Registration is disabled');
+            userId = await createGoogleUser(env, subject);
+        }
+        const user = await getUserById(env, userId);
+        if (!user) throw new HttpError(401, 'Account not found');
+        return ok({ tokens: await issueTokens(env, request, user.id), is_new_user: isNew, username: user.username });
+    }],
+
+    ['GET', /^\/api\/auth\/oidc\/bind\/authorize$/, async (env, request) => {
+        const { user } = await authenticate(env, request);
+        if (await googleIdentity(env, user.id)) throw new HttpError(409, 'A Google account is already linked');
+        return startAuthorization(env, request, 'bind', user.id);
+    }],
+
+    ['POST', /^\/api\/auth\/oidc\/bind\/callback$/, async (env, request) => {
+        const { user } = await authenticate(env, request);
+        const subject = await finishAuthorization(env, await readJson(request), 'bind', user.id);
+        const res = await env.DB.prepare(
+            `INSERT INTO user_identities (provider, subject_hash, user_id, created_at) VALUES ('google', ?, ?, ?)
+             ON CONFLICT DO NOTHING`
+        ).bind(subject, user.id, nowIso()).run();
+        if (!res.meta.changes) throw new HttpError(409, 'This Google account is already linked to another account');
+        return ok({ message: 'Google account linked' });
+    }],
+
+    ['GET', /^\/api\/auth\/oidc\/bind\/status$/, async (env, request) => {
+        const { user } = await authenticate(env, request);
+        const bound = !!(await googleIdentity(env, user.id));
+        return ok({ bound, provider: bound ? 'Google' : undefined, has_password: hasPassword(user) });
+    }],
 
     ['POST', /^\/api\/auth\/register$/, async (env, request) => {
         if (env.REGISTRATION_DISABLED === 'true') throw new HttpError(403, 'Registration is disabled');
@@ -342,7 +456,9 @@ const routes: [string, RegExp, Handler][] = [
         await checkTurnstile(env, request, str(body.turnstile_token));
         const user = await getUserByName(env, username);
         // Unknown users still pay the hashing cost so timing doesn't reveal which names exist.
-        if (!user) await pbkdf2(password, randomBytes(16), passwordIterations(env));
+        if (!user || !hasPassword(user)) await pbkdf2(password, randomBytes(16), passwordIterations(env));
+        // The login page recognises "oidc" and points to the Google button.
+        if (user && !hasPassword(user)) throw new HttpError(400, 'This account uses OIDC (Google) sign-in');
         if (!user || !(await verifyPassword(password, user))) {
             await recordFailure(env, username);
             throw new HttpError(401, 'Invalid username or password');
@@ -389,23 +505,21 @@ const routes: [string, RegExp, Handler][] = [
 
     ['DELETE', /^\/api\/auth\/sessions\/([A-Za-z0-9_-]+)$/, async (env, request, [id]) => {
         const { user } = await authenticate(env, request);
-        const body = await readJson(request);
-        if (!(await verifyPassword(str(body.password), user))) throw new HttpError(403, 'Invalid password');
+        await confirmPassword(user, await readJson(request));
         await env.DB.prepare('DELETE FROM sessions WHERE id = ? AND user_id = ?').bind(id, user.id).run();
         return ok(undefined, 'Session revoked');
     }],
 
     ['DELETE', /^\/api\/auth\/sessions$/, async (env, request) => {
         const { user, session } = await authenticate(env, request);
-        const body = await readJson(request);
-        if (!(await verifyPassword(str(body.password), user))) throw new HttpError(403, 'Invalid password');
+        await confirmPassword(user, await readJson(request));
         const res = await env.DB.prepare('DELETE FROM sessions WHERE user_id = ? AND id != ?').bind(user.id, session.id).run();
         return ok({ revoked_count: res.meta.changes ?? 0 });
     }],
 
     ['GET', /^\/api\/user\/me$/, async (env, request) => {
         const { user } = await authenticate(env, request);
-        return ok({ username: user.username, user_id: user.id });
+        return ok({ username: user.username, user_id: user.id, has_password: hasPassword(user) });
     }],
 
     ['GET', /^\/api\/user\/security-password\/status$/, async (env, request) => {
@@ -454,6 +568,15 @@ const routes: [string, RegExp, Handler][] = [
         return ok(undefined, 'Security password updated');
     }],
 
+    // Cheap "anything new?" check (no PIN, no download, no decryption), the
+    // counterpart of AtDo's incremental pull: a client whose baseline already
+    // has this revision skips the full download.
+    ['GET', /^\/api\/user\/data\/revision$/, async (env, request) => {
+        const { user } = await authenticate(env, request);
+        const row = await env.DB.prepare('SELECT revision FROM user_data WHERE user_id = ?').bind(user.id).first<{ revision: number }>();
+        return ok({ revision: row?.revision ?? 0 });
+    }],
+
     // "Get" is a POST because it may carry the PIN in the body.
     ['POST', /^\/api\/user\/data$/, async (env, request) => {
         const { user } = await authenticate(env, request);
@@ -474,6 +597,31 @@ const routes: [string, RegExp, Handler][] = [
         return ok({ revision }, 'Saved');
     }],
 
+    // Set a login password on an account created with Google.
+    ['POST', /^\/api\/user\/password$/, async (env, request) => {
+        const { user } = await authenticate(env, request);
+        if (hasPassword(user)) throw new HttpError(409, 'A login password is already set');
+        const password = str((await readJson(request)).password);
+        const pwError = validatePassword(password);
+        if (pwError) throw new HttpError(400, pwError);
+        const h = await hashPassword(password, passwordIterations(env));
+        await env.DB.prepare('UPDATE users SET password_hash = ?, password_salt = ?, password_iter = ? WHERE id = ?')
+            .bind(h.hash, h.salt, h.iterations, user.id).run();
+        return ok({ message: 'Login password set' });
+    }],
+
+    // Remove the login password (Google becomes the only sign-in); logs out every session.
+    ['DELETE', /^\/api\/user\/password$/, async (env, request) => {
+        const { user } = await authenticate(env, request);
+        if (!(await googleIdentity(env, user.id))) throw new HttpError(400, 'Link a Google account first');
+        if (!(await verifyPassword(str((await readJson(request)).password), user))) throw new HttpError(403, 'Invalid password');
+        await env.DB.batch([
+            env.DB.prepare(`UPDATE users SET password_hash = '', password_salt = '', password_iter = 0 WHERE id = ?`).bind(user.id),
+            env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(user.id),
+        ]);
+        return ok({ message: 'Login password removed' });
+    }],
+
     ['PUT', /^\/api\/user\/password$/, async (env, request) => {
         const { user, session } = await authenticate(env, request);
         const body = await readJson(request);
@@ -491,7 +639,7 @@ const routes: [string, RegExp, Handler][] = [
 ];
 
 /** Features of the original backend that this server does not provide. */
-const UNSUPPORTED = /^\/api\/(shares|avatars|user\/avatar|statistics|auth\/oidc)(\/|$)/;
+const UNSUPPORTED = /^\/api\/(shares|avatars|user\/avatar|statistics)(\/|$)/;
 
 export async function handleApi(request: Request, env: ApiEnv): Promise<Response> {
     const { pathname } = new URL(request.url);

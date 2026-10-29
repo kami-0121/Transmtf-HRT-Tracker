@@ -1,5 +1,12 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 import { TRANSLATIONS, Lang } from '../i18n/translations';
+import { CLOUD_BACKEND } from '../api/config';
+
+// The sign-in provider behind the OIDC pages: the original Transmtf server, or
+// Google on this fork's own D1 backend (server/google.ts).
+const PROVIDER_KEY = /^(oidc|oidcGate|account\.oidc|login\.error\.oidcBound)/;
+const withProvider = (key: string, text: string) =>
+    CLOUD_BACKEND === 'd1' && PROVIDER_KEY.test(key) ? text.replace(/Transmtf/g, 'Google') : text;
 
 const LanguageContext = createContext<{ lang: Lang; setLang: (l: Lang) => void; t: (k: string) => string } | null>(null);
 
@@ -28,7 +35,7 @@ export const LanguageProvider = ({ children }: { children: React.ReactNode }) =>
 
     const t = (key: string) => {
         const pack = (TRANSLATIONS as any)[lang] || TRANSLATIONS.zh;
-        return pack[key] ?? TRANSLATIONS.zh[key as keyof typeof TRANSLATIONS.zh] ?? TRANSLATIONS.en[key as keyof typeof TRANSLATIONS.en] ?? key;
+        return withProvider(key, pack[key] ?? TRANSLATIONS.zh[key as keyof typeof TRANSLATIONS.zh] ?? TRANSLATIONS.en[key as keyof typeof TRANSLATIONS.en] ?? key);
     };
 
     return (

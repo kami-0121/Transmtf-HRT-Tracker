@@ -362,8 +362,13 @@ class ApiClient {
     }, 30000, false, externalSignal);
   }
 
-  async updateUserData(data: UpdateUserDataRequest, externalSignal?: AbortSignal): Promise<ApiResponse<void>> {
-    return this.request<void>('/user/data', {
+  /** D1 backend only: the snapshot's current revision, without downloading it. */
+  async getUserDataRevision(): Promise<ApiResponse<{ revision: number }>> {
+    return this.request<{ revision: number }>('/user/data/revision', { method: 'GET' }, 15000);
+  }
+
+  async updateUserData(data: UpdateUserDataRequest, externalSignal?: AbortSignal): Promise<ApiResponse<{ revision?: number } | undefined>> {
+    return this.request<{ revision?: number } | undefined>('/user/data', {
       method: 'PUT',
       body: JSON.stringify(data),
     }, 30000, false, externalSignal);

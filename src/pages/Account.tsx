@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { useCloudSync } from '../contexts/CloudSyncContext';
@@ -27,6 +27,17 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   const navigate = useNavigate();
 
   const [avatarAvailable, setAvatarAvailable] = useState(true);
+  // D1 backend: the Google sign-in page is offered only when the server has it
+  // configured; accounts created with Google have no password to change.
+  const [googleEnabled, setGoogleEnabled] = useState(false);
+  const [hasLoginPassword, setHasLoginPassword] = useState(true);
+  useEffect(() => {
+    if (CLOUD_BACKEND !== 'd1') return;
+    let alive = true;
+    apiClient.getOIDCConfig().then(r => { if (alive) setGoogleEnabled(!!r.data?.oidc_enabled); });
+    apiClient.getMe().then(r => { if (alive && r.data?.has_password === false) setHasLoginPassword(false); });
+    return () => { alive = false; };
+  }, []);
 
   const [showPasswordModal, setShowPasswordModal] = useState(false);
   const [oldPassword, setOldPassword] = useState('');
@@ -233,7 +244,7 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
               </div>
             )}
             {syncError && (
-              <div className="mt-2 text-xs text-red-600">{syncError}</div>
+              <div className="mt-2 text-xs text-red-600">{syncError.startsWith('sync.') ? t(syncError) : syncError}</div>
             )}
             <div className="mt-2 border-t pt-2 text-xs leading-relaxed" style={{ borderColor: 'var(--border-primary)', color: 'var(--text-tertiary)' }}>
               {t('account.autoSyncNote')}
@@ -270,7 +281,7 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
               </div>
             </Link>
 
-            {CLOUD_BACKEND === 'external' && <Link to="/account/oidc" className={managementLinkClass}>
+            {(CLOUD_BACKEND === 'external' || googleEnabled) && <Link to="/account/oidc" className={managementLinkClass}>
               <Link2 size={20} style={{ color: 'var(--text-secondary)' }} />
               <div className="flex-1">
                 <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>{t('account.oidc') || 'Transmtf Login'}</p>
@@ -278,7 +289,7 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
               </div>
             </Link>}
 
-            <button
+            {hasLoginPassword && <button
               onClick={() => setShowPasswordModal(true)}
               className="flex w-full items-center gap-3 px-4 py-4 text-left transition hover:bg-[var(--bg-card-hover)]"
             >
@@ -287,7 +298,7 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
                 <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>{t('account.changePassword') || 'Change Password'}</p>
                 <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>{t('account.changePasswordDesc') || 'Update your login password'}</p>
               </div>
-            </button>
+            </button>}
           </div>
         </div>
 

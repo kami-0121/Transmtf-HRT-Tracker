@@ -27,9 +27,12 @@ const AccountDevices: React.FC = () => {
     deviceInfo?: string;
   }>({ show: false, action: null });
   const [password, setPassword] = useState('');
+  // Accounts created with Google sign-in have no password to re-enter.
+  const [hasLoginPassword, setHasLoginPassword] = useState(true);
 
   useEffect(() => {
     loadSessions();
+    apiClient.getMe().then(r => { if (r.data?.has_password === false) setHasLoginPassword(false); });
   }, []);
 
   const loadSessions = async () => {
@@ -44,7 +47,12 @@ const AccountDevices: React.FC = () => {
     setLoading(false);
   };
 
-  const handleRevokeSession = (sessionId: string, deviceInfo: string) => {
+  const handleRevokeSession = async (sessionId: string, deviceInfo: string) => {
+    if (!hasLoginPassword) {
+      const confirmed = await showDialog('confirm', `${t('devices.revokeSession') || 'Revoke Session'} - ${deviceInfo}`);
+      if (confirmed === 'confirm') await submitRevoke('revoke', sessionId, '');
+      return;
+    }
     setPasswordModal({
       show: true,
       action: 'revoke',
@@ -53,7 +61,12 @@ const AccountDevices: React.FC = () => {
     });
   };
 
-  const handleRevokeAllOthers = () => {
+  const handleRevokeAllOthers = async () => {
+    if (!hasLoginPassword) {
+      const confirmed = await showDialog('confirm', t('devices.revokeAll') || 'Revoke all other sessions');
+      if (confirmed === 'confirm') await submitRevoke('revokeAll', undefined, '');
+      return;
+    }
     setPasswordModal({
       show: true,
       action: 'revokeAll',
@@ -65,9 +78,12 @@ const AccountDevices: React.FC = () => {
       showDialog('alert', t('devices.passwordRequired') || 'Password is required');
       return;
     }
+    await submitRevoke(passwordModal.action, passwordModal.sessionId, password);
+  };
 
-    if (passwordModal.action === 'revoke' && passwordModal.sessionId) {
-      const response = await apiClient.revokeSession(passwordModal.sessionId, { password });
+  const submitRevoke = async (action: 'revoke' | 'revokeAll' | null, sessionId: string | undefined, password: string) => {
+    if (action === 'revoke' && sessionId) {
+      const response = await apiClient.revokeSession(sessionId, { password });
       if (response.success) {
         showDialog('alert', t('devices.revokeSuccess') || 'Session revoked successfully');
         loadSessions();
@@ -76,7 +92,7 @@ const AccountDevices: React.FC = () => {
       } else {
         showDialog('alert', response.error || 'Failed to revoke session');
       }
-    } else if (passwordModal.action === 'revokeAll') {
+    } else if (action === 'revokeAll') {
       const response = await apiClient.revokeAllOtherSessions({ password });
       if (response.success && response.data) {
         showDialog('alert', `${t('devices.revokedCount') || 'Revoked'} ${response.data.revoked_count} ${t('devices.sessions') || 'sessions'}`);
