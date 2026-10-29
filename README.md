@@ -6,6 +6,9 @@ A privacy-focused, web-based tool for simulating and tracking estradiol levels d
 
 这是一个注重隐私的网页工具，用于在激素替代疗法（HRT）期间模拟和追踪雌二醇水平。
 
+> **關於此 Fork**：此版本由 **Kimi**（[GitHub](https://github.com/kami-0121) · [部落格](https://kimi.ing)）與 **Claude** 製作，基於 [TransmtfTeam/Transmtf-HRT-Tracker](https://github.com/TransmtfTeam/Transmtf-HRT-Tracker)。新增螺內酯、睪固酮模型、抽血報告、Cloudflare Workers + D1 雲端備份與 Google 登入（部署見 [docs/DEPLOY_WORKERS.md](docs/DEPLOY_WORKERS.md)）。
+> 此 Fork 的問題與建議：[support@atdo.cc](mailto:support@atdo.cc)；也歡迎到原專案支持原製作組。
+
 ## Algorithm & Core Logic 算法逻辑
 
 The pharmacokinetic algorithms, mathematical models, and parameters used in this simulation are derived directly from the **[HRT-Recorder-PKcomponent-Test](https://github.com/LaoZhong-Mihari/HRT-Recorder-PKcomponent-Test)** repository.<br>

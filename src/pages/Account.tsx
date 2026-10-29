@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { useCloudSync } from '../contexts/CloudSyncContext';
@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import apiClient from '../api/client';
 import { CLOUD_BACKEND } from '../api/config';
+import GoogleSignInButton from '../components/GoogleSignInButton';
 
 const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   const { user, logout, isAuthenticated } = useAuth();
@@ -27,17 +28,8 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   const navigate = useNavigate();
 
   const [avatarAvailable, setAvatarAvailable] = useState(true);
-  // D1 backend: the Google sign-in page is offered only when the server has it
-  // configured; accounts created with Google have no password to change.
-  const [googleEnabled, setGoogleEnabled] = useState(false);
-  const [hasLoginPassword, setHasLoginPassword] = useState(true);
-  useEffect(() => {
-    if (CLOUD_BACKEND !== 'd1') return;
-    let alive = true;
-    apiClient.getOIDCConfig().then(r => { if (alive) setGoogleEnabled(!!r.data?.oidc_enabled); });
-    apiClient.getMe().then(r => { if (alive && r.data?.has_password === false) setHasLoginPassword(false); });
-    return () => { alive = false; };
-  }, []);
+  // D1 backend: Google is the only sign-in, so there is no password to change.
+  const hasLoginPassword = CLOUD_BACKEND !== 'd1';
 
   const [showPasswordModal, setShowPasswordModal] = useState(false);
   const [oldPassword, setOldPassword] = useState('');
@@ -141,6 +133,11 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
               {t('account.intro')}
             </p>
 
+            {CLOUD_BACKEND === 'd1' ? (
+            <div className="mt-6 mx-auto max-w-sm">
+              <GoogleSignInButton onError={(message) => showDialog('alert', message)} />
+            </div>
+            ) : (
             <div className="mt-6 flex flex-col gap-3 sm:flex-row">
               <button
                 onClick={() => navigate('/login')}
@@ -159,6 +156,7 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
                 {t('auth.register') || 'Register'}
               </button>
             </div>
+            )}
           </div>
         </div>
       </div>
@@ -281,7 +279,7 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
               </div>
             </Link>
 
-            {(CLOUD_BACKEND === 'external' || googleEnabled) && <Link to="/account/oidc" className={managementLinkClass}>
+            {CLOUD_BACKEND === 'external' && <Link to="/account/oidc" className={managementLinkClass}>
               <Link2 size={20} style={{ color: 'var(--text-secondary)' }} />
               <div className="flex-1">
                 <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>{t('account.oidc') || 'Transmtf Login'}</p>
