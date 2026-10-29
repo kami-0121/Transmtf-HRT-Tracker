@@ -3,12 +3,15 @@ export interface Env {
   ASSETS: Fetcher;
   VITE_API_BASE_URL?: string;
   VITE_TURNSTILE_SITE_KEY?: string;
+  /** "true" enables accounts / cloud sync (requires your own backend + Turnstile key). */
+  CLOUD_ENABLED?: string;
 }
 
 const buildRuntimeEnvScript = (env: Env) => {
   const runtimeEnv = {
     VITE_API_BASE_URL: env.VITE_API_BASE_URL,
     VITE_TURNSTILE_SITE_KEY: env.VITE_TURNSTILE_SITE_KEY,
+    CLOUD_ENABLED: env.CLOUD_ENABLED ?? 'false',
   };
 
   return `<script>window.__ENV__=${JSON.stringify(runtimeEnv)};</script>`;

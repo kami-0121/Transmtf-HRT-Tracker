@@ -7,6 +7,7 @@ type RuntimeEnv = {
   __ENV__?: {
     VITE_API_BASE_URL?: string;
     VITE_TURNSTILE_SITE_KEY?: string;
+    CLOUD_ENABLED?: string;
   };
 };
 
@@ -19,6 +20,16 @@ export const API_BASE_URL =
   DEFAULT_API_BASE_URL;
 
 export const API_ORIGIN = API_BASE_URL.replace(/\/api\/?$/, '');
+
+/**
+ * Accounts, cloud sync, sharing, announcements and usage statistics all talk
+ * to a backend. They are OFF unless explicitly enabled — at runtime by the
+ * Cloudflare Worker (`CLOUD_ENABLED` var → window.__ENV__) or at build time
+ * (`VITE_CLOUD_ENABLED=true`). Off = local-only app: no request leaves the
+ * browser and data stays in localStorage.
+ */
+const cloudFlag = runtimeEnv.__ENV__?.CLOUD_ENABLED ?? import.meta.env.VITE_CLOUD_ENABLED;
+export const CLOUD_ENABLED = String(cloudFlag ?? '').toLowerCase() === 'true';
 
 export const TURNSTILE_SITE_KEY =
   runtimeEnv.__ENV__?.VITE_TURNSTILE_SITE_KEY ||

@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { X, Megaphone } from 'lucide-react';
+import { CLOUD_ENABLED } from '../api/config';
 
 const ANNOUNCEMENT_URL = 'https://www.transmtf.com/api/announcement/tmtf_b243d43f97b51b4fef747016';
 const STORAGE_KEY = 'tmtf_announcement_hash';
@@ -16,6 +17,8 @@ const AnnouncementModal: React.FC = () => {
   const [visible, setVisible] = useState(false);
 
   useEffect(() => {
+    // Announcements come from the upstream project's server; skip in local mode.
+    if (!CLOUD_ENABLED) return;
     const check = async () => {
       try {
         const res = await fetch(ANNOUNCEMENT_URL);

@@ -6,6 +6,7 @@ import { DialogProvider } from './contexts/DialogContext';
 import { AppDataProvider } from './contexts/AppDataContext';
 import { useAuth } from './contexts/AuthContext';
 import { useCloudSync } from './contexts/CloudSyncContext';
+import { CLOUD_ENABLED } from './api/config';
 import MainLayout from './components/MainLayout';
 import SecurityPasswordGate from './components/SecurityPasswordGate';
 import OIDCBindingGate from './components/OIDCBindingGate';
@@ -70,9 +71,9 @@ const App = () => (
                         <Route path="lab" element={<Navigate to="/settings/calibration" replace />} />
                         <Route path="profile" element={<Navigate to="/settings" replace />} />
 
-                        {/* Auth pages */}
-                        <Route path="login" element={<Login />} />
-                        <Route path="register" element={<Register />} />
+                        {/* Auth pages (cloud features only; local mode goes back to settings) */}
+                        <Route path="login" element={CLOUD_ENABLED ? <Login /> : <Navigate to="/settings" replace />} />
+                        <Route path="register" element={CLOUD_ENABLED ? <Register /> : <Navigate to="/settings" replace />} />
 
                         {/* Legacy alias */}
                         <Route path="account" element={<Navigate to="/settings" replace />} />
@@ -83,7 +84,7 @@ const App = () => (
                         <Route path="account/oidc" element={<ProtectedRoute><AccountOIDC /></ProtectedRoute>} />
 
                         {/* OIDC callback - no auth required (handles both login and bind) */}
-                        <Route path="auth/oidc/callback" element={<OIDCCallback />} />
+                        <Route path="auth/oidc/callback" element={CLOUD_ENABLED ? <OIDCCallback /> : <Navigate to="/settings" replace />} />
                     </Route>
                 </Routes>
             </AppDataProvider>

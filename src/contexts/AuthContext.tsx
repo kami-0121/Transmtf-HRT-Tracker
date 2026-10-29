@@ -1,3 +1,4 @@
+import { CLOUD_ENABLED } from '../api/config';
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import apiClient from '../api/client';
 import type { AuthTokens } from '../api/types';
@@ -196,6 +197,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   // Initialize auth state from cookies, with silent refresh fallback
   useEffect(() => {
+    // Local-only deployment: never restore a session (no refresh request).
+    if (!CLOUD_ENABLED) {
+      setIsLoading(false);
+      return;
+    }
     const storedAccessToken = getStoredValue(TOKEN_STORAGE_KEY);
     const storedUsername = getStoredValue(USERNAME_STORAGE_KEY);
     const storedRefreshToken = getStoredValue(REFRESH_TOKEN_STORAGE_KEY);
