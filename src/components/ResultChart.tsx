@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { useTranslation } from '../contexts/LanguageContext';
 import { formatDate, formatTime } from '../utils/helpers';
-import { SimulationResult, DoseEvent, interpolateConcentration_E2, interpolateCompoundConcentration, isAntiandrogen, pickPrimaryAntiandrogen, ANTIANDROGENS, Ester, LabResult, convertToPgMl } from '../../logic';
+import { SimulationResult, DoseEvent, interpolateConcentration_E2, interpolateCompoundConcentration, isAntiandrogen, pickPrimaryAntiandrogen, ANTIANDROGENS, Ester, LabResult, convertToPgMl, endogenousFractionAt } from '../../logic';
 import { Activity, RotateCcw, Info, FlaskConical, Camera } from 'lucide-react';
 import { calculateNiceDomain } from '../utils/chartAxis';
 import {
@@ -381,7 +381,8 @@ const ResultChart = ({ sim, events, labResults = [], simCI, baselineE2PGmL, nowH
         return sim.timeH.map((t, i) => {
             const timeMs = t * 3600000;
             // E2: raw simulation (no calibrationFn; personal model curve shows the calibrated view)
-            const baseE2 = sim.concPGmL_E2[i] + baseShift; // pg/mL (+ endogenous if no personal model)
+            // Endogenous part fades with simulated T suppression (fraction = 1 when the testosterone model is off).
+            const baseE2 = sim.concPGmL_E2[i] + baseShift * (sim.testosterone?.endogenousFraction[i] ?? 1); // pg/mL (+ endogenous if no personal model)
             const aaSeries = primaryAA ? sim.byCompound?.[primaryAA] : undefined;
             const rawCPA_ngmL = (aaSeries ? aaSeries.values[i] : 0) * aaScale; // display unit
 
@@ -475,7 +476,7 @@ const ResultChart = ({ sim, events, labResults = [], simCI, baselineE2PGmL, nowH
                 ? baselineE2PGmL
                 : 0;
             const concE2 = concE2Raw !== null && !Number.isNaN(concE2Raw)
-                ? concE2Raw + baseShift
+                ? concE2Raw + baseShift * endogenousFractionAt(sim, e.timeH)
                 : 0;
             return {
                 time: timeMs,
@@ -549,7 +550,7 @@ const ResultChart = ({ sim, events, labResults = [], simCI, baselineE2PGmL, nowH
             if (l.time >= visibleMin && l.time <= visibleMax) includeBase(l.conc);
         }
         // Ensure the endogenous baseline reference line is always within the axis range.
-        if (!hasE2Personal && baselineE2PGmL && baselineE2PGmL > 0) {
+        if (!hasE2Personal && baselineE2PGmL && baselineE2PGmL > 0 && !sim?.testosterone) {
             includeBase(baselineE2PGmL);
         }
 
@@ -564,7 +565,7 @@ const ResultChart = ({ sim, events, labResults = [], simCI, baselineE2PGmL, nowH
         // Leave the raw lower bound to D3: nice() floors it to a round value.
         const lower = minVal > 0 ? minVal * 0.85 : 0;
         return calculateNiceDomain(lower, padded, AXIS_TICK_COUNT, E2_AXIS_FALLBACK_MAX, false);
-    }, [visibleData, labPoints, xDomain, minTime, maxTime, simCI, baselineE2PGmL]);
+    }, [visibleData, labPoints, xDomain, minTime, maxTime, simCI, baselineE2PGmL, sim]);
 
     // Compute right-axis Y domain from visible CPA-related series in current viewport.
     const yAxisRight = useMemo(() => {
@@ -628,7 +629,7 @@ const ResultChart = ({ sim, events, labResults = [], simCI, baselineE2PGmL, nowH
         const baseShift = (!hasE2Personal && baselineE2PGmL && baselineE2PGmL > 0)
             ? baselineE2PGmL
             : 0;
-        const concE2 = hasE2 ? (concE2Raw! + baseShift) : 0;
+        const concE2 = hasE2 ? (concE2Raw! + baseShift * endogenousFractionAt(sim, h)) : 0;
 
         return {
             time: now,
@@ -893,8 +894,9 @@ const ResultChart = ({ sim, events, labResults = [], simCI, baselineE2PGmL, nowH
                         />
                         <ReferenceLine x={now} stroke="#f6c4d7" strokeDasharray="3 3" strokeWidth={1.2} yAxisId="left" />
                         {/* Endogenous baseline reference line — shown when a pre-dose baseline is
-                            known but no personal model (post-dose learning) is active yet. */}
-                        {!hasPersonalModel && baselineE2PGmL != null && baselineE2PGmL > 0 && (
+                            known but no personal model (post-dose learning) is active yet. With the
+                            testosterone model the baseline is time-varying, so no constant line. */}
+                        {!hasPersonalModel && baselineE2PGmL != null && baselineE2PGmL > 0 && !sim?.testosterone && (
                             <ReferenceLine
                                 y={baselineE2PGmL}
                                 yAxisId="left"

@@ -41,7 +41,10 @@ export enum Ester {
     // action is an absorption (flip-flop) effect, not slow clearance. See EU_DEPOT_PK.
     EU = "EU",
     CPA = "CPA",
-    BICA = "BICA"
+    BICA = "BICA",
+    // Spironolactone (螺內酯). Oral anti-androgen; its plasma curve is modeled via
+    // the long-lived active metabolite canrenone (see SPL_PK in pk.ts).
+    SPL = "SPL"
 }
 
 /**
@@ -149,6 +152,22 @@ export interface SimulationResult {
     concPGmL_CPA: number[];
     byCompound: Partial<Record<Ester, CompoundSeries>>;
     auc: number;
+    /**
+     * Optional endogenous testosterone curve (see TESTOSTERONE_MODEL in pk.ts),
+     * present only when the simulation was run with the testosterone model on.
+     * `endogenousFraction[i]` = T(t)/T0, which scales the pre-treatment
+     * endogenous E2 baseline (aromatised from T) at that grid point.
+     */
+    testosterone?: TestosteroneSeries;
+}
+
+/** Endogenous testosterone curve on the shared simulation grid. */
+export interface TestosteroneSeries {
+    unit: 'ng/dL';
+    /** Pre-treatment (baseline) total testosterone used for scaling, ng/dL. */
+    baselineNgdL: number;
+    values: number[];
+    endogenousFraction: number[];
 }
 
 /**

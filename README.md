@@ -62,6 +62,10 @@ without duplicating formulas.<br>
 
   **多给药途径模拟**：支持注射（戊酸酯 Valerate、苯甲酸酯 Benzoate、环戊丙酸酯 Cypionate、庚酸酯 Enanthate）、口服、舌下、凝胶以及贴片等多种给药方式。
 
+* **Anti-androgens & Testosterone Model**: Cyproterone acetate, bicalutamide and spironolactone (tracked via its active metabolite canrenone) are simulated alongside estradiol. An endogenous-testosterone suppression model makes the endogenous (aromatised) E2 baseline fade as testosterone is suppressed, instead of treating it as a constant.<br>
+
+  **抗雄药物与睾酮模型**：支持醋酸环丙孕酮、比卡鲁胺与螺内酯（以活性代谢物坎利酮建模）。内源性睾酮抑制模型会让芳香化来源的内源性 E2 随睾酮被抑制而下降，而不再视为常数。
+
 * **Real-time Visualization**: Interactive charts showing estimated estradiol concentration (pg/mL) over time.<br>
 
   **实时可视化**：通过交互式图表展示随时间变化的雌二醇估算浓度（pg/mL）。

@@ -4,6 +4,7 @@ import {
     PersonalModelState, EKFDiagnostics, CalibrationModel, CalibrationMode,
     createCalibrationInterpolator,
     initPersonalModel, isAntiandrogen, GelProductSpec, setCustomGelProducts,
+    TESTOSTERONE_MODEL, type TestosteroneModelOptions,
 } from '../../logic';
 import { pkWorker, PKWorkerCancelledError } from '../workers/pkWorkerClient';
 import { computeDataHash } from '../utils/dataHash';
@@ -15,6 +16,9 @@ const APPLY_E2_LEARNING_TO_CPA_KEY = 'hrt-apply-e2-learning-to-cpa';
 const CALIBRATION_MODEL_KEY = 'hrt-calibration-model';
 const CALIBRATION_MODE_KEY = 'hrt-calibration-mode';
 const APPLY_CPA_INHIBITION_TO_E2_KEY = 'hrt-apply-cpa-inhibition-to-e2';
+// Device-local model preferences (not part of the cloud-synced snapshot).
+const TESTOSTERONE_MODEL_KEY = 'hrt-testosterone-model';
+const BASELINE_TESTOSTERONE_KEY = 'hrt-baseline-testosterone';
 const THEME_COLOR_KEY = 'hrt-theme-color';
 const DARK_MODE_KEY = 'hrt-dark-mode';
 const THEME_MODE_KEY = 'hrt-theme-mode';
@@ -83,6 +87,16 @@ interface AppDataContextType {
      * data is available.
      */
     baselineE2PGmL: number | null;
+    /**
+     * Endogenous testosterone model (pk.ts TESTOSTERONE_MODEL). When on, the
+     * simulation carries a T curve and the endogenous E2 baseline fades as T is
+     * suppressed instead of staying constant. Defaults to on.
+     */
+    testosteroneModelEnabled: boolean;
+    setTestosteroneModelEnabled: React.Dispatch<React.SetStateAction<boolean>>;
+    /** User's pre-treatment total testosterone (ng/dL); null = population default. */
+    baselineTestosteroneNgdL: number | null;
+    setBaselineTestosteroneNgdL: React.Dispatch<React.SetStateAction<number | null>>;
 }
 
 const AppDataContext = createContext<AppDataContextType | undefined>(undefined);
@@ -196,6 +210,22 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         return raw === '1' || raw.toLowerCase() === 'true';
     });
     const [gelProducts, setGelProducts] = useState<GelProductSpec[]>(() => readCustomGelProducts());
+    const [testosteroneModelEnabled, setTestosteroneModelEnabled] = useState<boolean>(() => {
+        const raw = localStorage.getItem(TESTOSTERONE_MODEL_KEY);
+        if (raw === null) return true;
+        return raw === '1' || raw.toLowerCase() === 'true';
+    });
+    const [baselineTestosteroneNgdL, setBaselineTestosteroneNgdL] = useState<number | null>(() => {
+        const v = Number(localStorage.getItem(BASELINE_TESTOSTERONE_KEY));
+        return Number.isFinite(v) && v > 0 ? v : null;
+    });
+    // Stable options object so the compute effects only re-run on real changes.
+    const testosteroneOpts = useMemo<TestosteroneModelOptions | null>(
+        () => testosteroneModelEnabled
+            ? { baselineNgdL: baselineTestosteroneNgdL ?? TESTOSTERONE_MODEL.baselineNgdL }
+            : null,
+        [testosteroneModelEnabled, baselineTestosteroneNgdL]
+    );
 
     const suppressLocalUpdateRef = useRef({
         events: false,
@@ -269,6 +299,13 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         localStorage.setItem(CALIBRATION_MODE_KEY, calibrationMode);
         finalizeLocalUpdate('calibrationMode', CALIBRATION_MODE_KEY);
     }, [calibrationMode]);
+    useEffect(() => {
+        localStorage.setItem(TESTOSTERONE_MODEL_KEY, testosteroneModelEnabled ? '1' : '0');
+    }, [testosteroneModelEnabled]);
+    useEffect(() => {
+        if (baselineTestosteroneNgdL === null) localStorage.removeItem(BASELINE_TESTOSTERONE_KEY);
+        else localStorage.setItem(BASELINE_TESTOSTERONE_KEY, String(baselineTestosteroneNgdL));
+    }, [baselineTestosteroneNgdL]);
     useEffect(() => {
         writeCustomGelProducts(gelProducts);
         finalizeLocalUpdate('gelProducts', GEL_PRODUCTS_KEY);
@@ -490,7 +527,7 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
     // below skips the worker call while the stored grid already covers
     // now + buffer, so a quiet history triggers at most ~one recompute per day
     // (when the buffer is about to be exceeded), not one per minute.
-    const simulationForRef = useRef<{ events: DoseEvent[]; gelProducts: GelProductSpec[] } | null>(null);
+    const simulationForRef = useRef<{ events: DoseEvent[]; gelProducts: GelProductSpec[]; testosterone: TestosteroneModelOptions | null } | null>(null);
     useEffect(() => {
         if (events.length === 0) {
             // Bump the sequence BEFORE cancelling: pkWorker.cancel rejects the
@@ -509,7 +546,8 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
             ? simulation.timeH[simulation.timeH.length - 1]
             : -Infinity;
         const fresh = simulationForRef.current?.events === events
-            && simulationForRef.current?.gelProducts === gelProducts;
+            && simulationForRef.current?.gelProducts === gelProducts
+            && simulationForRef.current?.testosterone === testosteroneOpts;
         // F03 final-review fix: skip while the stored grid still covers "now"
         // with a healthy buffer (>= 12h). Comparing endTimeH (= now + 24h)
         // against the grid end directly would recompute EVERY minute, because
@@ -519,14 +557,14 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         const seq = ++simulationSeqRef.current;
         setCustomGelProducts(gelProducts);
         pkWorker.cancel('simulation');
-        trackCompute(pkWorker.run('simulation', { events, gelProducts, endTimeH }))
+        trackCompute(pkWorker.run('simulation', { events, gelProducts, endTimeH, testosterone: testosteroneOpts }))
             .then(res => {
                 if (seq !== simulationSeqRef.current) return;
-                simulationForRef.current = { events, gelProducts };
+                simulationForRef.current = { events, gelProducts, testosterone: testosteroneOpts };
                 setSimulation(res);
             })
             .catch(handleComputeError);
-    }, [events, gelProducts, currentTime, simulation]);
+    }, [events, gelProducts, currentTime, simulation, testosteroneOpts]);
 
     // Rebuild personal model whenever events, labResults, or the custom-gel
     // registry change (gel calibration resolves kinetics from the registry).
@@ -543,7 +581,7 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
             savePersonalModel(null);
             return;
         }
-        trackCompute(pkWorker.run('personalModel', { events, labResults, gelProducts }))
+        trackCompute(pkWorker.run('personalModel', { events, labResults, gelProducts, testosterone: testosteroneOpts }))
             .then(({ model, diagnostics }) => {
                 if (seq !== personalModelSeqRef.current) return;
                 setLastDiagnostics(diagnostics);
@@ -551,7 +589,7 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
                 savePersonalModel(model);
             })
             .catch(handleComputeError);
-    }, [events, labResults, gelProducts]);
+    }, [events, labResults, gelProducts, testosteroneOpts]);
 
     // Recompute CI bands whenever relevant state changes.
     // - E2 personal CI (e2Adjusted + ci bands) requires at least one post-dose
@@ -615,12 +653,14 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
 
     // Expose baseline from pre-dose labs so UI can offset the raw sim curve
     // even when no post-dose learning has occurred yet.
+    // With the testosterone model on, a population pre-treatment baseline is
+    // used when there is no pre-dose lab; the display layers scale it by the
+    // simulated T(t)/T0 (endogenousFractionAt), so it fades under suppression.
     const baselineE2PGmL = useMemo<number | null>(() => {
-        if (!personalModel) return null;
-        const v = personalModel.baselinePGmL;
-        if (v === undefined || !Number.isFinite(v) || v <= 0) return null;
-        return v;
-    }, [personalModel]);
+        const v = personalModel?.baselinePGmL;
+        if (v !== undefined && Number.isFinite(v) && v > 0) return v;
+        return testosteroneModelEnabled ? TESTOSTERONE_MODEL.defaultBaselineE2PGmL : null;
+    }, [personalModel, testosteroneModelEnabled]);
 
     // Create calibration function (legacy ratio-based, still used for current-scale display)
     const calibrationFn = useMemo(() => {
@@ -665,6 +705,10 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         resetPersonalModel,
         isComputing,
         baselineE2PGmL,
+        testosteroneModelEnabled,
+        setTestosteroneModelEnabled,
+        baselineTestosteroneNgdL,
+        setBaselineTestosteroneNgdL,
     };
 
     return <AppDataContext.Provider value={value}>{children}</AppDataContext.Provider>;

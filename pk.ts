@@ -1,4 +1,4 @@
-import { Route, Ester, ExtraKey, type DoseEvent, type DoseEventExtras, type SimulationResult, type ConcUnit } from './types';
+import { Route, Ester, ExtraKey, type DoseEvent, type DoseEventExtras, type SimulationResult, type ConcUnit, type TestosteroneSeries } from './types';
 
 /**
  * Route-specific metadata for transdermal gel absorption.
@@ -476,6 +476,180 @@ export const BICA_PK = {
 };
 
 /**
+ * Spironolactone (SPL / 螺內酯) apparent one-compartment oral PK constants.
+ *
+ * Spironolactone itself is cleared within hours (t½ ≈ 1.4 h); its sustained
+ * anti-androgen / anti-mineralocorticoid activity comes from the active
+ * metabolites canrenone and 7α-thiomethylspironolactone. The tracked analyte is
+ * therefore CANRENONE, modeled with apparent first-order formation (`ka`, which
+ * lumps absorption + metabolic conversion) and elimination. Dose is entered as
+ * spironolactone mg; `vOverF` is the apparent canrenone volume per mg of parent
+ * dose, so the conversion fraction is folded into it.
+ *
+ * Targets used for the calibration (Aldactone label, 100 mg/day × 15 days, fed):
+ * - canrenone Tmax ≈ 4.3 h (model: ≈ 4.0 h at steady state, ≈ 4.8 h single dose)
+ * - canrenone Cmax ≈ 181 ng/mL at steady state
+ * - canrenone t½ ≈ 16.5 h
+ *
+ * `vOverF` is an ABSOLUTE apparent volume (L), not per-kg.
+ */
+export const SPL_PK = {
+    ka: 0.60,                       // h^-1  apparent canrenone formation
+    ke: Math.log(2) / 16.5,         // h^-1  (canrenone t½ ≈ 16.5 h)
+    vOverF: 737,                    // L     (apparent canrenone V/F per parent mg)
+    popLogVar: 0.12,                // ≈ 35% CV population PK uncertainty
+};
+
+/**
+ * Endogenous testosterone (HPG axis) model — "t-suppression-v1".
+ *
+ * Why it exists: in an untreated AMAB body most circulating E2 (≈ 20–30 pg/mL)
+ * is made by aromatising testosterone. That background E2 is NOT constant once
+ * HRT starts — exogenous estradiol and anti-androgens suppress LH and therefore
+ * testosterone, so the aromatised E2 fades too. Treating the pre-treatment
+ * baseline as a constant offset over-predicts E2 on suppressive regimens (and
+ * the EKF then mis-attributes that bias to the PK parameters). This model makes
+ * the endogenous E2 baseline time-varying: E2_endo(t) = B · T(t) / T0.
+ *
+ * Structure (indirect-response turnover with Emax drug effects):
+ *   T_target(t) = T0 · (1 − I_E2) · (1 − I_CPA) · (1 − I_SPL) · (1 + S_BICA)
+ *   dT/dt       = kout · (T_target − T)
+ * where each I = Imax·C^n / (IC50^n + C^n) uses the population DRUG
+ * concentration (exogenous E2 in pg/mL, anti-androgens in ng/mL), and
+ * bicalutamide's AR blockade at the hypothalamus RAISES LH/T (stimulation S).
+ *
+ * Anchors (population priors; individual responses vary widely):
+ * - E2 monotherapy: ≈ 100 pg/mL → T ≈ 350 ng/dL, ≈ 200 → ≈ 120, ≥ 300 → < 55
+ * - CPA 10–12.5 mg/day alone suppresses T by roughly 70–80 %
+ * - spironolactone lowers T only modestly (mostly an AR antagonist)
+ * - bicalutamide monotherapy raises T (and aromatised E2) by ≈ 50 %
+ * - T falls to a new steady state over a few days (response t½ ≈ 2 d)
+ */
+export const TESTOSTERONE_MODEL = {
+    /** Default pre-treatment total testosterone (ng/dL) for display scaling. */
+    baselineNgdL: 500,
+    /** Pre-treatment endogenous E2 (pg/mL) used when no pre-dose lab exists. */
+    defaultBaselineE2PGmL: 25,
+    /** First-order response rate of T toward its target (h^-1, t½ ≈ 48 h). */
+    kout: Math.log(2) / 48,
+    e2: { Imax: 0.97, IC50: 130, n: 3 },
+    cpa: { Imax: 0.90, IC50: 5, n: 1 },
+    spl: { Imax: 0.40, IC50: 100, n: 1 },
+    bica: { Smax: 0.60, EC50: 3000, n: 1 },
+    /** Floor for the endogenous fraction (adrenal androgens never fully vanish). */
+    minFraction: 0.02,
+};
+
+/** Options enabling the testosterone model in {@link runSimulation}. */
+export interface TestosteroneModelOptions {
+    /** Pre-treatment total testosterone in ng/dL (defaults to the population value). */
+    baselineNgdL?: number;
+}
+
+const hillEffect = (c: number, emax: number, c50: number, n: number): number => {
+    if (!(c > 0)) return 0;
+    const cn = Math.pow(c, n);
+    return emax * cn / (Math.pow(c50, n) + cn);
+};
+
+/**
+ * Steady-state testosterone fraction T_target/T0 for the given instantaneous
+ * drug exposure. Exported for tests and for explaining the model in the UI.
+ */
+export function testosteroneTargetFraction(
+    e2DrugPGmL: number,
+    aaNgML: Partial<Record<Ester, number>> = {}
+): number {
+    const m = TESTOSTERONE_MODEL;
+    const iE2 = hillEffect(e2DrugPGmL, m.e2.Imax, m.e2.IC50, m.e2.n);
+    const iCPA = hillEffect(aaNgML[Ester.CPA] ?? 0, m.cpa.Imax, m.cpa.IC50, m.cpa.n);
+    const iSPL = hillEffect(aaNgML[Ester.SPL] ?? 0, m.spl.Imax, m.spl.IC50, m.spl.n);
+    const sBICA = hillEffect(aaNgML[Ester.BICA] ?? 0, m.bica.Smax, m.bica.EC50, m.bica.n);
+    const f = (1 - iE2) * (1 - iCPA) * (1 - iSPL) * (1 + sBICA);
+    return Math.max(m.minFraction, f);
+}
+
+/**
+ * Integrate the testosterone turnover model over a simulation grid. The
+ * update is the exact solution for a target held constant across each step,
+ * so it is stable for any step size. Starts at the pre-treatment steady state.
+ */
+export function computeTestosteroneSeries(
+    timeH: number[],
+    e2DrugPGmL: number[],
+    byCompound: SimulationResult['byCompound'],
+    opts: TestosteroneModelOptions = {}
+): TestosteroneSeries {
+    const baselineNgdL = (typeof opts.baselineNgdL === 'number' && Number.isFinite(opts.baselineNgdL) && opts.baselineNgdL > 0)
+        ? opts.baselineNgdL
+        : TESTOSTERONE_MODEL.baselineNgdL;
+    const n = timeH.length;
+    const values = new Array<number>(n);
+    const endogenousFraction = new Array<number>(n);
+    let frac = 1;
+    for (let i = 0; i < n; i++) {
+        const aa: Partial<Record<Ester, number>> = {};
+        for (const key of Object.keys(byCompound) as Ester[]) {
+            aa[key] = byCompound[key]!.values[i] ?? 0;
+        }
+        const target = testosteroneTargetFraction(e2DrugPGmL[i] ?? 0, aa);
+        if (i > 0) {
+            const dt = Math.max(0, timeH[i] - timeH[i - 1]);
+            frac = target + (frac - target) * Math.exp(-TESTOSTERONE_MODEL.kout * dt);
+        }
+        endogenousFraction[i] = frac;
+        values[i] = frac * baselineNgdL;
+    }
+    return { unit: 'ng/dL', baselineNgdL, values, endogenousFraction };
+}
+
+/**
+ * Time-varying endogenous E2 context shared by the calibration layers (EKF,
+ * OU-Kalman, MIPD). `fractionAt(t)` = T(t)/T0 scales the pre-treatment
+ * baseline; `defaultBaselinePGmL` stands in for the baseline when the user has
+ * no pre-dose lab result.
+ */
+export interface EndogenousE2Context {
+    fractionAt: (timeH: number) => number;
+    defaultBaselinePGmL: number;
+}
+
+/**
+ * Build the endogenous-E2 context from a simulation that carries a
+ * testosterone series; returns undefined (legacy constant-baseline behaviour)
+ * when the testosterone model was off.
+ */
+export function makeEndogenousE2Context(sim: SimulationResult | null | undefined): EndogenousE2Context | undefined {
+    const series = sim?.testosterone;
+    if (!sim || !series || series.endogenousFraction.length !== sim.timeH.length) return undefined;
+    const timeH = sim.timeH;
+    const frac = series.endogenousFraction;
+    return {
+        fractionAt: (t: number) => interpolateSeries(timeH, frac, t) ?? 1,
+        defaultBaselinePGmL: TESTOSTERONE_MODEL.defaultBaselineE2PGmL,
+    };
+}
+
+/**
+ * Endogenous E2 (pg/mL) at `timeH`. Without a context this is the legacy
+ * constant pre-dose-lab baseline (0 when none); with one, the baseline (or the
+ * population default) is scaled by the testosterone fraction at that time.
+ */
+export function resolveEndogenousE2(
+    labBaselinePGmL: number | undefined,
+    timeH: number,
+    ctx?: EndogenousE2Context
+): number {
+    const lab = (labBaselinePGmL !== undefined && Number.isFinite(labBaselinePGmL) && labBaselinePGmL > 0)
+        ? labBaselinePGmL
+        : undefined;
+    if (!ctx) return lab ?? 0;
+    const base = lab ?? ctx.defaultBaselinePGmL;
+    const f = ctx.fractionAt(timeH);
+    return base * (Number.isFinite(f) ? Math.max(0, f) : 1);
+}
+
+/**
  * Estradiol undecylate (EU / 十一酸雌二醇) intramuscular depot — "im-depot-v1".
  *
  * EU is a long-chain (undecanoate) ester. Its hallmark — a duration of action far
@@ -551,11 +725,21 @@ export const ANTIANDROGENS: Partial<Record<Ester, AntiandrogenSpec>> = {
         // amount (mg) / V/F (L) -> mg/L; ×1000 -> ng/mL
         concFromAmountMG: (amountMG) => Math.max(0, (amountMG / BICA_PK.vOverF) * 1000),
     },
+    [Ester.SPL]: {
+        ester: Ester.SPL,
+        nativeUnit: 'ng/mL',
+        color: '#0ea5e9',
+        popLogVar: SPL_PK.popLogVar,
+        ciMaxNative: 2000,
+        adherenceFromE2: false,
+        // canrenone amount (mg) / V/F (L) -> mg/L; ×1000 -> ng/mL
+        concFromAmountMG: (amountMG) => Math.max(0, (amountMG / SPL_PK.vOverF) * 1000),
+    },
 };
 
 export const ANTIANDROGEN_ESTERS = Object.keys(ANTIANDROGENS) as Ester[];
 
-/** True when the ester is a tracked non-E2 anti-androgen (CPA / BICA / …). */
+/** True when the ester is a tracked non-E2 anti-androgen (CPA / BICA / SPL / …). */
 export function isAntiandrogen(ester: Ester): boolean {
     return Object.prototype.hasOwnProperty.call(ANTIANDROGENS, ester);
 }
@@ -610,7 +794,8 @@ const EsterInfo = {
     [Ester.EN]: { name: "Estradiol Enanthate", mw: 384.56 },
     [Ester.EU]: { name: "Estradiol Undecylate", mw: 440.66 },
     [Ester.CPA]: { name: "Cyproterone Acetate", mw: 416.94 },
-    [Ester.BICA]: { name: "Bicalutamide", mw: 430.37 }
+    [Ester.BICA]: { name: "Bicalutamide", mw: 430.37 },
+    [Ester.SPL]: { name: "Spironolactone", mw: 416.57 }
 };
 
 /**
@@ -800,7 +985,7 @@ export function resolveParams(event: DoseEvent): PKParams {
 
         case Route.oral: {
             if (isAntiandrogen(event.ester)) {
-                // Anti-androgens (CPA / bicalutamide) are dosed as raw compound
+                // Anti-androgens (CPA / bicalutamide / spironolactone) are dosed as raw compound
                 // mg and their amount is produced by their own model in
                 // PrecomputedEventModel; these params are not used for them.
                 return {
@@ -880,6 +1065,20 @@ export function bicalutamideConcNgML(events: DoseEvent[], timeH: number): number
         totalAmountMG += computeBicalutamideAmount(ev.doseMG, timeH - ev.timeH);
     }
     return spec.concFromAmountMG(totalAmountMG, 0);
+}
+
+/**
+ * Analytical single-dose oral spironolactone → canrenone amount (mg-equivalent)
+ * at elapsed time `tau` hours (apparent one-compartment formation/elimination).
+ * Dividing by `SPL_PK.vOverF` (and ×1000) yields canrenone ng/mL.
+ */
+export function computeSpironolactoneAmount(doseMG: number, tau: number): number {
+    if (tau < 0 || doseMG <= 0) return 0;
+    const { ka, ke } = SPL_PK;
+    if (Math.abs(ka - ke) < 1e-9) {
+        return Math.max(0, doseMG * ka * tau * Math.exp(-ke * tau));
+    }
+    return Math.max(0, doseMG * ka / (ka - ke) * (Math.exp(-ke * tau) - Math.exp(-ka * tau)));
 }
 
 /**
@@ -1014,6 +1213,9 @@ class PrecomputedEventModel {
                     if (event.ester === Ester.BICA) {
                         return computeBicalutamideAmount(dose, tau);
                     }
+                    if (event.ester === Ester.SPL) {
+                        return computeSpironolactoneAmount(dose, tau);
+                    }
                     return oneCompAmount(tau, dose, params);
                 };
                 break;
@@ -1111,10 +1313,14 @@ export function weightAtTimeH(sortedEvents: DoseEvent[], t: number): number {
  * `opts.endTimeH` is given — extends to at least that time. Callers that
  * display a "current" value pass now+buffer here so interpolation at the
  * current time is a real grid point instead of a frozen 14-day tail clamp.
+ *
+ * When `opts.testosterone` is given, the endogenous testosterone curve (and the
+ * derived endogenous-E2 fraction) is attached as `result.testosterone`; the
+ * drug curves themselves are unchanged.
  */
 export function runSimulation(
     events: DoseEvent[],
-    opts?: { endTimeH?: number }
+    opts?: { endTimeH?: number; testosterone?: TestosteroneModelOptions | null }
 ): SimulationResult | null {
     if (events.length === 0) return null;
 
@@ -1198,7 +1404,11 @@ export function runSimulation(
         }
     }
 
-    return { timeH, concPGmL, concPGmL_E2, concPGmL_CPA, byCompound, auc };
+    const result: SimulationResult = { timeH, concPGmL, concPGmL_E2, concPGmL_CPA, byCompound, auc };
+    if (opts?.testosterone) {
+        result.testosterone = computeTestosteroneSeries(timeH, concPGmL_E2, byCompound, opts.testosterone);
+    }
+    return result;
 }
 
 /**
@@ -1260,4 +1470,21 @@ export function interpolateCompoundConcentration(
 
 export function interpolateConcentration_CPA(sim: SimulationResult, hour: number): number | null {
     return interpolateCompoundConcentration(sim, Ester.CPA, hour);
+}
+
+/** Interpolated endogenous testosterone (ng/dL), or null when the model is off. */
+export function interpolateTestosterone(sim: SimulationResult, hour: number): number | null {
+    const series = sim.testosterone;
+    if (!series) return null;
+    return interpolateSeries(sim.timeH, series.values, hour);
+}
+
+/**
+ * Endogenous E2 fraction T(t)/T0 at `hour`; 1 (constant baseline, the legacy
+ * behaviour) when the simulation carries no testosterone series.
+ */
+export function endogenousFractionAt(sim: SimulationResult | null | undefined, hour: number): number {
+    const series = sim?.testosterone;
+    if (!sim || !series) return 1;
+    return interpolateSeries(sim.timeH, series.endogenousFraction, hour) ?? 1;
 }

@@ -48,6 +48,8 @@ import {
     weightAtTimeH,
     isAntiandrogen,
     findPatchRemovalForApply,
+    resolveEndogenousE2,
+    type EndogenousE2Context,
 } from './pk';
 import { convertToPgMl } from './calibration';
 
@@ -370,7 +372,8 @@ export function fitMipd(
     events: DoseEvent[],
     labResults: LabResult[],
     prior: MipdPrior = MIPD_DEFAULT_PRIOR,
-    cutoffTimeH: number = Infinity
+    cutoffTimeH: number = Infinity,
+    endo?: EndogenousE2Context
 ): MipdFit {
     const np = prior.omega.length;
     const sortedEvents = [...events].sort((a, b) => a.timeH - b.timeH);
@@ -389,7 +392,9 @@ export function fitMipd(
         const obsPGmL = convertToPgMl(lab.concValue, lab.unit);
         if (!Number.isFinite(obsPGmL) || obsPGmL <= 0) continue;
         if (lab.timeH < firstDose) {
-            baselineSum += obsPGmL;
+            // Testosterone model: normalise to the pre-treatment baseline B = obs / f(t).
+            const frac = endo ? Math.max(endo.fractionAt(lab.timeH), 0.05) : 1;
+            baselineSum += obsPGmL / frac;
             baselineCount += 1;
         }
     }
@@ -401,7 +406,7 @@ export function fitMipd(
         if (!Number.isFinite(obsPGmL) || obsPGmL <= 0) continue;
         // Subtract the endogenous baseline so the likelihood only constrains the
         // drug-derived signal (avoids biasing PK parameters with background E2).
-        const drug = Math.max(obsPGmL - baselinePGmL, MIPD_EPS);
+        const drug = Math.max(obsPGmL - resolveEndogenousE2(baselinePGmL, lab.timeH, endo), MIPD_EPS);
         obs.push({ timeH: lab.timeH, yLog: Math.log(drug) });
     }
 
@@ -569,12 +574,13 @@ export interface MipdSnapshot {
 export function fitMipdTimeline(
     events: DoseEvent[],
     labResults: LabResult[],
-    prior: MipdPrior = MIPD_DEFAULT_PRIOR
+    prior: MipdPrior = MIPD_DEFAULT_PRIOR,
+    endo?: EndogenousE2Context
 ): MipdSnapshot[] {
     const sorted = [...labResults].sort((a, b) => a.timeH - b.timeH);
-    const snapshots: MipdSnapshot[] = [{ timeH: -Infinity, fit: fitMipd(events, [], prior) }];
+    const snapshots: MipdSnapshot[] = [{ timeH: -Infinity, fit: fitMipd(events, [], prior, Infinity, endo) }];
     for (let i = 0; i < sorted.length; i++) {
-        snapshots.push({ timeH: sorted[i].timeH, fit: fitMipd(events, sorted, prior, sorted[i].timeH) });
+        snapshots.push({ timeH: sorted[i].timeH, fit: fitMipd(events, sorted, prior, sorted[i].timeH, endo) });
     }
     return snapshots;
 }

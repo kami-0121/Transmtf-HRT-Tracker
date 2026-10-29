@@ -55,6 +55,26 @@ const ModelInfoModal = ({ isOpen, onClose }: { isOpen: boolean; onClose: () => v
 
                     <div className="space-y-2">
                         <div className="flex items-center gap-2">
+                            <div className="w-7 h-7 rounded-lg bg-sky-50 dark:bg-sky-900/30 flex items-center justify-center">
+                                <Pill size={14} className="text-sky-500" />
+                            </div>
+                            <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>{t('model.spl.title')}</p>
+                        </div>
+                        <p className="text-xs leading-relaxed pl-9" style={{ color: 'var(--text-secondary)' }}>{t('model.spl.body')}</p>
+                    </div>
+
+                    <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                            <div className="w-7 h-7 rounded-lg bg-teal-50 dark:bg-teal-900/30 flex items-center justify-center">
+                                <Pill size={14} className="text-teal-500" />
+                            </div>
+                            <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>{t('model.testosterone.title')}</p>
+                        </div>
+                        <p className="text-xs leading-relaxed pl-9" style={{ color: 'var(--text-secondary)' }}>{t('model.testosterone.body')}</p>
+                    </div>
+
+                    <div className="space-y-2">
+                        <div className="flex items-center gap-2">
                             <div className="w-7 h-7 rounded-lg bg-blue-50 dark:bg-blue-900/30 flex items-center justify-center">
                                 <BrainCircuit size={14} className="text-blue-500" />
                             </div>

@@ -5,7 +5,7 @@ import { useTheme } from '../contexts/ThemeContext';
 import ResultChart from '../components/ResultChart';
 import ShareImageModal from '../components/ShareImageModal';
 import { formatTime } from '../utils/helpers';
-import { DoseEvent, SimulationResult, LabResult, Route, Ester, ExtraKey, SL_TIER_ORDER, interpolateConcentration_E2, interpolateCompoundConcentration, isAntiandrogen, pickPrimaryAntiandrogen, ANTIANDROGENS, formatAntiandrogenConc, convertToPgMl, PERSONAL_E2_CEILING_PGML } from '../../logic';
+import { DoseEvent, SimulationResult, LabResult, Route, Ester, ExtraKey, SL_TIER_ORDER, interpolateConcentration_E2, interpolateCompoundConcentration, isAntiandrogen, pickPrimaryAntiandrogen, ANTIANDROGENS, formatAntiandrogenConc, convertToPgMl, PERSONAL_E2_CEILING_PGML, endogenousFractionAt, interpolateTestosterone } from '../../logic';
 
 /** Convert hex color string to "r,g,b" for use in rgba() */
 function hexToRgb(hex: string): string {
@@ -226,14 +226,25 @@ const OverviewView: React.FC<OverviewViewProps> = ({
   const aaCI = (primaryAA && simCI) ? simCI.antiandrogen[primaryAA] : undefined;
   const hasPersonalAaModel = !!aaCI && aaCI.adjusted.length === (simCI?.timeH.length ?? -1) && aaCI.adjusted.length > 0;
 
+  // Endogenous (aromatised) E2 right now: the pre-treatment baseline scaled by
+  // the simulated testosterone fraction (constant when the T model is off).
+  const endogenousNow = useMemo(() => {
+    if (!baselineE2PGmL || baselineE2PGmL <= 0) return 0;
+    return baselineE2PGmL * endogenousFractionAt(simulation, h);
+  }, [simulation, h, baselineE2PGmL]);
+
+  // Estimated endogenous testosterone (ng/dL); null when the model is off.
+  const testosteroneNow = useMemo(
+    () => (simulation ? interpolateTestosterone(simulation, h) : null),
+    [simulation, h]
+  );
+
   const rawLevel = useMemo(() => {
     if (!simulation) return 0;
     const drugE2 = interpolateConcentration_E2(simulation, h) || 0;
-    const shift = (!hasPersonalModel && baselineE2PGmL && baselineE2PGmL > 0)
-      ? baselineE2PGmL
-      : 0;
+    const shift = !hasPersonalModel ? endogenousNow : 0;
     return drugE2 + shift;
-  }, [simulation, h, hasPersonalModel, baselineE2PGmL]);
+  }, [simulation, h, hasPersonalModel, endogenousNow]);
 
   const baselineLevel = useMemo(() => {
     if (!hasDoseHistory && labResults.length > 0) {
@@ -241,11 +252,11 @@ const OverviewView: React.FC<OverviewViewProps> = ({
       const v = convertToPgMl(latest.concValue, latest.unit);
       return Number.isFinite(v) && v > 0 ? v : null;
     }
-    if (hasDoseHistory && !hasPersonalModel && baselineE2PGmL && baselineE2PGmL > 0) {
-      return baselineE2PGmL;
+    if (hasDoseHistory && !hasPersonalModel && endogenousNow > 0) {
+      return endogenousNow;
     }
     return null;
-  }, [hasDoseHistory, hasPersonalModel, baselineE2PGmL, labResults]);
+  }, [hasDoseHistory, hasPersonalModel, endogenousNow, labResults]);
 
   // F13: the personal estimate is a {value, capped} structure, not a nullable
   // number. At the model ceiling (5000) the value is REAL but bounded — the
@@ -547,7 +558,18 @@ const OverviewView: React.FC<OverviewViewProps> = ({
                   <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0 mt-0.5">
                     <span className="text-[9px] font-bold text-teal-400 uppercase tracking-wide whitespace-nowrap">Endogenous</span>
                     <span className="text-[10px] font-semibold text-teal-500 whitespace-nowrap">
-                      {baselineE2PGmL.toFixed(1)} pg/mL
+                      {endogenousNow.toFixed(1)} pg/mL
+                    </span>
+                  </div>
+                )}
+                {hasDoseHistory && testosteroneNow !== null && (
+                  <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0 mt-0.5"
+                    title={t('overview.testosterone_note')}>
+                    <span className="text-[9px] font-bold uppercase tracking-wide whitespace-nowrap" style={{ color: 'var(--text-tertiary)' }}>
+                      {t('overview.testosterone_est')}
+                    </span>
+                    <span className="text-[10px] font-semibold whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>
+                      {testosteroneNow.toFixed(0)} ng/dL
                     </span>
                   </div>
                 )}
@@ -577,7 +599,9 @@ const OverviewView: React.FC<OverviewViewProps> = ({
                   const { value } = fmt(v);
                   return value >= 100 ? value.toFixed(0) : value >= 10 ? value.toFixed(1) : value.toFixed(2);
                 };
-                const noteKey = primaryAA === Ester.BICA ? 'chart.bica_note' : 'chart.cpa_note';
+                const noteKey = primaryAA === Ester.BICA ? 'chart.bica_note'
+                  : primaryAA === Ester.SPL ? 'chart.spl_note'
+                  : 'chart.cpa_note';
                 return (
               <div className="space-y-1">
                 <div className="text-[10px] md:text-xs font-bold uppercase tracking-wider"

@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { FlaskConical, Plus, Brain, AlertTriangle, ChevronDown, ChevronUp, CheckCircle2, Cpu, Waves, Clock, History, Sparkles, Info } from 'lucide-react';
 import { useTranslation } from '../contexts/LanguageContext';
 import { formatDate, formatTime } from '../utils/helpers';
-import { LabResult, PersonalModelState, EKFDiagnostics, CalibrationModel, CalibrationMode } from '../../logic';
+import { LabResult, PersonalModelState, EKFDiagnostics, CalibrationModel, CalibrationMode, TESTOSTERONE_MODEL } from '../../logic';
 
 interface LabViewProps {
   labResults: LabResult[];
@@ -11,6 +11,10 @@ interface LabViewProps {
   applyE2LearningToCPA: boolean;
   onSetApplyE2LearningToCPA: (enabled: boolean) => void;
   applyCPAInhibitionToE2: boolean;
+  testosteroneModelEnabled: boolean;
+  onSetTestosteroneModelEnabled: (v: boolean) => void;
+  baselineTestosteroneNgdL: number | null;
+  onSetBaselineTestosteroneNgdL: (v: number | null) => void;
   onSetApplyCPAInhibitionToE2: (enabled: boolean) => void;
   calibrationModel: CalibrationModel;
   onSetCalibrationModel: (model: CalibrationModel) => void;
@@ -288,6 +292,10 @@ const LabView: React.FC<LabViewProps> = ({
   onSetApplyE2LearningToCPA,
   applyCPAInhibitionToE2,
   onSetApplyCPAInhibitionToE2,
+  testosteroneModelEnabled,
+  onSetTestosteroneModelEnabled,
+  baselineTestosteroneNgdL,
+  onSetBaselineTestosteroneNgdL,
   calibrationModel,
   onSetCalibrationModel,
   calibrationMode,
@@ -455,6 +463,63 @@ const LabView: React.FC<LabViewProps> = ({
         </div>
         <p className="mt-2 text-[10px] font-semibold" style={{ color: 'var(--text-tertiary)' }}>
           {applyCPAInhibitionToE2 ? t('lab.apply_cpa_inhibition_on') : t('lab.apply_cpa_inhibition_off')}
+        </p>
+      </div>
+
+      {/* Endogenous testosterone model toggle + pre-treatment T */}
+      <div className="mx-4 glass-card p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>{t('lab.testosterone_model')}</p>
+            <p className="text-[11px] mt-1 leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+              {t('lab.testosterone_model_desc')}
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={testosteroneModelEnabled}
+            onClick={() => onSetTestosteroneModelEnabled(!testosteroneModelEnabled)}
+            className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border transition ${
+              testosteroneModelEnabled
+                ? ''
+                : 'bg-gray-200 dark:bg-gray-600 border-gray-200 dark:border-gray-600'
+            }`}
+            style={testosteroneModelEnabled ? { background: 'var(--accent-500)', borderColor: 'var(--accent-500)' } : undefined}
+          >
+            <span
+              className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition ${
+                testosteroneModelEnabled ? 'translate-x-5' : 'translate-x-0.5'
+              }`}
+            />
+          </button>
+        </div>
+        {testosteroneModelEnabled && (
+          <label className="mt-3 flex items-center justify-between gap-3">
+            <span className="text-[11px] font-semibold" style={{ color: 'var(--text-secondary)' }}>
+              {t('lab.testosterone_baseline')}
+            </span>
+            <span className="flex items-center gap-1.5">
+              <input
+                type="number"
+                inputMode="decimal"
+                min={1}
+                step={10}
+                placeholder={String(TESTOSTERONE_MODEL.baselineNgdL)}
+                value={baselineTestosteroneNgdL ?? ''}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  onSetBaselineTestosteroneNgdL(e.target.value !== '' && Number.isFinite(v) && v > 0 ? v : null);
+                }}
+                className="w-24 px-2 py-1 rounded-lg border text-sm text-right bg-transparent"
+                style={{ borderColor: 'var(--border-secondary)', color: 'var(--text-primary)' }}
+              />
+              <span className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>ng/dL</span>
+            </span>
+          </label>
+        )}
+        <p className="mt-2 text-[10px] font-semibold" style={{ color: 'var(--text-tertiary)' }}>
+          {testosteroneModelEnabled ? t('lab.testosterone_model_on') : t('lab.testosterone_model_off')}
         </p>
       </div>
 

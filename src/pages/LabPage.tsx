@@ -20,6 +20,10 @@ const LabPage: React.FC = () => {
         setApplyE2LearningToCPA,
         applyCPAInhibitionToE2,
         setApplyCPAInhibitionToE2,
+        testosteroneModelEnabled,
+        setTestosteroneModelEnabled,
+        baselineTestosteroneNgdL,
+        setBaselineTestosteroneNgdL,
         calibrationModel,
         setCalibrationModel,
         calibrationMode,
@@ -35,6 +39,10 @@ const LabPage: React.FC = () => {
             onSetApplyE2LearningToCPA={setApplyE2LearningToCPA}
             applyCPAInhibitionToE2={applyCPAInhibitionToE2}
             onSetApplyCPAInhibitionToE2={setApplyCPAInhibitionToE2}
+            testosteroneModelEnabled={testosteroneModelEnabled}
+            onSetTestosteroneModelEnabled={setTestosteroneModelEnabled}
+            baselineTestosteroneNgdL={baselineTestosteroneNgdL}
+            onSetBaselineTestosteroneNgdL={setBaselineTestosteroneNgdL}
             calibrationModel={calibrationModel}
             onSetCalibrationModel={setCalibrationModel}
             calibrationMode={calibrationMode}

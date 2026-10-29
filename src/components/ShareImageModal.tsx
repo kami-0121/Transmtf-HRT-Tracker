@@ -8,7 +8,7 @@ import { useFocusTrap } from '../hooks/useFocusTrap';
 import {
     DoseEvent, SimulationResult, LabResult,
     interpolateConcentration_E2, interpolateCompoundConcentration, convertToPgMl,
-    pickPrimaryAntiandrogen, ANTIANDROGENS, formatAntiandrogenConc, Ester,
+    pickPrimaryAntiandrogen, ANTIANDROGENS, formatAntiandrogenConc, Ester, endogenousFractionAt,
     PERSONAL_E2_CEILING_PGML,
 } from '../../logic';
 import ResultChartStatic from './ResultChartStatic';
@@ -153,7 +153,9 @@ const ShareImageModal: React.FC<Props> = ({
 
     // ── Current values (mirror OverviewView logic) ──
     const rawE2 = simulation ? (interpolateConcentration_E2(simulation, h) || 0) : 0;
-    const baseShift = (!hasPersonalModel && baselineE2PGmL && baselineE2PGmL > 0) ? baselineE2PGmL : 0;
+    // Endogenous E2 now (fades with simulated T suppression when the testosterone model is on).
+    const endoNow = (baselineE2PGmL && baselineE2PGmL > 0) ? baselineE2PGmL * endogenousFractionAt(simulation, h) : 0;
+    const baseShift = !hasPersonalModel ? endoNow : 0;
     // F13 final-review fix: a personal estimate at the model ceiling stays
     // sourced from the personal curve (rendered with a "≥" qualifier), never
     // silently swapped for the raw population value while the CI stays personal.
@@ -647,7 +649,7 @@ const ShareImageModal: React.FC<Props> = ({
                                     {hasDoseHistory && !hasPersonalModel && baselineE2PGmL != null && baselineE2PGmL > 0 && (
                                         <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px', whiteSpace: 'nowrap' }}>
                                             <span style={{ fontSize: '13px', fontWeight: 800, color: '#2dd4bf', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Endogenous</span>
-                                            <span style={{ fontSize: '17px', fontWeight: 700, color: '#14b8a6' }}>{baselineE2PGmL.toFixed(1)} pg/mL</span>
+                                            <span style={{ fontSize: '17px', fontWeight: 700, color: '#14b8a6' }}>{endoNow.toFixed(1)} pg/mL</span>
                                         </div>
                                     )}
                                 </div>

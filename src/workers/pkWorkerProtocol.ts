@@ -4,7 +4,7 @@
 // PK types involved (DoseEvent, LabResult, SimulationResult,
 // PersonalModelState, ...) already are, so no custom (de)serialisation exists.
 import type { DoseEvent, LabResult, SimulationResult } from '../../types';
-import type { GelProductSpec } from '../../pk';
+import type { GelProductSpec, TestosteroneModelOptions } from '../../pk';
 import type { CalibrationModel, CalibrationMode } from '../../calibration';
 import type {
     PersonalModelState,
@@ -29,6 +29,8 @@ export type PKWorkerRequest =
          * never freezes on the 14-day tail clamp.
          */
         endTimeH?: number;
+        /** Endogenous testosterone model options; null/absent = model off. */
+        testosterone?: TestosteroneModelOptions | null;
     }
     | {
         type: 'personalModel';
@@ -36,6 +38,8 @@ export type PKWorkerRequest =
         events: DoseEvent[];
         labResults: LabResult[];
         gelProducts?: GelProductSpec[];
+        /** Endogenous testosterone model options; null/absent = model off. */
+        testosterone?: TestosteroneModelOptions | null;
     }
     | {
         type: 'ci';

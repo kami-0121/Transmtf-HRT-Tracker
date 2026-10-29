@@ -12,6 +12,9 @@ import {
     ANTIANDROGENS,
     ANTIANDROGEN_ESTERS,
     findPatchRemovalForApply,
+    makeEndogenousE2Context,
+    resolveEndogenousE2,
+    type EndogenousE2Context,
 } from './pk';
 import {
     convertToPgMl,
@@ -257,7 +260,8 @@ export function ekfUpdatePersonalModel(
     events: DoseEvent[],
     state: PersonalModelState,
     labResult: LabResult,
-    prevLabTimeH?: number
+    prevLabTimeH?: number,
+    endo?: EndogenousE2Context
 ): { newState: PersonalModelState; diagnostics: EKFDiagnostics } {
     const hasDoseBeforeLab = events.some((ev) =>
         ev.timeH <= labResult.timeH &&
@@ -288,11 +292,16 @@ export function ekfUpdatePersonalModel(
         // Accumulate baseline estimates using an online mean so multiple pre-dose
         // labs all contribute. Use observationCount (total, not post-dose) as the
         // running count of pre-dose observations already accumulated.
+        // With the testosterone model, a "pre-dose" lab may already sit on a
+        // partially suppressed axis (e.g. an anti-androgen started before E2),
+        // so normalise it back to the pre-treatment baseline: B = obs / f(t).
+        const fracAtLab = endo ? Math.max(endo.fractionAt(labResult.timeH), 0.05) : 1;
+        const obsBaseline = obsPGmL / fracAtLab;
         const prevBaseline = state.baselinePGmL ?? 0;
         const prevCount = state.observationCount;
         const newBaselinePGmL = prevCount === 0
-            ? obsPGmL
-            : (prevBaseline * prevCount + obsPGmL) / (prevCount + 1);
+            ? obsBaseline
+            : (prevBaseline * prevCount + obsBaseline) / (prevCount + 1);
 
         const baselineState: PersonalModelState = {
             ...state,
@@ -328,9 +337,9 @@ export function ekfUpdatePersonalModel(
     // Without this correction the baseline would be absorbed into theta (biasing
     // PK parameters upward) and then added again in computeSimulationWithCI,
     // causing a double-count of the endogenous contribution.
-    const baseline = (state.baselinePGmL !== undefined && Number.isFinite(state.baselinePGmL))
-        ? Math.max(0, state.baselinePGmL)
-        : 0;
+    // With the testosterone model the endogenous part is time-varying (it fades
+    // as T is suppressed); without it this is the legacy constant baseline.
+    const baseline = resolveEndogenousE2(state.baselinePGmL, labResult.timeH, endo);
     const obsDrugPGmL = Math.max(obsPGmL - baseline, EKF_EPS);
     const y = Math.log(obsDrugPGmL);
 
@@ -439,14 +448,15 @@ export interface PersonalSnapshot {
  */
 export function replayPersonalModelTimeline(
     events: DoseEvent[],
-    labResults: LabResult[]
+    labResults: LabResult[],
+    endo?: EndogenousE2Context
 ): PersonalSnapshot[] {
     let state = initPersonalModel();
     const sorted = [...labResults].sort((a, b) => a.timeH - b.timeH);
     const snapshots: PersonalSnapshot[] = [{ timeH: -Infinity, state }];
     for (let i = 0; i < sorted.length; i++) {
         const prevTimeH = i > 0 ? sorted[i - 1].timeH : undefined;
-        const { newState } = ekfUpdatePersonalModel(events, state, sorted[i], prevTimeH);
+        const { newState } = ekfUpdatePersonalModel(events, state, sorted[i], prevTimeH, endo);
         state = newState;
         snapshots.push({ timeH: sorted[i].timeH, state });
     }
@@ -461,9 +471,10 @@ export function replayPersonalModelTimeline(
  */
 export function replayPersonalModel(
     events: DoseEvent[],
-    labResults: LabResult[]
+    labResults: LabResult[],
+    endo?: EndogenousE2Context
 ): PersonalModelState {
-    const timeline = replayPersonalModelTimeline(events, labResults);
+    const timeline = replayPersonalModelTimeline(events, labResults, endo);
     return timeline[timeline.length - 1].state;
 }
 
@@ -552,15 +563,17 @@ export function computeSimulationWithCI(
     // snapshot timeline), so adding later labs or doses never rewrites the past.
     // In `retrospective` mode the resolver always returns the final learned
     // `state`, i.e. the whole curve is re-fit from hindsight (legacy behaviour).
+    // Endogenous E2: the simulation carries a testosterone series only when the
+    // testosterone model is on; then the baseline fades with T suppression.
+    const endo = makeEndogenousE2Context(sim);
     const timeline = calibrationMode === 'causal'
-        ? replayPersonalModelTimeline(events, labResults)
+        ? replayPersonalModelTimeline(events, labResults, endo)
         : null;
     const resolveState = makeSnapshotResolver(timeline, state);
-    // Baseline endogenous E2 from pre-dose calibration; 0 if none available.
-    const baselineOf = (st: PersonalModelState): number =>
-        (st.baselinePGmL !== undefined && Number.isFinite(st.baselinePGmL))
-            ? Math.max(0, st.baselinePGmL)
-            : 0;
+    // Endogenous E2 at `timeH`: the pre-dose-lab baseline (0 if none, unless the
+    // testosterone model supplies a population default), scaled by T(t)/T0.
+    const baselineOf = (st: PersonalModelState, timeH: number): number =>
+        resolveEndogenousE2(st.baselinePGmL, timeH, endo);
 
     const clampCI = (low: number, high: number, hardMax: number): [number, number] => {
         const lo = Number.isFinite(low) ? Math.max(0, low) : 0;
@@ -586,11 +599,11 @@ export function computeSimulationWithCI(
             labResults,
             OU_DEFAULT_PARAMS,
             calibrationMode === 'causal' ? 'forward' : 'smooth',
-            { baselineAt: (timeH: number) => baselineOf(resolveState(timeH)) }
+            { baselineAt: (timeH: number) => baselineOf(resolveState(timeH), timeH) }
         );
 
         for (let i = 0; i < n; i++) {
-            const baselinePGmL = baselineOf(resolveState(sim.timeH[i]));
+            const baselinePGmL = baselineOf(resolveState(sim.timeH[i]), sim.timeH[i]);
             const c0 = Math.max(sim.concPGmL_E2[i], EKF_EPS);
             const mean = ou.m[i];
             const std = Math.sqrt(Math.max(0, ou.P[i]));
@@ -621,16 +634,16 @@ export function computeSimulationWithCI(
         // it to the whole curve. Each fit carries its own endogenous baseline.
         const sortedEvents = [...events].sort((a, b) => a.timeH - b.timeH);
         const mipdTimeline = calibrationMode === 'causal'
-            ? fitMipdTimeline(events, labResults, MIPD_DEFAULT_PRIOR)
+            ? fitMipdTimeline(events, labResults, MIPD_DEFAULT_PRIOR, endo)
             : null;
-        const finalFit = fitMipd(events, labResults, MIPD_DEFAULT_PRIOR);
+        const finalFit = fitMipd(events, labResults, MIPD_DEFAULT_PRIOR, Infinity, endo);
         const resolveMipd = makeMipdResolver(mipdTimeline, finalFit);
 
         for (let i = 0; i < n; i++) {
             const timeH = sim.timeH[i];
             const fit = resolveMipd(timeH);
             const pred = mipdPredict(sortedEvents, timeH, fit, GP_RESIDUAL_DEFAULT);
-            const baselinePGmL = Math.max(0, fit.baselinePGmL || 0);
+            const baselinePGmL = resolveEndogenousE2(fit.baselinePGmL, timeH, endo);
             // Central line = GP-corrected MAP point prediction (the posterior
             // mode/median), the standard MIPD choice — uncertainty lives in the
             // bands, not in an upward Jensen shift of the line. This makes the
@@ -668,7 +681,7 @@ export function computeSimulationWithCI(
             const st = resolveState(timeH);
             const theta = st.thetaMean;
             const P = st.thetaCov;
-            const baselinePGmL = baselineOf(st);
+            const baselinePGmL = baselineOf(st, timeH);
             const e2Base = e2AtTimeWithThetaSorted(sortedEvents, timeH, theta);
             const yhat = Math.log(Math.max(e2Base, EKF_EPS));
             const thetaKPlus: [number, number] = [theta[0], theta[1] + EKF_DELTA_K];
