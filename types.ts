@@ -161,6 +161,15 @@ export interface SimulationResult {
     testosterone?: TestosteroneSeries;
 }
 
+/** One exact evaluation of the T posterior (used for segment-edge knots). */
+export interface TSeriesPoint {
+    values: number;
+    tFraction: number;
+    logSd: number;
+    fractionLogSd: number;
+    endogenousFraction: number;
+}
+
 /** Endogenous testosterone curve on the shared simulation grid. */
 export interface TestosteroneSeries {
     unit: 'ng/dL';
@@ -185,6 +194,15 @@ export interface TestosteroneSeries {
      * pre-treatment endogenous E2 baseline B (see ENDOGENOUS_E2 in pk.ts).
      */
     endogenousFraction: number[];
+    /**
+     * Calibration update times (distinct T lab times, causal mode only). The
+     * series is piecewise between them: read it with interpolateTSeries,
+     * never with plain linear interpolation across an update.
+     */
+    updateTimesH?: number[];
+    /** Exact state just BEFORE each update (left limit) and AT it (new state). */
+    knotsBefore?: TSeriesPoint[];
+    knotsAfter?: TSeriesPoint[];
     /** Number of measured T values that informed the calibration. */
     observationCount: number;
     postDoseObservationCount: number;

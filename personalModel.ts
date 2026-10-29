@@ -558,6 +558,12 @@ export function computeSimulationWithCI(
     e2DrugPersonal: number[];
     /** Posterior mean of the endogenous E2 contribution included in e2Adjusted. */
     endogenousMean: number[];
+    /**
+     * Causal mode: times at which the personalised curves change state (E2 lab
+     * times and T calibration updates). Read the arrays with
+     * interpolateNoCross so no value mixes pre- and post-update states.
+     */
+    updateTimesH: number[];
     antiandrogen: Partial<Record<Ester, { adjusted: number[]; ci95Low: number[]; ci95High: number[] }>>;
 } {
     const n = sim.timeH.length;
@@ -571,6 +577,7 @@ export function computeSimulationWithCI(
             ci68High: [],
             e2DrugPersonal: [],
             endogenousMean: [],
+            updateTimesH: [],
             antiandrogen: {},
         };
     }
@@ -683,7 +690,8 @@ export function computeSimulationWithCI(
             const e2Base = Math.max(e2AtTimeWithThetaSorted(sortedEvents, timeH, theta), EKF_EPS);
             const yhat = Math.log(e2Base);
             const thetaKPlus: [number, number] = [theta[0], theta[1] + EKF_DELTA_K];
-            const yhatPlus = fast ? yhat : Math.log(Math.max(e2AtTimeWithThetaSorted(sortedEvents, timeH, thetaKPlus), EKF_EPS));
+            // Same centre formula in the fast and full paths (the Jensen term needs H1).
+            const yhatPlus = Math.log(Math.max(e2AtTimeWithThetaSorted(sortedEvents, timeH, thetaKPlus), EKF_EPS));
             const H1 = (yhatPlus - yhat) / EKF_DELTA_K;
             const rawSigma2Param = P[0][0] + 2 * H1 * P[0][1] + H1 * H1 * P[1][1];
             const sigma2Param = Number.isFinite(rawSigma2Param) && rawSigma2Param > 0 ? rawSigma2Param : 0;
@@ -706,7 +714,7 @@ export function computeSimulationWithCI(
         }
         return {
             timeH: sim.timeH, e2Adjusted: [], ci95Low: [], ci95High: [], ci68Low: [], ci68High: [],
-            e2DrugPersonal: drugCenter, endogenousMean: [], antiandrogen: {},
+            e2DrugPersonal: drugCenter, endogenousMean: [], updateTimesH: [], antiandrogen: {},
         };
     }
 
@@ -828,6 +836,9 @@ export function computeSimulationWithCI(
         ci68High,
         e2DrugPersonal: drugCenter,
         endogenousMean,
+        updateTimesH: calibrationMode === 'causal'
+            ? [...new Set([...labResults.map(l => l.timeH), ...(sim.testosterone?.updateTimesH ?? [])])].sort((a, b) => a - b)
+            : [],
         antiandrogen,
     };
 }
@@ -858,44 +869,72 @@ export function computeCoupledSimulationWithCI(
     applyCPAInhibitionToE2: boolean,
     calibrationMode: CalibrationMode,
     testosterone?: TestosteroneModelOptions | null,
-    maxIterations = 3
+    maxIterations = 3,
+    tolerance = COUPLING_TOLERANCE
 ): ReturnType<typeof computeSimulationWithCI> & {
     testosterone?: TestosteroneSeries;
     model: PersonalModelState;
     couplingIterations: number;
+    /**
+     * max |Δ log T| between the returned T and T recomputed from the returned
+     * personalised E2 — 0 when not coupled. Below `tolerance` ⇔ the pair is a
+     * fixed point of the coupled model.
+     */
+    couplingResidual: number;
 } {
     if (!testosterone || !sim.testosterone || state.postDoseObservationCount === 0 || sim.timeH.length === 0) {
         const single = computeSimulationWithCI(sim, events, state, applyE2LearningToCPA, labResults,
             calibrationModel, applyCPAInhibitionToE2, calibrationMode);
-        return { ...single, testosterone: sim.testosterone, model: state, couplingIterations: 0 };
+        return { ...single, testosterone: sim.testosterone, model: state, couplingIterations: 0, couplingResidual: 0 };
     }
-    const fast = { drugOnly: true as const, strideH: 2 };
-    let ci = computeSimulationWithCI(sim, events, state, applyE2LearningToCPA, labResults,
-        calibrationModel, applyCPAInhibitionToE2, calibrationMode, fast);
     const firstDose = [...events].filter(e => e.route !== Route.patchRemove).sort((a, b) => a.timeH - b.timeH)[0];
-    let current: SimulationResult = sim;
-    let model = state;
-    let iterations = 0;
-    for (let k = 0; k < maxIterations; k++) {
-        const T = computeTestosteroneSeries(sim.timeH, ci.e2DrugPersonal, sim.byCompound, {
-            ...testosterone,
-            mode: calibrationMode,
-            firstDoseH: testosterone.firstDoseH ?? firstDose?.timeH,
-        });
-        let delta = 0;
-        const prev = current.testosterone!.values;
-        for (let i = 0; i < T.values.length; i++) {
-            delta = Math.max(delta, Math.abs(Math.log(Math.max(T.values[i], 1e-6) / Math.max(prev[i], 1e-6))));
+    const tOpts: TestosteroneModelOptions = {
+        ...testosterone,
+        mode: calibrationMode,
+        firstDoseH: testosterone.firstDoseH ?? firstDose?.timeH,
+    };
+    const computeT = (e2: number[]) => computeTestosteroneSeries(sim.timeH, e2, sim.byCompound, tOpts);
+    const maxLogDiff = (a: TestosteroneSeries, b: TestosteroneSeries) => {
+        let d = 0;
+        for (let i = 0; i < a.values.length; i++) {
+            d = Math.max(d, Math.abs(Math.log(Math.max(a.values[i], 1e-9) / Math.max(b.values[i], 1e-9))));
         }
+        return d;
+    };
+    const ciOf = (s: SimulationResult, m: PersonalModelState, fast?: { drugOnly: true; strideH: number }) =>
+        computeSimulationWithCI(s, events, m, applyE2LearningToCPA, labResults,
+            calibrationModel, applyCPAInhibitionToE2, calibrationMode, fast);
+    const adopt = (T: TestosteroneSeries) => {
         current = { ...sim, testosterone: T };
         model = replayPersonalModel(events, labResults, makeEndogenousE2Context(current));
         iterations++;
-        if (delta < 0.005 || k === maxIterations - 1) break;
-        ci = computeSimulationWithCI(current, events, model, applyE2LearningToCPA, labResults,
-            calibrationModel, applyCPAInhibitionToE2, calibrationMode, fast);
+    };
+
+    let current: SimulationResult = sim;
+    let model = state;
+    let iterations = 0;
+
+    // Phase 1 — cheap fixed-point iterations on the strided personalised E2
+    // (identical centre formula to the full pass, only fewer grid points).
+    const fast = { drugOnly: true as const, strideH: 2 };
+    for (let k = 0; k < maxIterations; k++) {
+        const T = computeT(ciOf(current, model, fast).e2DrugPersonal);
+        const delta = maxLogDiff(T, current.testosterone!);
+        adopt(T);
+        if (delta < tolerance) break;
     }
-    // Final full-resolution pass (bands, anti-androgens) with the converged T.
-    ci = computeSimulationWithCI(current, events, model, applyE2LearningToCPA, labResults,
-        calibrationModel, applyCPAInhibitionToE2, calibrationMode);
-    return { ...ci, testosterone: current.testosterone, model, couplingIterations: iterations };
+
+    // Phase 2 — full resolution until the RETURNED pair is self-consistent:
+    // T recomputed from the returned E2 must match the returned T.
+    let ci = ciOf(current, model);
+    let residual = maxLogDiff(computeT(ci.e2DrugPersonal), current.testosterone!);
+    for (let k = 0; k < maxIterations && residual >= tolerance; k++) {
+        adopt(computeT(ci.e2DrugPersonal));
+        ci = ciOf(current, model);
+        residual = maxLogDiff(computeT(ci.e2DrugPersonal), current.testosterone!);
+    }
+    return { ...ci, testosterone: current.testosterone, model, couplingIterations: iterations, couplingResidual: residual };
 }
+
+/** Convergence / self-consistency tolerance of the coupled E2/T estimation (max |Δ log T|). */
+export const COUPLING_TOLERANCE = 0.005;

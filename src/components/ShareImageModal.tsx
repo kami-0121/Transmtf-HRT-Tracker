@@ -10,6 +10,7 @@ import {
     interpolateConcentration_E2, interpolateCompoundConcentration, convertToPgMl,
     pickPrimaryAntiandrogen, ANTIANDROGENS, formatAntiandrogenConc, Ester, endogenousFractionAt,
     PERSONAL_E2_CEILING_PGML,
+    interpolateNoCross,
 } from '../../logic';
 import ResultChartStatic from './ResultChartStatic';
 import { API_ORIGIN } from '../api/config';
@@ -22,6 +23,8 @@ interface SimCI {
     ci68Low: number[];
     ci68High: number[];
     antiandrogen: Partial<Record<string, { adjusted: number[]; ci95Low: number[]; ci95High: number[] }>>;
+    /** Causal-mode state-change times; never interpolate across them. */
+    updateTimesH?: number[];
 }
 
 interface Props {
@@ -34,18 +37,14 @@ interface Props {
     baselineE2PGmL?: number | null;
 }
 
-function interpAt(timeH: number[], values: number[], h: number): number {
-    if (!timeH.length) return 0;
-    if (h <= timeH[0]) return values[0];
-    if (h >= timeH[timeH.length - 1]) return values[values.length - 1];
-    let lo = 0, hi = timeH.length - 1;
-    while (hi - lo > 1) {
-        const mid = (lo + hi) >> 1;
-        if (timeH[mid] <= h) lo = mid; else hi = mid;
-    }
-    const frac = (timeH[hi] - timeH[lo]) > 0 ? (h - timeH[lo]) / (timeH[hi] - timeH[lo]) : 0;
-    const v = values[lo] + frac * (values[hi] - values[lo]);
-    return isFinite(v) ? v : 0;
+/**
+ * Linear interpolation of a personal-model curve that never crosses a
+ * calibration update (causal mode): see interpolateNoCross in pk.ts.
+ */
+function interpAt(timeH: number[], values: number[], h: number, updateTimesH: number[] = []): number {
+    if (!timeH.length || !values.length || timeH.length !== values.length) return 0;
+    const v = interpolateNoCross(timeH, values, h, updateTimesH);
+    return v !== null && Number.isFinite(v) ? v : 0;
 }
 
 // A4 landscape at 150dpi
@@ -159,29 +158,29 @@ const ShareImageModal: React.FC<Props> = ({
     // F13 final-review fix: a personal estimate at the model ceiling stays
     // sourced from the personal curve (rendered with a "≥" qualifier), never
     // silently swapped for the raw population value while the CI stays personal.
-    const personalE2Raw = hasPersonalModel ? interpAt(simCI!.timeH, simCI!.e2Adjusted, h) : null;
+    const personalE2Raw = hasPersonalModel ? interpAt(simCI!.timeH, simCI!.e2Adjusted, h, simCI!.updateTimesH) : null;
     const personalE2Capped = personalE2Raw !== null && personalE2Raw >= PERSONAL_E2_CEILING_PGML;
     const currentE2 = personalE2Raw !== null ? personalE2Raw : (rawE2 + baseShift);
 
     const rawCPA = (simulation && primaryAA) ? (interpolateCompoundConcentration(simulation, primaryAA, h) || 0) * aaScale : 0;
-    const personalCPA = (hasPersonalCpaModel && aaCISeries) ? interpAt(simCI!.timeH, aaCISeries.adjusted, h) * aaScale : null;
+    const personalCPA = (hasPersonalCpaModel && aaCISeries) ? interpAt(simCI!.timeH, aaCISeries.adjusted, h, simCI!.updateTimesH) * aaScale : null;
     const currentCPA = personalCPA ?? rawCPA;
 
     const currentCI = hasPersonalModel ? (() => {
-        const lo = interpAt(simCI!.timeH, simCI!.ci95Low, h);
-        const hi = interpAt(simCI!.timeH, simCI!.ci95High, h);
+        const lo = interpAt(simCI!.timeH, simCI!.ci95Low, h, simCI!.updateTimesH);
+        const hi = interpAt(simCI!.timeH, simCI!.ci95High, h, simCI!.updateTimesH);
         return (lo > 0 && hi > lo) ? { lo, hi } : null;
     })() : null;
 
     const currentCPACI = (hasPersonalCpaModel && hasPersonalCpaCI && aaCISeries) ? (() => {
-        const lo = interpAt(simCI!.timeH, aaCISeries.ci95Low, h) * aaScale;
-        const hi = interpAt(simCI!.timeH, aaCISeries.ci95High, h) * aaScale;
+        const lo = interpAt(simCI!.timeH, aaCISeries.ci95Low, h, simCI!.updateTimesH) * aaScale;
+        const hi = interpAt(simCI!.timeH, aaCISeries.ci95High, h, simCI!.updateTimesH) * aaScale;
         return (lo > 0 && hi > lo) ? { lo, hi } : null;
     })() : null;
 
     const currentCI68 = (hasPersonalModel && simCI!.ci68Low?.length === simCI!.timeH.length) ? (() => {
-        const lo = interpAt(simCI!.timeH, simCI!.ci68Low, h);
-        const hi = interpAt(simCI!.timeH, simCI!.ci68High, h);
+        const lo = interpAt(simCI!.timeH, simCI!.ci68Low, h, simCI!.updateTimesH);
+        const hi = interpAt(simCI!.timeH, simCI!.ci68High, h, simCI!.updateTimesH);
         return (lo > 0 && hi > lo) ? { lo, hi } : null;
     })() : null;
 

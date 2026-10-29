@@ -16,6 +16,7 @@ import {
     interpolateCompoundConcentration,
     interpolateConcentration_E2,
     testosteroneGP,
+    computeTestosteroneSeries,
     ENDOGENOUS_E2_RHO_MEAN,
     POSTERIOR_DRAWS,
 } from './pk';
@@ -308,5 +309,59 @@ describe('coupled E2/T estimation', () => {
         const b = computeCoupledSimulationWithCI(sim, events, st2, false, later, 'ekf', false, 'causal', tOpts);
         const i = sim.timeH.findIndex(t => t >= 50 * DAY);
         expect(b.testosterone!.tFraction[i]).toBeCloseTo(a.testosterone!.tFraction[i], 6);
+    });
+});
+
+describe('time & numerical consistency (review round 2)', () => {
+    const events = weeklyEV(10);
+    const plain = runSimulation(events, { testosterone: {} })!;
+
+    it('causal: no interpolation across a calibration update (future 4× lab, 1 h before it)', () => {
+        // Off-grid lab time so the two neighbouring grid points straddle it.
+        const labH = 40 * DAY + 0.37;
+        const obs = [{ timeH: labH, ngdL: interpolateTestosterone(plain, labH)! * 4 }];
+        const cal = runSimulation(events, { testosterone: { observations: obs, mode: 'causal' } })!;
+        for (const dt of [1, 0.25, 0.01]) {
+            const t = labH - dt;
+            // Equal up to linear-interpolation error of the reference (exact knot vs.
+            // interpolated grid), i.e. no trace of the 4× lab (the leak was ×1.49).
+            expect(interpolateTestosterone(cal, t)! / interpolateTestosterone(plain, t)!).toBeCloseTo(1, 5);
+            expect(endogenousFractionAt(cal, t)).toBeCloseTo(endogenousFractionAt(plain, t), 5);
+            expect(makeEndogenousE2Context(cal)!.tFractionAt(t)).toBeCloseTo(makeEndogenousE2Context(plain)!.tFractionAt(t), 5);
+        }
+        // At and after the lab the update applies immediately.
+        expect(interpolateTestosterone(cal, labH)! / interpolateTestosterone(plain, labH)!).toBeGreaterThan(2);
+    });
+
+    it('causal: residuals of all visible labs use the current ηT (lab spacing does not matter)', () => {
+        const t1 = 40 * DAY, v = interpolateTestosterone(plain, t1)! * 3;
+        const same = runSimulation(events, { testosterone: { mode: 'causal', observations: [{ timeH: t1, ngdL: v }, { timeH: t1, ngdL: v }] } })!;
+        const apart = runSimulation(events, { testosterone: { mode: 'causal', observations: [{ timeH: t1, ngdL: v }, { timeH: t1 + 0.001, ngdL: v }] } })!;
+        const next = t1 + DAY;
+        expect(interpolateTestosterone(apart, next)! / interpolateTestosterone(same, next)!).toBeCloseTo(1, 3);
+        // …and causal agrees with retrospective once every lab is visible.
+        const retro = runSimulation(events, { testosterone: { mode: 'retrospective', observations: [{ timeH: t1, ngdL: v }, { timeH: t1, ngdL: v }] } })!;
+        const late = 70 * DAY;
+        expect(retro.testosterone!.etaT).toBeCloseTo(same.testosterone!.etaT, 6);
+        expect(interpolateTestosterone(same, late)! / interpolateTestosterone(retro, late)!).toBeCloseTo(1, 6);
+    });
+
+    it('coupled E2/T: the returned T is a fixed point of the returned E2', () => {
+        const sim = runSimulation(events, { testosterone: {}, endTimeH: 80 * DAY })!;
+        const labH = 30 * DAY + 24;
+        const labs: LabResult[] = [{ id: 'e', timeH: labH, concValue: interpolateConcentration_E2(sim, labH)! * 2.5, unit: 'pg/ml' }];
+        const tOpts = { observations: [{ timeH: 45 * DAY, ngdL: 150 }] };
+        for (const mode of ['causal', 'retrospective'] as const) {
+            const s = runSimulation(events, { testosterone: { ...tOpts, mode }, endTimeH: 80 * DAY })!;
+            const state = replayPersonalModel(events, labs, makeEndogenousE2Context(s));
+            const res = computeCoupledSimulationWithCI(s, events, state, false, labs, 'ekf', false, mode, tOpts);
+            const recomputed = computeTestosteroneSeries(s.timeH, res.e2DrugPersonal, s.byCompound, { ...tOpts, mode, firstDoseH: 0 });
+            let worst = 0;
+            for (let i = 0; i < recomputed.values.length; i++) {
+                worst = Math.max(worst, Math.abs(Math.log(recomputed.values[i] / res.testosterone!.values[i])));
+            }
+            expect(worst).toBeLessThan(0.005);
+            expect(res.couplingResidual).toBeLessThan(0.005);
+        }
     });
 });

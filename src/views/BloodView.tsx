@@ -78,6 +78,25 @@ const BloodView: React.FC<BloodViewProps> = ({ rows, onAdd, onEdit }) => {
         }
         // Before the simulation grid starts (pre-treatment) T sits at its baseline.
         if (out.length > 0 && xDomain[0] < grid[0] * 3600000) out.unshift(point(0, xDomain[0]));
+        // Causal mode: draw each calibration update as a step (exact state just
+        // before and at the update) instead of a slope that would leak the lab
+        // into earlier times.
+        const ups = ts.updateTimesH ?? [];
+        ups.forEach((u, j) => {
+            const time = u * 3600000;
+            if (time < xDomain[0] || time > xDomain[1] || !ts.knotsBefore || !ts.knotsAfter) return;
+            // Population curve carries no calibration state: nearest grid value suffices.
+            const gi = grid.findIndex(g => g >= u);
+            const pop = ts.populationValues[gi >= 0 ? gi : grid.length - 1];
+            const knot = (k: { values: number; logSd: number }, dt: number) => ({
+                time: time + dt, model: k.values, pop,
+                band: [k.values * Math.exp(-1.96 * k.logSd), k.values * Math.exp(1.96 * k.logSd)] as [number, number],
+            });
+            // Drop grid samples inside the (sub-step) gap, then add both knots.
+            for (let q = out.length - 1; q >= 0; q--) if (Math.abs(out[q].time - time) < 1) out.splice(q, 1);
+            out.push(knot(ts.knotsBefore[j], -1), knot(ts.knotsAfter[j], 0));
+        });
+        out.sort((x, y) => x.time - y.time);
         return out;
     }, [tSrc, xDomain]);
 

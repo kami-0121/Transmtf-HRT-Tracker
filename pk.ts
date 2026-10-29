@@ -747,11 +747,54 @@ export interface TGPResult {
     totalVar: number[];
 }
 
+/** A GP conditioned on a fixed set of observations; evaluates at any (t, a(t)). */
+interface TGPPosterior {
+    at: (t: number, a: number) => { rMean: number; rVar: number; totalMean: number; totalVar: number };
+}
+
 /**
- * GP posterior of the T calibration terms on `times` (see T_CALIBRATION).
- * `y` are log(T_measured / (T0·S(t_i))) at `obsTimes`, `obsAmp`/`amp` the
- * response amplitudes at the observation and query times. `causal` conditions
- * each query time on the prefix of observations at or before it. Exported for tests.
+ * Condition the T-calibration GP (see T_CALIBRATION) on observations with log
+ * residuals `y` and response amplitudes `obsAmp`. With no observations the
+ * prior is returned.
+ */
+function conditionTGP(obsTimes: number[], y: number[], obsAmp: number[], t0SdLog: number, p = T_CALIBRATION): TGPPosterior {
+    const s2 = p.priorSdLog * p.priorSdLog;
+    const d2 = t0SdLog * t0SdLog;
+    const e2 = p.noiseSdLog * p.noiseSdLog;
+    const lo = Math.log(p.minRatio), hi = Math.log(p.maxRatio);
+    const clamp = (v: number) => Math.min(hi, Math.max(lo, v));
+    const k = obsTimes.length;
+    const kr = (ta: number, aa: number, tb: number, ab: number) => aa * ab * s2 * Math.exp(-Math.abs(ta - tb) / p.lengthScaleH);
+    if (k === 0) {
+        return { at: (_t, a) => ({ rMean: 0, rVar: a * a * s2, totalMean: 0, totalVar: a * a * s2 + d2 }) };
+    }
+    const L = cholesky(Array.from({ length: k }, (_, i) => Array.from({ length: k }, (_, j) =>
+        kr(obsTimes[i], obsAmp[i], obsTimes[j], obsAmp[j]) + d2 + (i === j ? e2 : 0))));
+    const alpha = cholSolve(L, y);
+    return {
+        at: (t, a) => {
+            const cr = obsTimes.map((ot, i) => kr(t, a, ot, obsAmp[i]));
+            const ct = cr.map(c => c + d2);
+            let mr = 0, mt = 0;
+            for (let i = 0; i < k; i++) { mr += cr[i] * alpha[i]; mt += ct[i] * alpha[i]; }
+            const wr = cholSolve(L, cr), wt = cholSolve(L, ct);
+            let qr = 0, qt = 0;
+            for (let i = 0; i < k; i++) { qr += cr[i] * wr[i]; qt += ct[i] * wt[i]; }
+            const priorR = a * a * s2;
+            return {
+                rMean: clamp(mr), totalMean: clamp(mt),
+                rVar: Math.max(0, priorR - qr),
+                totalVar: Math.max(1e-6, priorR + d2 - qt),
+            };
+        },
+    };
+}
+
+/**
+ * GP posterior of the T calibration terms on `times` for FIXED residuals `y`.
+ * `causal` conditions each time on the observations at or before it.
+ * (The series builder re-derives residuals per update — see
+ * computeTestosteroneSeries; this helper is the plain GP, kept for tests.)
  */
 export function testosteroneGP(
     obsTimes: number[],
@@ -763,52 +806,22 @@ export function testosteroneGP(
     mode: TCalibrationMode = 'retrospective',
     p = T_CALIBRATION
 ): TGPResult {
-    const s2 = p.priorSdLog * p.priorSdLog;
-    const d2 = t0SdLog * t0SdLog;
-    const e2 = p.noiseSdLog * p.noiseSdLog;
-    const lo = Math.log(p.minRatio), hi = Math.log(p.maxRatio);
-    const clamp = (v: number) => Math.min(hi, Math.max(lo, v));
-    const nT = times.length;
-    const rMean = new Array<number>(nT), rVar = new Array<number>(nT);
-    const totalMean = new Array<number>(nT), totalVar = new Array<number>(nT);
     const order = obsTimes.map((_, i) => i).sort((a, b) => obsTimes[a] - obsTimes[b]);
     const ot = order.map(i => obsTimes[i]), oy = order.map(i => y[i]), oa = order.map(i => obsAmp[i]);
-    const kr = (ta: number, aa: number, tb: number, ab: number) => aa * ab * s2 * Math.exp(-Math.abs(ta - tb) / p.lengthScaleH);
-    // One Cholesky factor per data prefix (causal) or one for all data (retrospective).
-    const factors = new Map<number, { L: number[][]; alpha: number[] }>();
-    const factorFor = (k: number) => {
-        let f = factors.get(k);
-        if (!f) {
-            const A = Array.from({ length: k }, (_, i) => Array.from({ length: k }, (_, j) =>
-                kr(ot[i], oa[i], ot[j], oa[j]) + d2 + (i === j ? e2 : 0)));
-            const L = cholesky(A);
-            f = { L, alpha: cholSolve(L, oy.slice(0, k)) };
-            factors.set(k, f);
-        }
-        return f;
+    const cache = new Map<number, TGPPosterior>();
+    const post = (k: number) => {
+        let g = cache.get(k);
+        if (!g) { g = conditionTGP(ot.slice(0, k), oy.slice(0, k), oa.slice(0, k), t0SdLog, p); cache.set(k, g); }
+        return g;
     };
-    for (let q = 0; q < nT; q++) {
-        const t = times[q], a = amp[q];
+    const out: TGPResult = { rMean: [], rVar: [], totalMean: [], totalVar: [] };
+    times.forEach((t, q) => {
         let k = ot.length;
         if (mode === 'causal') { k = 0; while (k < ot.length && ot[k] <= t) k++; }
-        const priorR = a * a * s2;
-        if (k === 0) {
-            rMean[q] = 0; rVar[q] = priorR; totalMean[q] = 0; totalVar[q] = priorR + d2;
-            continue;
-        }
-        const { L, alpha } = factorFor(k);
-        const cr = Array.from({ length: k }, (_, i) => kr(t, a, ot[i], oa[i]));
-        const ct = cr.map(c => c + d2);
-        let mr = 0, mt = 0;
-        for (let i = 0; i < k; i++) { mr += cr[i] * alpha[i]; mt += ct[i] * alpha[i]; }
-        const wr = cholSolve(L, cr), wt = cholSolve(L, ct);
-        let qr = 0, qt = 0;
-        for (let i = 0; i < k; i++) { qr += cr[i] * wr[i]; qt += ct[i] * wt[i]; }
-        rMean[q] = clamp(mr); totalMean[q] = clamp(mt);
-        rVar[q] = Math.max(0, priorR - qr);
-        totalVar[q] = Math.max(1e-6, priorR + d2 - qt);
-    }
-    return { rMean, rVar, totalMean, totalVar };
+        const r = post(k).at(t, amp[q]);
+        out.rMean.push(r.rMean); out.rVar.push(r.rVar); out.totalMean.push(r.totalMean); out.totalVar.push(r.totalVar);
+    });
+    return out;
 }
 
 /** −2·log posterior (up to constants) of ηT under the GP marginal likelihood. */
@@ -861,6 +874,17 @@ function fitEtaT(
     return { eta, sd, estimated: true };
 }
 
+/** One evaluated point of the calibrated T posterior. */
+interface TPoint {
+    values: number;
+    tFraction: number;
+    logSd: number;
+    fractionLogSd: number;
+    endogenousFraction: number;
+}
+const T_POINT_FIELDS = ['values', 'tFraction', 'logSd', 'fractionLogSd', 'endogenousFraction'] as const;
+export type TSeriesField = typeof T_POINT_FIELDS[number];
+
 /**
  * Build the endogenous testosterone series on a simulation grid.
  *
@@ -868,6 +892,16 @@ function fitEtaT(
  * from runSimulation, or the PERSONALISED drug curve when called from the
  * coupled E2/T estimation (computeCoupledSimulationWithCI), so both predictions
  * share the same individual parameters.
+ *
+ * Calibration is organised in SEGMENTS between update times (distinct T lab
+ * times). In segment k the state is: labs visible = those drawn at or before
+ * the segment start; ηT refit on exactly those labs; ALL visible residuals
+ * recomputed against that ηT's structural curve; GP conditioned on them.
+ * Causal mode has one segment per update; retrospective mode a single
+ * segment containing every lab — the same code path, so both agree once all
+ * labs are visible. Exact values on both sides of every update are stored as
+ * knots, and all readers interpolate only WITHIN a segment
+ * (interpolateTSeries), so no value ever mixes pre- and post-update states.
  */
 export function computeTestosteroneSeries(
     timeH: number[],
@@ -893,7 +927,8 @@ export function computeTestosteroneSeries(
         if (!tr) { tr = integrateTFraction(timeH, e2PGmL, byCompound, key).v; cache.set(key, tr); }
         return tr;
     };
-    const at = (tr: number[]) => (t: number) => interpolateSeries(timeH, tr, t) ?? 1;
+    // Continuous in t for a fixed ηT (no calibration state inside) → safe to interpolate.
+    const trajAt = (eta: number, t: number) => interpolateSeries(timeH, trajectory(eta), t) ?? 1;
     const explore = (eta: number) => {
         const r = integrateTFraction(timeH, e2PGmL, byCompound, eta, 2);
         return (t: number) => interpolateSeries(r.t, r.v, t) ?? 1;
@@ -903,72 +938,130 @@ export function computeTestosteroneSeries(
     const ampAt = (t: number) => interpolateSeries(timeH, amp, t) ?? 0;
     const obsAmp = observations.map(o => ampAt(o.timeH));
 
-    // ηT snapshots: causal → refit after each lab on the labs so far;
-    // retrospective → one fit on all labs. A snapshot is valid from its time on.
-    const snapshots: { from: number; fit: EtaFit }[] = [];
+    // Update times and the number of labs visible in each segment.
+    const updateTimesH: number[] = [];
+    const visibleCounts: number[] = [0];
     if (mode === 'causal') {
-        snapshots.push({ from: -Infinity, fit: { eta: 0, sd: P.etaPriorSd, estimated: false } });
-        for (let k = 0; k < observations.length; k++) {
-            snapshots.push({ from: observations[k].timeH, fit: fitEtaT(observations.slice(0, k + 1), firstDoseH, explore, obsAmp.slice(0, k + 1), T0, t0SdLog) });
+        for (let i = 0; i < observations.length; i++) {
+            const t = observations[i].timeH;
+            if (updateTimesH.length === 0 || updateTimesH[updateTimesH.length - 1] !== t) updateTimesH.push(t);
+            visibleCounts[updateTimesH.length] = i + 1;
         }
     } else {
-        snapshots.push({ from: -Infinity, fit: fitEtaT(observations, firstDoseH, explore, obsAmp, T0, t0SdLog) });
+        visibleCounts[0] = observations.length;
     }
-    const snapshotAt = (t: number) => {
-        let s = snapshots[0];
-        for (const x of snapshots) if (x.from <= t) s = x;
-        return s.fit;
+
+    interface Segment { fit: EtaFit; gp: TGPPosterior; }
+    const segments: Segment[] = visibleCounts.map(m => {
+        const vis = observations.slice(0, m);
+        const visAmp = obsAmp.slice(0, m);
+        const fit = fitEtaT(vis, firstDoseH, explore, visAmp, T0, t0SdLog);
+        // Residuals of ALL visible labs against THIS segment's structural curve.
+        const y = vis.map(o => Math.log(o.ngdL / Math.max(trajAt(fit.eta, o.timeH) * T0, 1e-6)));
+        return { fit, gp: conditionTGP(vis.map(o => o.timeH), y, visAmp, t0SdLog) };
+    });
+    const segmentOf = (t: number) => {
+        let k = 0;
+        while (k < updateTimesH.length && updateTimesH[k] <= t) k++;
+        return k;
     };
 
-    // Structural curve (ηT applied) and the ηT variance contribution to log S.
-    const structFrac = new Array<number>(n);
-    const etaVar = new Array<number>(n);
-    const h = 0.05;
-    for (let i = 0; i < n; i++) {
-        const fit = snapshotAt(timeH[i]);
-        structFrac[i] = trajectory(fit.eta)[i];
-        const dd = (Math.log(trajectory(fit.eta + h)[i]) - Math.log(trajectory(fit.eta - h)[i])) / (2 * h);
-        etaVar[i] = dd * dd * fit.sd * fit.sd;
-    }
-
-    // Each lab's residual is taken against the structural curve valid at the
-    // lab's time (causally: fitted on labs up to and including it).
-    const y = observations.map(o => Math.log(o.ngdL / Math.max(at(trajectory(snapshotAt(o.timeH).eta))(o.timeH) * T0, 1e-6)));
-    const gp = testosteroneGP(observations.map(o => o.timeH), y, obsAmp, timeH, amp, t0SdLog, mode);
-
-    const values = new Array<number>(n);
-    const populationValues = new Array<number>(n);
-    const tFraction = new Array<number>(n);
-    const logSd = new Array<number>(n);
-    const fractionLogSd = new Array<number>(n);
-    const endogenousFraction = new Array<number>(n);
     const rhoMean = ENDOGENOUS_E2_RHO_MEAN;
+    const h = 0.05;
+    const evalPoint = (seg: Segment, t: number, structFrac: number, a: number, dLogS: number): TPoint => {
+        const r = seg.gp.at(t, a);
+        const etaVar = dLogS * dLogS * seg.fit.sd * seg.fit.sd;
+        const vf = r.rVar + etaVar;
+        const tFraction = structFrac * Math.exp(r.rMean);
+        return {
+            values: T0 * structFrac * Math.exp(r.totalMean),
+            tFraction,
+            logSd: Math.sqrt(r.totalVar + etaVar),
+            fractionLogSd: Math.sqrt(vf),
+            // Mean endogenous multiplier E[ρ]·E[T/T0] + (1 − E[ρ]), lognormal mean.
+            endogenousFraction: rhoMean * tFraction * Math.exp(0.5 * vf) + (1 - rhoMean),
+        };
+    };
+    const evalAt = (k: number, t: number): TPoint => {
+        const seg = segments[k];
+        const eta = seg.fit.eta;
+        const dLogS = (Math.log(trajAt(eta + h, t)) - Math.log(trajAt(eta - h, t))) / (2 * h);
+        return evalPoint(seg, t, trajAt(eta, t), ampAt(t), dLogS);
+    };
+
+    const series = {
+        values: new Array<number>(n), tFraction: new Array<number>(n), logSd: new Array<number>(n),
+        fractionLogSd: new Array<number>(n), endogenousFraction: new Array<number>(n),
+    };
     for (let i = 0; i < n; i++) {
-        populationValues[i] = popFrac[i] * T0;
-        tFraction[i] = structFrac[i] * Math.exp(gp.rMean[i]);
-        values[i] = T0 * structFrac[i] * Math.exp(gp.totalMean[i]);
-        logSd[i] = Math.sqrt(gp.totalVar[i] + etaVar[i]);
-        const vf = gp.rVar[i] + etaVar[i];
-        fractionLogSd[i] = Math.sqrt(vf);
-        // Mean endogenous multiplier E[ρ]·E[T/T0] + (1 − E[ρ]), lognormal mean.
-        endogenousFraction[i] = rhoMean * tFraction[i] * Math.exp(0.5 * vf) + (1 - rhoMean);
+        const k = segmentOf(timeH[i]);
+        const seg = segments[k];
+        const eta = seg.fit.eta;
+        const dLogS = (Math.log(trajectory(eta + h)[i]) - Math.log(trajectory(eta - h)[i])) / (2 * h);
+        const pt = evalPoint(seg, timeH[i], trajectory(eta)[i], amp[i], dLogS);
+        for (const f of T_POINT_FIELDS) series[f][i] = pt[f];
     }
-    // Personal T0 actually implied by the data: T0·exp(E[δ0]) — read off where
-    // the response amplitude is ~0 (before treatment); otherwise the assumption.
+    // Exact values on both sides of each update: before = previous segment's
+    // state at the update time, after = the new segment's state.
+    const knotsBefore = updateTimesH.map((u, j) => evalAt(j, u));
+    const knotsAfter = updateTimesH.map((u, j) => evalAt(j + 1, u));
+
+    // Personal T0 actually implied by the data: T0·exp(E[δ0]) at the first grid
+    // point without drug effect, from the final segment.
     const preIdx = amp.findIndex(x => x < 1e-6);
+    const last = segments[segments.length - 1];
+    const personalT0 = preIdx >= 0 ? T0 * Math.exp(last.gp.at(timeH[preIdx], 0).totalMean) : T0;
     const pre = observations.filter(o => o.timeH < firstDoseH);
-    const personalT0 = preIdx >= 0 ? T0 * Math.exp(gp.totalMean[preIdx]) : T0;
-    const lastFit = snapshots[snapshots.length - 1].fit;
     return {
         unit: 'ng/dL',
         baselineNgdL: personalT0,
         baselineSource: pre.length > 0 ? 'lab' : hasSetting ? 'setting' : 'population',
         mode,
-        values, populationValues, tFraction, logSd, fractionLogSd, endogenousFraction,
+        ...series,
+        populationValues: popFrac.map(f => f * T0),
+        updateTimesH,
+        knotsBefore,
+        knotsAfter,
         observationCount: observations.length,
         postDoseObservationCount: observations.length - pre.length,
-        etaT: lastFit.eta, etaTSd: lastFit.sd, etaTEstimated: lastFit.estimated,
+        etaT: last.fit.eta, etaTSd: last.fit.sd, etaTEstimated: last.fit.estimated,
     };
+}
+
+/**
+ * Read a T-series field at `hour` without ever interpolating across a
+ * calibration update: inside a segment the grid values are interpolated
+ * linearly; at a segment edge the exact knot (left limit before an update,
+ * new state at it) replaces the neighbour from the other segment.
+ */
+export function interpolateTSeries(timeH: number[], series: TestosteroneSeries, field: TSeriesField, hour: number): number | null {
+    const vals = series[field];
+    const n = timeH.length;
+    if (n === 0) return null;
+    const ups = series.updateTimesH ?? [];
+    if (ups.length === 0) return interpolateSeries(timeH, vals, hour);
+    let k = 0;
+    while (k < ups.length && ups[k] <= hour) k++;
+    const segStart = k > 0 ? ups[k - 1] : -Infinity;
+    const segEnd = k < ups.length ? ups[k] : Infinity;
+    // Bracketing grid indices.
+    let lo = -1, hi = -1;
+    if (hour <= timeH[0]) hi = 0;
+    else if (hour >= timeH[n - 1]) lo = n - 1;
+    else {
+        let a = 0, b = n - 1;
+        while (b - a > 1) { const m = (a + b) >> 1; if (timeH[m] <= hour) a = m; else b = m; }
+        lo = a; hi = b;
+    }
+    let left: [number, number] | null = null;
+    let right: [number, number] | null = null;
+    if (lo >= 0) left = timeH[lo] >= segStart ? [timeH[lo], vals[lo]] : [segStart, series.knotsAfter![k - 1][field]];
+    if (hi >= 0) right = timeH[hi] < segEnd ? [timeH[hi], vals[hi]] : [segEnd, series.knotsBefore![k][field]];
+    if (hour === segStart && k > 0) return series.knotsAfter![k - 1][field];
+    if (!left) return right![1];
+    if (!right) return left[1];
+    if (right[0] === left[0]) return left[1];
+    return left[1] + (right[1] - left[1]) * (hour - left[0]) / (right[0] - left[0]);
 }
 
 // ── Shared posterior draws (common random numbers) ──────────────────────────
@@ -1035,9 +1128,9 @@ export function makeEndogenousE2Context(sim: SimulationResult | null | undefined
     if (!sim || !series || series.endogenousFraction.length !== sim.timeH.length) return undefined;
     const timeH = sim.timeH;
     return {
-        fractionAt: (t: number) => interpolateSeries(timeH, series.endogenousFraction, t) ?? 1,
-        tFractionAt: (t: number) => interpolateSeries(timeH, series.tFraction, t) ?? 1,
-        tLogSdAt: (t: number) => interpolateSeries(timeH, series.fractionLogSd, t) ?? 0,
+        fractionAt: (t: number) => interpolateTSeries(timeH, series, 'endogenousFraction', t) ?? 1,
+        tFractionAt: (t: number) => interpolateTSeries(timeH, series, 'tFraction', t) ?? 1,
+        tLogSdAt: (t: number) => interpolateTSeries(timeH, series, 'fractionLogSd', t) ?? 0,
         defaultBaselinePGmL: ENDOGENOUS_E2.baselineDefaultPGmL,
     };
 }
@@ -1887,6 +1980,27 @@ function interpolateSeries(
     return c0 + (c1 - c0) * ratio;
 }
 
+/**
+ * Linear interpolation that never mixes the states on both sides of a
+ * calibration update: when an update time lies between the two bracketing grid
+ * points, the value from the grid point on the same side of the update as
+ * `hour` is held instead. Used for causal-mode personal curves read at
+ * arbitrary times (e.g. "now").
+ */
+export function interpolateNoCross(timeH: number[], values: number[], hour: number, updateTimesH: number[] = []): number | null {
+    const n = timeH.length;
+    if (n === 0) return null;
+    if (hour <= timeH[0]) return values[0];
+    if (hour >= timeH[n - 1]) return values[n - 1];
+    let a = 0, b = n - 1;
+    while (b - a > 1) { const m = (a + b) >> 1; if (timeH[m] <= hour) a = m; else b = m; }
+    for (const u of updateTimesH) {
+        if (u > timeH[a] && u <= timeH[b]) return u <= hour ? values[b] : values[a];
+    }
+    const t0 = timeH[a], t1 = timeH[b];
+    return t1 === t0 ? values[a] : values[a] + (values[b] - values[a]) * (hour - t0) / (t1 - t0);
+}
+
 export function interpolateConcentration(sim: SimulationResult, hour: number): number | null {
     return interpolateSeries(sim.timeH, sim.concPGmL, hour);
 }
@@ -1917,7 +2031,7 @@ export function interpolateConcentration_CPA(sim: SimulationResult, hour: number
 export function interpolateTestosterone(sim: SimulationResult, hour: number): number | null {
     const series = sim.testosterone;
     if (!series) return null;
-    return interpolateSeries(sim.timeH, series.values, hour);
+    return interpolateTSeries(sim.timeH, series, 'values', hour);
 }
 
 /**
@@ -1927,5 +2041,5 @@ export function interpolateTestosterone(sim: SimulationResult, hour: number): nu
 export function endogenousFractionAt(sim: SimulationResult | null | undefined, hour: number): number {
     const series = sim?.testosterone;
     if (!sim || !series) return 1;
-    return interpolateSeries(sim.timeH, series.endogenousFraction, hour) ?? 1;
+    return interpolateTSeries(sim.timeH, series, 'endogenousFraction', hour) ?? 1;
 }

@@ -50,6 +50,8 @@ interface SimCI {
     couplingIterations?: number;
     e2DrugPersonal?: number[];
     endogenousMean?: number[];
+    /** Causal-mode state-change times; never interpolate across them. */
+    updateTimesH?: number[];
 }
 
 interface AppDataContextType {

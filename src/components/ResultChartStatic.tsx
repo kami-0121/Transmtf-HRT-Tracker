@@ -8,7 +8,7 @@ import {
     XAxis, YAxis, CartesianGrid, ReferenceLine, ReferenceDot,
     Area, AreaChart, ComposedChart, Scatter
 } from 'recharts';
-import { SimulationResult, DoseEvent, LabResult, interpolateConcentration_E2, interpolateCompoundConcentration, isAntiandrogen, pickPrimaryAntiandrogen, ANTIANDROGENS, Ester, convertToPgMl, endogenousFractionAt } from '../../logic';
+import { SimulationResult, DoseEvent, LabResult, interpolateConcentration_E2, interpolateCompoundConcentration, isAntiandrogen, pickPrimaryAntiandrogen, ANTIANDROGENS, Ester, convertToPgMl, endogenousFractionAt, interpolateNoCross } from '../../logic';
 import { formatDate } from '../utils/helpers';
 import { calculateNiceDomain } from '../utils/chartAxis';
 
@@ -20,6 +20,8 @@ interface SimCI {
     ci68Low: number[];
     ci68High: number[];
     antiandrogen: Partial<Record<string, { adjusted: number[]; ci95Low: number[]; ci95High: number[] }>>;
+    /** Causal-mode state-change times; never interpolate across them. */
+    updateTimesH?: number[];
 }
 
 interface ChartPoint {
@@ -36,18 +38,14 @@ interface ChartPoint {
     cpaCi95Band?: number;
 }
 
-function interpAt(timeH: number[], values: number[], h: number): number | undefined {
-    if (!timeH.length || !values.length) return undefined;
-    if (h <= timeH[0]) return values[0];
-    if (h >= timeH[timeH.length - 1]) return values[values.length - 1];
-    let lo = 0, hi = timeH.length - 1;
-    while (hi - lo > 1) {
-        const mid = (lo + hi) >> 1;
-        if (timeH[mid] <= h) lo = mid; else hi = mid;
-    }
-    const frac = (timeH[hi] - timeH[lo]) > 0 ? (h - timeH[lo]) / (timeH[hi] - timeH[lo]) : 0;
-    const v = values[lo] + frac * (values[hi] - values[lo]);
-    return isFinite(v) ? v : undefined;
+/**
+ * Linear interpolation of a personal-model curve that never crosses a
+ * calibration update (causal mode): see interpolateNoCross in pk.ts.
+ */
+function interpAt(timeH: number[], values: number[], h: number, updateTimesH: number[] = []): number | undefined {
+    if (!timeH.length || !values.length || timeH.length !== values.length) return undefined;
+    const v = interpolateNoCross(timeH, values, h, updateTimesH);
+    return v !== null && Number.isFinite(v) ? v : undefined;
 }
 
 function formatAxisTick(raw: any): string {
@@ -116,14 +114,14 @@ const ResultChartStatic: React.FC<Props> = ({ sim, events, labResults, simCI, ba
             const timeMs = t * 3600000;
             const baseE2 = sim.concPGmL_E2[i] + baseShift * (sim.testosterone?.endogenousFraction[i] ?? 1);
             const rawCPA = (aaSeries ? aaSeries.values[i] : 0) * aaScale;
-            const ci95Low = simCI ? interpAt(simCI.timeH, simCI.ci95Low, t) : undefined;
-            const ci95High = simCI ? interpAt(simCI.timeH, simCI.ci95High, t) : undefined;
-            const ci68Low = simCI ? interpAt(simCI.timeH, simCI.ci68Low, t) : undefined;
-            const ci68High = simCI ? interpAt(simCI.timeH, simCI.ci68High, t) : undefined;
-            const concPersonal = simCI ? interpAt(simCI.timeH, simCI.e2Adjusted, t) : undefined;
-            const concPersonalCPA = (hasPersonalCpaModel && aaCISeries) ? interpAt(simCI!.timeH, aaCISeries.adjusted, t)! * aaScale : undefined;
-            const cpaCi95Low = (hasPersonalCpaCI && aaCISeries) ? interpAt(simCI!.timeH, aaCISeries.ci95Low, t)! * aaScale : undefined;
-            const cpaCi95High = (hasPersonalCpaCI && aaCISeries) ? interpAt(simCI!.timeH, aaCISeries.ci95High, t)! * aaScale : undefined;
+            const ci95Low = simCI ? interpAt(simCI.timeH, simCI.ci95Low, t, simCI.updateTimesH) : undefined;
+            const ci95High = simCI ? interpAt(simCI.timeH, simCI.ci95High, t, simCI.updateTimesH) : undefined;
+            const ci68Low = simCI ? interpAt(simCI.timeH, simCI.ci68Low, t, simCI.updateTimesH) : undefined;
+            const ci68High = simCI ? interpAt(simCI.timeH, simCI.ci68High, t, simCI.updateTimesH) : undefined;
+            const concPersonal = simCI ? interpAt(simCI.timeH, simCI.e2Adjusted, t, simCI.updateTimesH) : undefined;
+            const concPersonalCPA = (hasPersonalCpaModel && aaCISeries) ? interpAt(simCI!.timeH, aaCISeries.adjusted, t, simCI!.updateTimesH)! * aaScale : undefined;
+            const cpaCi95Low = (hasPersonalCpaCI && aaCISeries) ? interpAt(simCI!.timeH, aaCISeries.ci95Low, t, simCI!.updateTimesH)! * aaScale : undefined;
+            const cpaCi95High = (hasPersonalCpaCI && aaCISeries) ? interpAt(simCI!.timeH, aaCISeries.ci95High, t, simCI!.updateTimesH)! * aaScale : undefined;
             return {
                 time: timeMs,
                 concE2: baseE2,

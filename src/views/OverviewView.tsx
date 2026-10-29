@@ -9,7 +9,7 @@ import { useAppData } from '../contexts/AppDataContext';
 import { regimenDisplayName, formatRegimenDose } from '../utils/regimenDisplay';
 import type { Regimen } from '../utils/regimens';
 import { formatTime, getRouteIcon } from '../utils/helpers';
-import { DoseEvent, SimulationResult, LabResult, Route, Ester, ExtraKey, SL_TIER_ORDER, interpolateConcentration_E2, interpolateCompoundConcentration, isAntiandrogen, pickPrimaryAntiandrogen, ANTIANDROGENS, formatAntiandrogenConc, convertToPgMl, PERSONAL_E2_CEILING_PGML, endogenousFractionAt, type TestosteroneSeries } from '../../logic';
+import { DoseEvent, SimulationResult, LabResult, Route, Ester, ExtraKey, SL_TIER_ORDER, interpolateConcentration_E2, interpolateCompoundConcentration, isAntiandrogen, pickPrimaryAntiandrogen, ANTIANDROGENS, formatAntiandrogenConc, convertToPgMl, PERSONAL_E2_CEILING_PGML, endogenousFractionAt, interpolateTSeries, interpolateNoCross, type TestosteroneSeries } from '../../logic';
 
 /** Convert hex color string to "r,g,b" for use in rgba() */
 function hexToRgb(hex: string): string {
@@ -174,6 +174,7 @@ interface SimCI {
     ci68High: number[];
     antiandrogen: Partial<Record<string, { adjusted: number[]; ci95Low: number[]; ci95High: number[] }>>;
     testosterone?: TestosteroneSeries;
+    updateTimesH?: number[];
 }
 
 interface OverviewViewProps {
@@ -188,21 +189,6 @@ interface OverviewViewProps {
   onAddRegimenDose: (regimen: Regimen) => void;
 }
 
-function interpAt(timeH: number[], values: number[], h: number): number {
-  if (!timeH.length || !values.length) return 0;
-  if (h <= timeH[0]) return values[0];
-  if (h >= timeH[timeH.length - 1]) return values[values.length - 1];
-  let lo = 0, hi = timeH.length - 1;
-  while (hi - lo > 1) {
-    const mid = (lo + hi) >> 1;
-    if (timeH[mid] <= h) lo = mid; else hi = mid;
-  }
-  const frac = (timeH[hi] - timeH[lo]) > 0
-    ? (h - timeH[lo]) / (timeH[hi] - timeH[lo])
-    : 0;
-  const v = values[lo] + frac * (values[hi] - values[lo]);
-  return isFinite(v) ? v : 0;
-}
 
 const OverviewView: React.FC<OverviewViewProps> = ({
   events,
@@ -222,6 +208,9 @@ const OverviewView: React.FC<OverviewViewProps> = ({
   const h = currentTime.getTime() / 3600000;
 
   const hasPersonalModel = !!simCI && simCI.e2Adjusted.length > 0;
+  // Causal personal curves change state at lab times: never interpolate across one.
+  const interpCI = (values: number[], at: number): number =>
+    interpolateNoCross(simCI!.timeH, values, at, simCI!.updateTimesH ?? []) ?? NaN;
   const hasDoseHistory = events.length > 0;
 
   // The "primary" anti-androgen shown in the headline / side tile = the most
@@ -251,12 +240,12 @@ const OverviewView: React.FC<OverviewViewProps> = ({
     return null;
   }, [simCI, simulation]);
   const testosteroneNow = useMemo(
-    () => (tSource ? interpAt(tSource.timeH, tSource.series.values, h) : null),
+    () => (tSource ? interpolateTSeries(tSource.timeH, tSource.series, 'values', h) : null),
     [tSource, h]
   );
   const testosteroneRange = useMemo(() => {
     if (!tSource || testosteroneNow === null) return null;
-    const sd = interpAt(tSource.timeH, tSource.series.logSd, h);
+    const sd = interpolateTSeries(tSource.timeH, tSource.series, 'logSd', h) ?? 0;
     return { lo: testosteroneNow * Math.exp(-1.96 * sd), hi: testosteroneNow * Math.exp(1.96 * sd) };
   }, [tSource, testosteroneNow, h]);
 
@@ -286,7 +275,7 @@ const OverviewView: React.FC<OverviewViewProps> = ({
   // keeps showing personal-model intervals.
   const personalLevel = useMemo(() => {
     if (!hasPersonalModel) return null;
-    const v = interpAt(simCI!.timeH, simCI!.e2Adjusted, h);
+    const v = interpCI(simCI!.e2Adjusted, h);
     if (!Number.isFinite(v) || v <= 0) return null; // 无法估计 → fall back below
     return v >= PERSONAL_E2_CEILING_PGML ? { value: v, capped: true as const } : { value: v, capped: false as const };
   }, [hasPersonalModel, simCI, h]);
@@ -298,8 +287,8 @@ const OverviewView: React.FC<OverviewViewProps> = ({
 
   const currentCI = useMemo(() => {
     if (!hasPersonalModel) return null;
-    const lo = interpAt(simCI!.timeH, simCI!.ci95Low, h);
-    const hi = interpAt(simCI!.timeH, simCI!.ci95High, h);
+    const lo = interpCI(simCI!.ci95Low, h);
+    const hi = interpCI(simCI!.ci95High, h);
     if (lo > 0 && hi > 0 && hi > lo) return { lo, hi };
     return null;
   }, [hasPersonalModel, simCI, h]);
@@ -312,7 +301,7 @@ const OverviewView: React.FC<OverviewViewProps> = ({
 
   const personalAA = useMemo(() => {
     if (!hasPersonalAaModel || !aaCI || !primaryAASpec) return null;
-    const v = interpAt(simCI!.timeH, aaCI.adjusted, h);
+    const v = interpCI(aaCI.adjusted, h);
     return (v > 0 && v <= primaryAASpec.ciMaxNative) ? v : null;
   }, [hasPersonalAaModel, aaCI, primaryAASpec, simCI, h]);
 
@@ -324,8 +313,8 @@ const OverviewView: React.FC<OverviewViewProps> = ({
     if (aaCI.ci95Low.length !== simCI!.timeH.length || aaCI.ci95High.length !== simCI!.timeH.length) {
       return null;
     }
-    const lo = interpAt(simCI!.timeH, aaCI.ci95Low, h);
-    const hi = interpAt(simCI!.timeH, aaCI.ci95High, h);
+    const lo = interpCI(aaCI.ci95Low, h);
+    const hi = interpCI(aaCI.ci95High, h);
     if (lo > 0 && hi > 0 && hi > lo) return { lo, hi };
     return null;
   }, [hasPersonalAaModel, aaCI, simCI, h]);
@@ -333,8 +322,8 @@ const OverviewView: React.FC<OverviewViewProps> = ({
   const currentCI68 = useMemo(() => {
     if (!hasPersonalModel) return null;
     if (!simCI!.ci68Low?.length || simCI!.ci68Low.length !== simCI!.timeH.length) return null;
-    const lo = interpAt(simCI!.timeH, simCI!.ci68Low, h);
-    const hi = interpAt(simCI!.timeH, simCI!.ci68High, h);
+    const lo = interpCI(simCI!.ci68Low, h);
+    const hi = interpCI(simCI!.ci68High, h);
     if (lo > 0 && hi > 0 && hi > lo) return { lo, hi };
     return null;
   }, [hasPersonalModel, simCI, h]);
