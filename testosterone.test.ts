@@ -17,6 +17,7 @@ import {
     interpolateConcentration_E2,
     testosteroneGP,
     computeTestosteroneSeries,
+    interpolateNoCross,
     ENDOGENOUS_E2_RHO_MEAN,
     POSTERIOR_DRAWS,
 } from './pk';
@@ -363,5 +364,48 @@ describe('time & numerical consistency (review round 2)', () => {
             expect(worst).toBeLessThan(0.005);
             expect(res.couplingResidual).toBeLessThan(0.005);
         }
+    });
+});
+
+describe('E2 queries between several updates inside one grid step (review round 3)', () => {
+    it('interpolateNoCross never returns a value that includes a later update', () => {
+        // One grid step [0, 10] containing updates at 2 and 8; query at 5.
+        // The right endpoint (10) already includes the update at 8 > 5.
+        expect(interpolateNoCross([0, 10], [1, 3], 5, [2, 8])).toBe(1);
+        expect(interpolateNoCross([0, 10], [1, 3], 9, [2, 8])).toBe(3);
+        // Unrelated interval: plain interpolation.
+        expect(interpolateNoCross([0, 10], [1, 3], 5, [20])).toBeCloseTo(2, 12);
+    });
+
+    it('causal personal E2 between two labs in one step ignores the later lab', () => {
+        const events = weeklyEV(6);
+        // Place both labs inside ONE step of the default grid.
+        const grid = runSimulation(events, { endTimeH: 50 * DAY })!.timeH;
+        const i0 = grid.findIndex(t => t >= 20 * DAY);
+        const ta = grid[i0], dt = grid[i0 + 1] - grid[i0];
+        const l1: LabResult = { id: 'a', timeH: ta + 0.2 * dt, concValue: 120, unit: 'pg/ml' };
+        const l2: LabResult = { id: 'b', timeH: ta + 0.8 * dt, concValue: 900, unit: 'pg/ml' }; // far off → big shift
+        const q = ta + 0.5 * dt; // strictly between the two labs
+        const run = (labs: LabResult[]) => {
+            const sim = runSimulation(events, { breakpointsH: labs.map(l => l.timeH), endTimeH: 50 * DAY })!;
+            const st = replayPersonalModel(events, labs);
+            const ci = computeSimulationWithCI(sim, events, st, false, labs, 'ekf', false, 'causal');
+            return interpolateNoCross(ci.timeH, ci.e2Adjusted, q, ci.updateTimesH)!;
+        };
+        const both = run([l1, l2]);
+        const onlyFirst = run([l1]);
+        expect(both / onlyFirst).toBeCloseTo(1, 4);
+    });
+
+    it('breakpoints put each update and the instant before it on the grid', () => {
+        const events = weeklyEV(4);
+        const u = 10 * DAY + 0.37;
+        const sim = runSimulation(events, { breakpointsH: [u] })!;
+        expect(sim.timeH).toContain(u);
+        expect(sim.timeH.some(t => t < u && u - t <= 0.01)).toBe(true);
+        // Grid stays strictly increasing and the AUC uses the real step widths.
+        for (let i = 1; i < sim.timeH.length; i++) expect(sim.timeH[i]).toBeGreaterThan(sim.timeH[i - 1]);
+        const plain = runSimulation(events)!;
+        expect(sim.auc / plain.auc).toBeCloseTo(1, 3);
     });
 });

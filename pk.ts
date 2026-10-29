@@ -1850,7 +1850,17 @@ export function weightAtTimeH(sortedEvents: DoseEvent[], t: number): number {
  */
 export function runSimulation(
     events: DoseEvent[],
-    opts?: { endTimeH?: number; testosterone?: TestosteroneModelOptions | null }
+    opts?: {
+        endTimeH?: number;
+        testosterone?: TestosteroneModelOptions | null;
+        /**
+         * Calibration update times (E2 and T lab times). Each one and the instant
+         * just before it (BREAKPOINT_EPS_H earlier) are added to the grid, so the
+         * personalised curves are evaluated exactly on both sides of every update
+         * and no grid step ever contains an update strictly inside it.
+         */
+        breakpointsH?: number[];
+    }
 ): SimulationResult | null {
     if (events.length === 0) return null;
 
@@ -1891,9 +1901,23 @@ export function runSimulation(
     let auc = 0;
 
     const stepSize = (endTime - startTime) / (steps - 1);
+    const gridTimes: number[] = [];
+    for (let i = 0; i < steps; i++) gridTimes.push(startTime + i * stepSize);
+    const extra = (opts?.breakpointsH ?? [])
+        .filter(u => Number.isFinite(u) && u > startTime && u <= endTime)
+        .flatMap(u => [u - BREAKPOINT_EPS_H, u]);
+    if (extra.length > 0) {
+        gridTimes.push(...extra);
+        gridTimes.sort((a, b) => a - b);
+        // Drop near-duplicates (keep the exact breakpoint over a coincident grid point).
+        const exact = new Set(extra);
+        for (let i = gridTimes.length - 1; i > 0; i--) {
+            if (gridTimes[i] - gridTimes[i - 1] < 1e-9) gridTimes.splice(exact.has(gridTimes[i]) ? i - 1 : i, 1);
+        }
+    }
 
-    for (let i = 0; i < steps; i++) {
-        const t = startTime + i * stepSize;
+    for (let i = 0; i < gridTimes.length; i++) {
+        const t = gridTimes[i];
         let totalAmountMG_E2 = 0;
         const amountByCompound: Partial<Record<Ester, number>> = {};
 
@@ -1930,7 +1954,7 @@ export function runSimulation(
         concPGmL_CPA.push(currentConc_CPA);
 
         if (i > 0) {
-            auc += 0.5 * (currentConc + concPGmL[i - 1]) * stepSize;
+            auc += 0.5 * (currentConc + concPGmL[i - 1]) * (t - timeH[i - 1]);
         }
     }
 
@@ -1980,6 +2004,9 @@ function interpolateSeries(
     return c0 + (c1 - c0) * ratio;
 }
 
+/** Offset of the "just before the update" grid point added for each breakpoint (h ≈ 3.6 s). */
+export const BREAKPOINT_EPS_H = 0.001;
+
 /**
  * Linear interpolation that never mixes the states on both sides of a
  * calibration update: when an update time lies between the two bracketing grid
@@ -1994,9 +2021,18 @@ export function interpolateNoCross(timeH: number[], values: number[], hour: numb
     if (hour >= timeH[n - 1]) return values[n - 1];
     let a = 0, b = n - 1;
     while (b - a > 1) { const m = (a + b) >> 1; if (timeH[m] <= hour) a = m; else b = m; }
+    let earlier = false, later = false;
     for (const u of updateTimesH) {
-        if (u > timeH[a] && u <= timeH[b]) return u <= hour ? values[b] : values[a];
+        if (u > timeH[a] && u <= hour) earlier = true;
+        if (u > hour && u <= timeH[b]) later = true;
     }
+    // The right endpoint already contains an update after `hour` → never use it
+    // (holds the last state known at `hour`; with breakpoints on the grid this
+    // only happens within BREAKPOINT_EPS_H of the update).
+    if (later) return values[a];
+    // An update between the left endpoint and `hour`: the left value predates
+    // it, the right one is in the same state as `hour`.
+    if (earlier) return values[b];
     const t0 = timeH[a], t1 = timeH[b];
     return t1 === t0 ? values[a] : values[a] + (values[b] - values[a]) * (hour - t0) / (t1 - t0);
 }

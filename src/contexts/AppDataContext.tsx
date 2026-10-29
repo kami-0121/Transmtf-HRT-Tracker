@@ -250,6 +250,14 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
             .filter((o): o is { timeH: number; ngdL: number } => o !== null)
             .sort((a, b) => a.timeH - b.timeH)
     ), [bloodReports]);
+    // Every calibration update time (E2 and T labs) goes onto the simulation grid
+    // with the instant before it, so causal personal curves are exact on both
+    // sides of each update (runSimulation breakpointsH).
+    const breakpointsKey = useMemo(() => JSON.stringify(
+        [...new Set([...labResults.map(l => l.timeH), ...JSON.parse(tObservationsKey).map((o: { timeH: number }) => o.timeH)])]
+            .filter((t: number) => Number.isFinite(t))
+            .sort((a: number, b: number) => a - b)
+    ), [labResults, tObservationsKey]);
     // Stable options object so the compute effects only re-run on real changes.
     const testosteroneOpts = useMemo<TestosteroneModelOptions | null>(
         () => testosteroneModelEnabled
@@ -594,7 +602,7 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
     // below skips the worker call while the stored grid already covers
     // now + buffer, so a quiet history triggers at most ~one recompute per day
     // (when the buffer is about to be exceeded), not one per minute.
-    const simulationForRef = useRef<{ events: DoseEvent[]; gelProducts: GelProductSpec[]; testosterone: TestosteroneModelOptions | null } | null>(null);
+    const simulationForRef = useRef<{ events: DoseEvent[]; gelProducts: GelProductSpec[]; testosterone: TestosteroneModelOptions | null; breakpointsKey: string } | null>(null);
     useEffect(() => {
         if (events.length === 0) {
             // Bump the sequence BEFORE cancelling: pkWorker.cancel rejects the
@@ -614,7 +622,8 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
             : -Infinity;
         const fresh = simulationForRef.current?.events === events
             && simulationForRef.current?.gelProducts === gelProducts
-            && simulationForRef.current?.testosterone === testosteroneOpts;
+            && simulationForRef.current?.testosterone === testosteroneOpts
+            && simulationForRef.current?.breakpointsKey === breakpointsKey;
         // F03 final-review fix: skip while the stored grid still covers "now"
         // with a healthy buffer (>= 12h). Comparing endTimeH (= now + 24h)
         // against the grid end directly would recompute EVERY minute, because
@@ -624,14 +633,14 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         const seq = ++simulationSeqRef.current;
         setCustomGelProducts(gelProducts);
         pkWorker.cancel('simulation');
-        trackCompute(pkWorker.run('simulation', { events, gelProducts, endTimeH, testosterone: testosteroneOpts }))
+        trackCompute(pkWorker.run('simulation', { events, gelProducts, endTimeH, testosterone: testosteroneOpts, breakpointsH: JSON.parse(breakpointsKey) }))
             .then(res => {
                 if (seq !== simulationSeqRef.current) return;
-                simulationForRef.current = { events, gelProducts, testosterone: testosteroneOpts };
+                simulationForRef.current = { events, gelProducts, testosterone: testosteroneOpts, breakpointsKey };
                 setSimulation(res);
             })
             .catch(handleComputeError);
-    }, [events, gelProducts, currentTime, simulation, testosteroneOpts]);
+    }, [events, gelProducts, currentTime, simulation, testosteroneOpts, breakpointsKey]);
 
     // Rebuild personal model whenever events, labResults, or the custom-gel
     // registry change (gel calibration resolves kinetics from the registry).

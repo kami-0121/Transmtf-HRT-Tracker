@@ -21,7 +21,11 @@ export function computePK(request: PKWorkerRequest): PKWorkerResponse {
         switch (request.type) {
             case 'simulation': {
                 if (request.gelProducts) setCustomGelProducts(request.gelProducts);
-                const simulation = runSimulation(request.events, { endTimeH: request.endTimeH, testosterone: request.testosterone });
+                const simulation = runSimulation(request.events, {
+                    endTimeH: request.endTimeH,
+                    testosterone: request.testosterone,
+                    breakpointsH: request.breakpointsH,
+                });
                 return { type: 'simulation', id, simulation };
             }
             case 'personalModel': {
@@ -32,7 +36,11 @@ export function computePK(request: PKWorkerRequest): PKWorkerResponse {
                 let endo;
                 if (request.testosterone && events.length > 0) {
                     const lastLabH = labResults.reduce((m, l) => Math.max(m, l.timeH), -Infinity);
-                    const sim = runSimulation(events, { endTimeH: lastLabH + 1, testosterone: request.testosterone });
+                    const sim = runSimulation(events, {
+                        endTimeH: lastLabH + 1,
+                        testosterone: request.testosterone,
+                        breakpointsH: [...labResults.map(l => l.timeH), ...(request.testosterone.observations ?? []).map(o => o.timeH)],
+                    });
                     endo = makeEndogenousE2Context(sim);
                 }
                 // Replay EKF from the prior using all sorted lab results.

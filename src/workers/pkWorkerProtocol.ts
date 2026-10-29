@@ -31,6 +31,8 @@ export type PKWorkerRequest =
         endTimeH?: number;
         /** Endogenous testosterone model options; null/absent = model off. */
         testosterone?: TestosteroneModelOptions | null;
+        /** Lab (calibration update) times to put on the grid, both sides exact. */
+        breakpointsH?: number[];
     }
     | {
         type: 'personalModel';
