@@ -30,6 +30,7 @@ import type { Regimen } from '../utils/regimens';
 
 import { decryptData } from '../../logic';
 import { computeDataHash } from '../utils/dataHash';
+import { CLOUD_ENABLED } from '../api/config';
 import { readBloodReports, sanitizeBloodReports, BLOOD_REPORTS_KEY } from '../utils/bloodTests';
 import { readRegimens, sanitizeRegimens, REGIMENS_KEY } from '../utils/regimens';
 import { writeCustomGelProducts } from '../utils/doseForm';
@@ -492,7 +493,12 @@ const SettingsPage: React.FC = () => {
                     <h2 className={sectionTitleClass} style={{ color: 'var(--text-tertiary)' }}>
                         {t('settings.group.account')}
                     </h2>
-                    <Account embedded />
+                    {CLOUD_ENABLED ? <Account embedded /> : (
+                        <div className="rounded-2xl glass-card p-5 space-y-1">
+                            <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>{t('settings.local_mode')}</p>
+                            <p className="text-xs leading-relaxed" style={{ color: 'var(--text-secondary)' }}>{t('settings.local_mode_desc')}</p>
+                        </div>
+                    )}
                 </section>
 
                 {/* Medication: regimens + custom gels */}
@@ -727,7 +733,7 @@ const SettingsPage: React.FC = () => {
                             </div>
                         </button>
 
-                        <button
+                        {CLOUD_ENABLED && <button
                             onClick={() => setIsStatisticsOpen(true)}
                             className="flex w-full items-center gap-3 px-4 py-4 text-left transition btn-press-glass"
                             style={{ color: 'var(--text-primary)' }}
@@ -739,7 +745,7 @@ const SettingsPage: React.FC = () => {
                                 <p className="text-sm font-bold">{t('statistics.title')}</p>
                                 <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>{t('statistics.desc')}</p>
                             </div>
-                        </button>
+                        </button>}
 
                         <button
                             onClick={() => setIsDisclaimerOpen(true)}

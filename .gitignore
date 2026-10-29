@@ -31,3 +31,7 @@ src-tauri/target/release
 .env
 .env.*
 !.env.example
+
+# Wrangler local state
+.wrangler
+.dev.vars

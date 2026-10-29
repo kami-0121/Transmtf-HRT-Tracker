@@ -4,8 +4,10 @@ import { useAuth } from './AuthContext';
 import { useSecurityPassword } from './SecurityPasswordContext';
 import { computeDataHash, projectForSync, resolveThemeMode, SYNC_HASH_SCHEMA } from '../utils/dataHash';
 import { classifyChanges } from '../utils/syncDecision';
+import { mergeSnapshots, pickMergeFields } from '../utils/syncMerge';
 import { DEFAULT_WEIGHT_KG } from '../utils/weight';
 import { isLogoutInProgress } from '../utils/authSessionState';
+import { CLOUD_BACKEND } from '../api/config';
 import type { ConflictState, FieldDiff } from '../components/SyncConflictModal';
 
 interface CloudSyncContextType {
@@ -14,6 +16,8 @@ interface CloudSyncContextType {
   syncError: string | null;
   pendingConflict: ConflictState | null;
   resolveConflict: (resolution: 'local' | 'cloud' | 'merge', mergedData?: Record<string, any>) => void;
+  /** Sync immediately (manual "back up now"). */
+  syncNow: () => void;
 }
 
 const CloudSyncContext = createContext<CloudSyncContextType | undefined>(undefined);
@@ -23,18 +27,66 @@ const LAST_PULL_TIME_KEY = 'hrt-last-pull-time';
 const LAST_DATA_UPDATED_KEY = 'hrt-last-data-updated';
 const LAST_KNOWN_CLOUD_UPDATED_KEY = 'hrt-last-known-cloud-updated';
 const LAST_KNOWN_CLOUD_HASH_KEY = 'hrt-last-known-cloud-hash';
-const SYNC_INTERVAL = 3000; // 3 seconds
-const PULL_CHECK_INTERVAL = 3000; // 3 seconds
+// The synced fields of the baseline itself, for the three-way merge
+// (utils/syncMerge.ts), tagged with the baseline hash it belongs to.
+const SYNC_BASE_KEY = 'hrt-sync-base';
+// Slow, event-driven sync (local storage is the primary copy; the cloud is a
+// backup). No fast polling: each sync is one GET (+ one PUT when local changed).
+//  - local edit        → push after PUSH_DEBOUNCE_MS of quiet (≤ PUSH_MAX_WAIT_MS)
+//  - app hidden        → flush a pending push right away
+//  - app shown / PWA resumed / back online → pull if the last pull is older
+//                        than RESUME_PULL_MIN_MS
+//  - while visible     → pull every PULL_INTERVAL_MS
+const PULL_INTERVAL_MS = 15 * 60 * 1000;
+const RESUME_PULL_MIN_MS = 60 * 1000;
+const PUSH_DEBOUNCE_MS = 8 * 1000;
+const PUSH_MAX_WAIT_MS = 60 * 1000;
+const SCHEDULER_TICK_MS = 60 * 1000;
+// Failed syncs (offline, 429, 5xx) retry on their own with exponential backoff
+// (30 s, 1 min, 2 min, … up to 15 min); going online or reopening the app
+// retries sooner. A 409 rerun is bounded per run.
+const RETRY_BASE_MS = 30 * 1000;
+const RETRY_MAX_MS = 15 * 60 * 1000;
+const MAX_RERUNS_PER_RUN = 5;
+const SYNC_LOCK_NAME = 'hrt-cloud-sync';
+const isRetryable = (status: number) => status === 0 || status === 429 || status >= 500;
+/** Window event other modules dispatch to request a sync (e.g. ownership resolved). */
+export const SYNC_REQUEST_EVENT = 'hrt-sync-request';
 
 // Record the cloud baseline = the cloud state we last successfully synced with.
 // This lets us distinguish "local-only changes since baseline" (safe to push) from
 // "cloud changed under us while we also changed locally" (real conflict).
-function setCloudBaseline(cloudUpdated: string | null | undefined, cloudHash: string) {
+function setCloudBaseline(cloudUpdated: string | null | undefined, cloudHash: string, data: Record<string, any>, revision?: number) {
   if (cloudUpdated) {
     localStorage.setItem(LAST_KNOWN_CLOUD_UPDATED_KEY, cloudUpdated);
   }
   localStorage.setItem(LAST_KNOWN_CLOUD_HASH_KEY, cloudHash);
+  try {
+    localStorage.setItem(SYNC_BASE_KEY, JSON.stringify({ hash: cloudHash, data: pickMergeFields(data), revision }));
+  } catch {
+    // Quota: without a base the next divergence falls back to the conflict dialog.
+    localStorage.removeItem(SYNC_BASE_KEY);
+  }
 }
+
+function readStoredBase(): { data: Record<string, any>; revision?: number } | null {
+  try {
+    const stored = JSON.parse(localStorage.getItem(SYNC_BASE_KEY) || 'null');
+    const hash = localStorage.getItem(LAST_KNOWN_CLOUD_HASH_KEY);
+    return stored && hash && stored.hash === hash && stored.data ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The baseline's data, only if it still belongs to the current baseline hash. */
+const readSyncBase = (): Record<string, any> | null => readStoredBase()?.data ?? null;
+
+/** Server revision the baseline corresponds to (D1 backend), if known. */
+const readSyncBaseRevision = (): number | undefined => {
+  const revision = readStoredBase()?.revision;
+  return typeof revision === 'number' ? revision : undefined;
+};
 
 // Deep-equal for comparing field values (handles arrays, objects, primitives)
 function deepEqual(a: any, b: any): boolean {
@@ -102,7 +154,18 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setPendingConflict(next);
   }, []);
 
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  // Slow-sync scheduler state.
+  const syncRunningRef = useRef(false);
+  const syncRerunRef = useRef(false);
+  // Status of the last failed request in the current run (0 = network), for
+  // the backoff retry; null when the run did not fail.
+  const failureStatusRef = useRef<number | null>(null);
+  const retryAttemptRef = useRef(0);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Revision of the cloud copy fetched by the current sync (baseline tagging).
+  const pulledRevisionRef = useRef<number | undefined>(undefined);
+  const pushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pushFirstRequestRef = useRef<number | null>(null);
   const isSyncingRef = useRef(false);
   const conflictPendingRef = useRef(false);
   // Live view of the authed account so post-await checks in async callbacks
@@ -126,6 +189,13 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     if (isSyncingRef.current) return false;
     return true;
   }, [isAuthenticated, hasSecurityPassword, isVerified, securityPassword, passwordVerificationFailed]);
+
+  // Offline / busy get a friendly message and an automatic retry (runSync).
+  const reportFailure = useCallback((status: number | undefined, error: string | undefined) => {
+    const code = status ?? 0;
+    failureStatusRef.current = code;
+    setSyncError(code === 0 ? 'sync.offline' : code === 429 || code >= 500 ? 'sync.busy' : (error || 'Sync failed'));
+  }, []);
 
   // ── getLocalDataSnapshot ──
   const getLocalDataSnapshot = useCallback(() => {
@@ -229,7 +299,7 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     regimens?: any[];
     lastModified: string;
     lastDataUpdated?: string | null;
-  }) => {
+  }, baseRevision?: number) => {
     // F02: stamp results only if the session that issued the push is still
     // current when the response arrives.
     const generation = getSessionGeneration();
@@ -240,6 +310,8 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         lastDataUpdated: localData.lastDataUpdated || localData.lastModified,
       },
       password: hasSecurityPassword ? securityPassword : undefined,
+      // Omitted for an explicit "keep this device's copy" (conflict dialog).
+      base_revision: baseRevision,
     });
 
     if (getSessionGeneration() !== generation) {
@@ -274,7 +346,8 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
       // After a successful push, the cloud's state == what we just uploaded,
       // so record it as the new baseline.
-      setCloudBaseline(localData.lastDataUpdated || localData.lastModified, dataHash);
+      setCloudBaseline(localData.lastDataUpdated || localData.lastModified, dataHash, localData,
+        response.data?.revision);
       // The local data now matches THIS account's cloud copy (blocker 1).
       if (userRef.current?.username) {
         localStorage.setItem('hrt-data-owner', userRef.current.username);
@@ -282,14 +355,19 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return true;
     }
 
-    setSyncError(response.error || 'Failed to sync to cloud');
+    if (response.status === 409) {
+      // Another device uploaded since our pull: pull again and merge.
+      syncRerunRef.current = true;
+      return false;
+    }
+    reportFailure(response.status, response.error || 'Failed to sync to cloud');
     return false;
-  }, [hasSecurityPassword, securityPassword, getSessionGeneration]);
+  }, [hasSecurityPassword, securityPassword, getSessionGeneration, reportFailure]);
 
   const shouldPullFromCloud = useCallback(() => {
     const lastPull = localStorage.getItem(LAST_PULL_TIME_KEY);
     if (!lastPull) return true;
-    return Date.now() - new Date(lastPull).getTime() >= SYNC_INTERVAL;
+    return Date.now() - new Date(lastPull).getTime() >= PULL_INTERVAL_MS;
   }, []);
 
   // Load last sync time from localStorage
@@ -310,7 +388,9 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, [isAuthenticated, user?.username, updatePendingConflict]);
 
   // ── apply cloud data to local ──
-  const applyCloudToLocal = useCallback((data: any, localData: Record<string, any>, fallbackTimestamp?: string) => {
+  // setBaseline=false: the written data is NOT what the cloud holds (local
+  // edits on top of an uploaded merge), so the baseline stays as the upload set it.
+  const applyCloudToLocal = useCallback((data: any, localData: Record<string, any>, fallbackTimestamp?: string, setBaseline = true) => {
     const resolvedLang = data?.lang || localData.lang;
     if (data?.events) localStorage.setItem('hrt-events', JSON.stringify(data.events));
     if (data?.weight !== undefined) localStorage.setItem('hrt-weight', data.weight.toString());
@@ -366,7 +446,7 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     localStorage.setItem('hrt-data-hash', dataHash);
     // After applying cloud data locally, our local state == cloud state,
     // so the cloud version we just pulled becomes the new baseline.
-    setCloudBaseline(data?.lastDataUpdated || fallbackTimestamp || null, dataHash);
+    if (setBaseline) setCloudBaseline(data?.lastDataUpdated || fallbackTimestamp || null, dataHash, data ?? {}, pulledRevisionRef.current);
     // The local data now matches THIS account's cloud copy (blocker 1).
     if (userRef.current?.username) {
       localStorage.setItem('hrt-data-owner', userRef.current.username);
@@ -427,6 +507,32 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setSyncError(null);
 
     try {
+      // ⓪ D1 backend: ask only for the revision first (no PIN, no download).
+      //    Unchanged since our baseline → nothing to pull; a local edit is
+      //    uploaded straight away, based on that revision.
+      const knownRevision = CLOUD_BACKEND === 'd1' ? readSyncBaseRevision() : undefined;
+      if (knownRevision !== undefined) {
+        const probe = await apiClient.getUserDataRevision();
+        if (getSessionGeneration() !== generation || (userRef.current?.username ?? null) !== username) return;
+        if (!probe.success || !probe.data) {
+          reportFailure(probe.status, probe.error || 'Failed to check cloud data');
+          return;
+        }
+        if (probe.data.revision === knownRevision) {
+          const local = getLocalDataSnapshot();
+          if (local.dataHash !== localStorage.getItem(LAST_KNOWN_CLOUD_HASH_KEY)) {
+            const stamp = new Date().toISOString();
+            const pushed = await pushLocalDataToCloud({ ...local, lastModified: local.lastModified || stamp }, knownRevision);
+            if (!pushed || getSessionGeneration() !== generation || (userRef.current?.username ?? null) !== username) return;
+          }
+          const now = new Date();
+          setLastSyncTime(now);
+          localStorage.setItem(LAST_SYNC_TIME_KEY, now.toISOString());
+          localStorage.setItem(LAST_PULL_TIME_KEY, now.toISOString());
+          return;
+        }
+      }
+
       // ① Pull cloud data
       const response = await apiClient.getUserData({
         password: hasSecurityPassword ? securityPassword : undefined,
@@ -445,8 +551,12 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       // F02 re-review: after ANY awaited push, stop dead if the session changed
       // — otherwise the stamp/baseline lines after the push would still run
       // for a sync whose session is over.
+      // Uploads in this sync name the revision just pulled: if another device
+      // uploads in between, the server refuses (409) and the sync reruns.
+      const cloudRevision = typeof response.data?.revision === 'number' ? response.data.revision : undefined;
+      pulledRevisionRef.current = cloudRevision;
       const pushAndStayCurrent = async (data: Parameters<typeof pushLocalDataToCloud>[0]): Promise<boolean> => {
-        const pushed = await pushLocalDataToCloud(data);
+        const pushed = await pushLocalDataToCloud(data, cloudRevision);
         // Final-review fix: the remote must explicitly confirm the upload
         // before we stamp sync time — a failed push returns false here so the
         // stamp lines after each call site are skipped.
@@ -458,7 +568,7 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         // and pushing blindly would set a stale baseline. The next 3-second poll
         // will retry once the network/auth recovers. Local changes remain in
         // localStorage and will be pushed on the next successful sync.
-        setSyncError(response.error || 'Failed to fetch cloud data');
+        reportFailure(response.status, response.error || 'Failed to fetch cloud data');
         return;
       }
 
@@ -504,7 +614,7 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           if (!(await pushAndStayCurrent({ ...localData, lastModified: localData.lastModified || now.toISOString() }))) return;
         }
         // Local == cloud, refresh baseline so future pushes don't trip false conflicts
-        setCloudBaseline(cloudData.lastDataUpdated || localData.lastDataUpdated || null, cloudHash);
+        setCloudBaseline(cloudData.lastDataUpdated || localData.lastDataUpdated || null, cloudHash, cloudData, cloudRevision);
         setLastSyncTime(now);
         localStorage.setItem(LAST_SYNC_TIME_KEY, now.toISOString());
         localStorage.setItem(LAST_PULL_TIME_KEY, now.toISOString());
@@ -576,9 +686,39 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
 
       if (cloudChangedSinceBaseline && localChangedSinceBaseline) {
-        // Both sides diverged from the shared baseline → genuine conflict.
-        // Never fall through to timestamp-based auto-resolution here — that would
-        // silently overwrite one side's changes. Always prompt the user.
+        // Both sides diverged from the shared baseline. With the baseline's own
+        // data at hand, merge record by record (utils/syncMerge.ts): additions,
+        // edits and deletions from both devices are kept, and only the same
+        // field edited on both sides is decided (for this device). Upload the
+        // merge first; only once the server accepted it, write it locally.
+        const base = readSyncBase();
+        if (base) {
+          const stamp = now.toISOString();
+          const merged = {
+            ...localData,
+            ...mergeSnapshots(base, localData, cloudData),
+            lastModified: stamp,
+            lastDataUpdated: stamp,
+          };
+          if (!(await pushAndStayCurrent(merged))) return;
+          // Edits made on this device while the upload was in flight are kept
+          // on top of the merge and go out with the next sync.
+          const latest = getLocalDataSnapshot();
+          const editedMeanwhile = latest.dataHash !== localData.dataHash;
+          applyCloudToLocal(
+            editedMeanwhile ? { ...merged, ...mergeSnapshots(localData, latest, merged) } : merged,
+            latest,
+            undefined,
+            !editedMeanwhile,
+          );
+          if (editedMeanwhile) syncRerunRef.current = true;
+          setLastSyncTime(now);
+          localStorage.setItem(LAST_SYNC_TIME_KEY, now.toISOString());
+          localStorage.setItem(LAST_PULL_TIME_KEY, now.toISOString());
+          return;
+        }
+        // No usable baseline data (first sync after an upgrade, storage
+        // quota): never auto-resolve by timestamp, ask the user.
         const diffs = computeFieldDiffs(localData, cloudData);
         if (diffs.length > 0) {
           conflictPendingRef.current = true;
@@ -625,12 +765,12 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       localStorage.setItem(LAST_PULL_TIME_KEY, now.toISOString());
     } catch (error) {
       console.error('Sync error:', error);
-      setSyncError(error instanceof Error ? error.message : 'Sync failed');
+      reportFailure(0, error instanceof Error ? error.message : 'Sync failed');
     } finally {
       isSyncingRef.current = false;
       setIsSyncing(false);
     }
-  }, [canSync, hasSecurityPassword, securityPassword, getLocalDataSnapshot, pushLocalDataToCloud, applyCloudToLocal, getSessionGeneration, updatePendingConflict]);
+  }, [canSync, hasSecurityPassword, securityPassword, getLocalDataSnapshot, pushLocalDataToCloud, applyCloudToLocal, getSessionGeneration, updatePendingConflict, reportFailure]);
 
   // ── Resolve conflict ──
   const resolveConflict = useCallback(async (
@@ -758,45 +898,125 @@ export const CloudSyncProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
   }, [pushLocalDataToCloud, applyCloudToLocal, getLocalDataSnapshot, getSessionGeneration, updatePendingConflict, restoreLocalDataFromSnapshot]);
 
-  // ── Watch for local data changes → trigger unified sync ──
+  // ── Slow-sync scheduler ──
+  // Serialises syncs: a request arriving while one runs is not dropped — it
+  // triggers exactly one more run afterwards (performSync itself bails out
+  // while another sync is in flight).
+  //
+  // Across tabs/windows of the app, a Web Lock lets only one sync run at a
+  // time (as AtDo's outbox does), so two tabs never race each other's upload.
+  const runSyncRef = useRef<() => void>(() => {});
+  const runSync = useCallback(async () => {
+    if (syncRunningRef.current) { syncRerunRef.current = true; return; }
+    syncRunningRef.current = true;
+    if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    retryTimerRef.current = null;
+    try {
+      const body = async () => {
+        let runs = 0;
+        do {
+          syncRerunRef.current = false;
+          failureStatusRef.current = null;
+          await performSync();
+        } while (syncRerunRef.current && ++runs < MAX_RERUNS_PER_RUN);
+      };
+      const locks = (navigator as Navigator & { locks?: LockManager }).locks;
+      if (locks) await locks.request(SYNC_LOCK_NAME, body);
+      else await body();
+    } finally {
+      syncRunningRef.current = false;
+    }
+    const failed = failureStatusRef.current;
+    if (failed !== null && isRetryable(failed) && isAuthenticated && !isLogoutInProgress()) {
+      const delay = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** retryAttemptRef.current);
+      retryAttemptRef.current += 1;
+      retryTimerRef.current = setTimeout(() => runSyncRef.current(), delay);
+    } else if (failed === null) {
+      retryAttemptRef.current = 0;
+    }
+  }, [performSync, isAuthenticated]);
+  runSyncRef.current = runSync;
+
+  const flushPush = useCallback(() => {
+    if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
+    pushTimerRef.current = null;
+    pushFirstRequestRef.current = null;
+    runSync();
+  }, [runSync]);
+
+  // Debounced push: coalesce bursts of edits into one upload.
+  const schedulePush = useCallback(() => {
+    const now = Date.now();
+    if (pushFirstRequestRef.current === null) pushFirstRequestRef.current = now;
+    if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
+    const waited = now - pushFirstRequestRef.current;
+    const delay = Math.max(0, Math.min(PUSH_DEBOUNCE_MS, PUSH_MAX_WAIT_MS - waited));
+    pushTimerRef.current = setTimeout(flushPush, delay);
+  }, [flushPush]);
+
+  const syncNow = useCallback(() => { flushPush(); }, [flushPush]);
+
   useEffect(() => {
     if (!isAuthenticated || isLogoutInProgress()) return;
 
-    const handleStorageChange = (e: StorageEvent) => {
+    const onLocalUpdate = () => schedulePush();
+    // Another tab changed synced storage: that tab syncs its own edit; we only
+    // need a (debounced) check so this tab's baseline stays current.
+    const onStorage = (e: StorageEvent) => {
       if (e.storageArea !== localStorage) return;
       const syncKeys = ['hrt-events', 'hrt-weight', 'hrt-lab-results', 'hrt-lang', 'hrt-calibration-model', 'hrt-calibration-mode', 'hrt-apply-e2-learning-to-cpa', 'hrt-apply-cpa-inhibition-to-e2', 'hrt-theme-color', 'hrt-theme-mode', 'hrt-dark-mode', 'hrt-gel-products', 'hrt-blood-reports', 'hrt-regimens'];
-      if (e.key && syncKeys.includes(e.key)) performSync();
+      if (e.key && syncKeys.includes(e.key)) schedulePush();
     };
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        // Leaving / backgrounding the app (incl. an installed PWA): upload now.
+        if (pushTimerRef.current) flushPush();
+      } else {
+        // Shown again / PWA resumed: pull if it has been a while.
+        const lastPull = localStorage.getItem(LAST_PULL_TIME_KEY);
+        if (!lastPull || Date.now() - new Date(lastPull).getTime() >= RESUME_PULL_MIN_MS) runSync();
+      }
+    };
+    const onOnline = () => { retryAttemptRef.current = 0; runSync(); };
+    const onRequest = () => flushPush();
 
-    const handleLocalUpdate = () => performSync();
+    window.addEventListener('hrt-local-data-updated', onLocalUpdate as EventListener);
+    window.addEventListener('storage', onStorage);
+    window.addEventListener('online', onOnline);
+    window.addEventListener(SYNC_REQUEST_EVENT, onRequest);
+    document.addEventListener('visibilitychange', onVisibility);
 
-    window.addEventListener('storage', handleStorageChange);
-    window.addEventListener('hrt-local-data-updated', handleLocalUpdate as EventListener);
+    // Initial sync on mount / auth change, then a slow periodic pull while visible.
+    runSync();
+    const tick = setInterval(() => {
+      if (document.visibilityState === 'visible' && shouldPullFromCloud()) runSync();
+    }, SCHEDULER_TICK_MS);
+
     return () => {
-      window.removeEventListener('storage', handleStorageChange);
-      window.removeEventListener('hrt-local-data-updated', handleLocalUpdate as EventListener);
+      window.removeEventListener('hrt-local-data-updated', onLocalUpdate as EventListener);
+      window.removeEventListener('storage', onStorage);
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener(SYNC_REQUEST_EVENT, onRequest);
+      document.removeEventListener('visibilitychange', onVisibility);
+      clearInterval(tick);
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+      retryAttemptRef.current = 0;
+      if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
+      pushTimerRef.current = null;
+      pushFirstRequestRef.current = null;
     };
-  }, [isAuthenticated, performSync]);
+  }, [isAuthenticated, runSync, schedulePush, flushPush, shouldPullFromCloud]);
 
-  // ── Periodic poll + initial sync ──
+  // Sync becomes possible later (security PIN verified): run once then —
+  // the old 3-second poll used to cover this implicitly.
   useEffect(() => {
-    if (!isAuthenticated || isLogoutInProgress()) return;
-
-    // Initial sync on mount / auth change
-    performSync();
-
-    pollIntervalRef.current = setInterval(() => {
-      if (shouldPullFromCloud()) performSync();
-    }, PULL_CHECK_INTERVAL);
-
-    return () => {
-      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-    };
-  }, [isAuthenticated, performSync, shouldPullFromCloud]);
+    if (isAuthenticated && hasSecurityPassword && isVerified && securityPassword) runSync();
+  }, [isAuthenticated, hasSecurityPassword, isVerified, securityPassword, runSync]);
 
   return (
     <CloudSyncContext.Provider
-      value={{ isSyncing, lastSyncTime, syncError, pendingConflict, resolveConflict }}
+      value={{ isSyncing, lastSyncTime, syncError, pendingConflict, resolveConflict, syncNow }}
     >
       {children}
     </CloudSyncContext.Provider>

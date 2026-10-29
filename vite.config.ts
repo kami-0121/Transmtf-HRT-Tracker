@@ -41,6 +41,9 @@ export default defineConfig(({ mode }) => {
           workbox: {
             // Tailwind CSS is built locally (tailwind.config.js + postcss.config.js);
             // the old third-party CDN runtime cache was removed with the CDN script.
+            // The cloud-backup API lives on the same origin: never answer it from
+            // the app shell / cache.
+            navigateFallbackDenylist: [/^\/api\//],
           }
         })
       ],

@@ -11,7 +11,8 @@
     "test:watch": "vitest",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "deploy": "npm test && npm run build && npx wrangler deploy"
   },
   "dependencies": {
     "@types/uuid": "^10.0.0",

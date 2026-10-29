@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { useCloudSync } from '../contexts/CloudSyncContext';
@@ -17,15 +17,27 @@ import {
   Link2,
 } from 'lucide-react';
 import apiClient from '../api/client';
+import { CLOUD_BACKEND } from '../api/config';
 
 const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
   const { user, logout, isAuthenticated } = useAuth();
-  const { isSyncing, lastSyncTime, syncError } = useCloudSync();
+  const { isSyncing, lastSyncTime, syncError, syncNow } = useCloudSync();
   const { t } = useTranslation();
   const { showDialog } = useDialog();
   const navigate = useNavigate();
 
   const [avatarAvailable, setAvatarAvailable] = useState(true);
+  // D1 backend: the Google sign-in page is offered only when the server has it
+  // configured; accounts created with Google have no password to change.
+  const [googleEnabled, setGoogleEnabled] = useState(false);
+  const [hasLoginPassword, setHasLoginPassword] = useState(true);
+  useEffect(() => {
+    if (CLOUD_BACKEND !== 'd1') return;
+    let alive = true;
+    apiClient.getOIDCConfig().then(r => { if (alive) setGoogleEnabled(!!r.data?.oidc_enabled); });
+    apiClient.getMe().then(r => { if (alive && r.data?.has_password === false) setHasLoginPassword(false); });
+    return () => { alive = false; };
+  }, []);
 
   const [showPasswordModal, setShowPasswordModal] = useState(false);
   const [oldPassword, setOldPassword] = useState('');
@@ -195,7 +207,7 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
                 <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>@{user.username}</p>
               )}
               <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>{t('account.member') || 'Transmtf HRT Tracker Member'}</p>
-              <p className="mt-1 text-xs" style={{ color: 'var(--text-tertiary)' }}>
+              {CLOUD_BACKEND === 'external' && <p className="mt-1 text-xs" style={{ color: 'var(--text-tertiary)' }}>
                 {t('account.avatarOAuthOnly') || 'Avatar is synced automatically via third-party login and cannot be uploaded here.'}{' '}
                 <a
                   href="https://www.transmtf.com/profile"
@@ -207,7 +219,7 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
                   transmtf.com/profile
                   <ExternalLink size={10} className="inline" />
                 </a>
-              </p>
+              </p>}
             </div>
           </div>
         </div>
@@ -232,11 +244,19 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
               </div>
             )}
             {syncError && (
-              <div className="mt-2 text-xs text-red-600">{syncError}</div>
+              <div className="mt-2 text-xs text-red-600">{syncError.startsWith('sync.') ? t(syncError) : syncError}</div>
             )}
-            <div className="mt-2 border-t pt-2 text-xs" style={{ borderColor: 'var(--border-primary)', color: 'var(--text-tertiary)' }}>
-              {t('account.autoSyncNote') || 'Local changes upload in real time; cloud data is pulled every 3 seconds'}
+            <div className="mt-2 border-t pt-2 text-xs leading-relaxed" style={{ borderColor: 'var(--border-primary)', color: 'var(--text-tertiary)' }}>
+              {t('account.autoSyncNote')}
             </div>
+            <button
+              type="button"
+              onClick={syncNow}
+              disabled={isSyncing}
+              className="mt-2 inline-flex items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-bold text-white glass-btn-primary btn-press-glass disabled:opacity-50"
+            >
+              <Cloud size={14} /> {t('account.syncNow')}
+            </button>
           </div>
         </div>
 
@@ -261,15 +281,15 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
               </div>
             </Link>
 
-            <Link to="/account/oidc" className={managementLinkClass}>
+            {(CLOUD_BACKEND === 'external' || googleEnabled) && <Link to="/account/oidc" className={managementLinkClass}>
               <Link2 size={20} style={{ color: 'var(--text-secondary)' }} />
               <div className="flex-1">
                 <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>{t('account.oidc') || 'Transmtf Login'}</p>
                 <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>{t('account.oidcDesc') || 'Manage Transmtf identity and password'}</p>
               </div>
-            </Link>
+            </Link>}
 
-            <button
+            {hasLoginPassword && <button
               onClick={() => setShowPasswordModal(true)}
               className="flex w-full items-center gap-3 px-4 py-4 text-left transition hover:bg-[var(--bg-card-hover)]"
             >
@@ -278,7 +298,7 @@ const Account: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
                 <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>{t('account.changePassword') || 'Change Password'}</p>
                 <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>{t('account.changePasswordDesc') || 'Update your login password'}</p>
               </div>
-            </button>
+            </button>}
           </div>
         </div>
 

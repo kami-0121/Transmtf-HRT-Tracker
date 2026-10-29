@@ -1,17 +1,51 @@
-name = "hrt-tracker-cloud"
+# Cloudflare Workers deployment of this fork.
+# `name` must match the Worker you create in the Cloudflare dashboard
+# (Workers & Pages → Create → Import a repository).
+name = "transmtf-hrt-tracker"
 main = "worker.ts"
+# Keep variables set in the dashboard (e.g. REGISTRATION_DISABLED) when
+# Workers Builds runs `wrangler deploy`; without this they are removed.
+keep_vars = true
 compatibility_date = "2025-12-04"
 
 [assets]
 directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
-run_worker_first = ["/api/*"]
+# The Worker must run first for HTML pages: it injects window.__ENV__
+# (CLOUD_ENABLED / API URL / Turnstile key). With only "/api/*" the HTML was
+# served straight from assets and the injection never happened.
+run_worker_first = true
 
 [observability]
 enabled = true
 head_sampling_rate = 1
 
+# Cloud backup database (accounts + one snapshot per user, encrypted with the
+# user's security PIN when set). `wrangler deploy` creates it on first deploy;
+# the Worker creates its tables on first use (server/schema.ts).
+[[d1_databases]]
+binding = "DB"
+database_name = "hrt-tracker"
+
+# Daily housekeeping (worker.ts `scheduled`): purge expired sessions and old
+# rate-limit rows. 03:15 UTC = 11:15 Taipei.
+[triggers]
+crons = ["15 3 * * *"]
+
 [vars]
-VITE_TURNSTILE_SITE_KEY = "0x4AAAAAACNK04dmEz0g0aG7"
-VITE_API_BASE_URL = "https://hrt-service.transmtf.com/api"
+# Accounts + cloud backup served by this Worker from D1 (server/api.ts).
+# "false" = local-only app (no account UI, no requests).
+CLOUD_ENABLED = "true"
+# Google sign-in: the OAuth client ID is public (it appears in every Google
+# authorization URL). The client SECRET must never be committed: set it as a
+# Secret in the dashboard (Worker → Settings → Variables and Secrets) or with
+# `npx wrangler secret put GOOGLE_CLIENT_SECRET`.
+GOOGLE_CLIENT_ID = "549548693796-jv8rdl1onarnvhbinu3iufjrbgd8m6ml.apps.googleusercontent.com"
+# Optional hardening (set in the dashboard; keep secrets out of this file):
+#   TURNSTILE_SECRET_KEY (secret) + VITE_TURNSTILE_SITE_KEY → CAPTCHA on register/login
+#   REGISTRATION_DISABLED = "true" → close sign-ups
+#   PASSWORD_PBKDF2_ITERATIONS → login password hashing cost (default 100000)
+#   GOOGLE_CLIENT_SECRET (secret) → enables "Sign in with Google"
+#   (redirect URI: https://<host>/auth/oidc/callback, see docs/DEPLOY_WORKERS.md)
+# To use an external backend instead of D1, set VITE_API_BASE_URL.
