@@ -9,13 +9,13 @@ import type { CalibrationModel, CalibrationMode } from '../../calibration';
 import type {
     PersonalModelState,
     EKFDiagnostics,
-    computeSimulationWithCI,
+    computeCoupledSimulationWithCI,
 } from '../../personalModel';
 
 export type PKWorkerKind = 'simulation' | 'personalModel' | 'ci';
 
 /** Return shape of computeSimulationWithCI, re-exported as a named type. */
-export type SimCIResult = ReturnType<typeof computeSimulationWithCI>;
+export type SimCIResult = ReturnType<typeof computeCoupledSimulationWithCI>;
 
 export type PKWorkerRequest =
     | {
@@ -53,6 +53,8 @@ export type PKWorkerRequest =
         applyCPAInhibitionToE2: boolean;
         calibrationMode: CalibrationMode;
         gelProducts?: GelProductSpec[];
+        /** Testosterone model options → coupled E2/T estimation; null/absent = off. */
+        testosterone?: TestosteroneModelOptions | null;
     };
 
 export type PKWorkerResponse =

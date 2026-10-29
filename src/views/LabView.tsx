@@ -17,6 +17,8 @@ interface LabViewProps {
   onSetBaselineTestosteroneNgdL: (v: number | null) => void;
   /** Current simulated testosterone series (calibration status display). */
   testosteroneSeries?: TestosteroneSeries;
+  /** Number of coupled E2/T iterations run (0/undefined = not coupled). */
+  couplingIterations?: number;
   onSetApplyCPAInhibitionToE2: (enabled: boolean) => void;
   calibrationModel: CalibrationModel;
   onSetCalibrationModel: (model: CalibrationModel) => void;
@@ -298,6 +300,7 @@ const LabView: React.FC<LabViewProps> = ({
   baselineTestosteroneNgdL,
   onSetBaselineTestosteroneNgdL,
   testosteroneSeries,
+  couplingIterations,
   calibrationModel,
   onSetCalibrationModel,
   calibrationMode,
@@ -531,6 +534,19 @@ const LabView: React.FC<LabViewProps> = ({
               {testosteroneSeries.observationCount > 0
                 ? t('lab.testosterone_calibrated').replace('{n}', String(testosteroneSeries.observationCount))
                 : t('lab.testosterone_uncalibrated')}
+            </p>
+            <p>
+              {t('lab.testosterone_mode')}: <span className="font-semibold">{t(testosteroneSeries.mode === 'causal' ? 'lab.testosterone_mode_causal' : 'lab.testosterone_mode_retro')}</span>
+            </p>
+            <p>
+              {testosteroneSeries.etaTEstimated
+                ? t('lab.testosterone_eta').replace('{eta}', testosteroneSeries.etaT.toFixed(2)).replace('{sd}', testosteroneSeries.etaTSd.toFixed(2))
+                : t('lab.testosterone_eta_fixed')}
+            </p>
+            <p>
+              {couplingIterations && couplingIterations > 0
+                ? t('lab.testosterone_coupled').replace('{n}', String(couplingIterations))
+                : t('lab.testosterone_not_coupled')}
             </p>
           </div>
         )}

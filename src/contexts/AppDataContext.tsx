@@ -4,7 +4,7 @@ import {
     PersonalModelState, EKFDiagnostics, CalibrationModel, CalibrationMode,
     createCalibrationInterpolator,
     initPersonalModel, isAntiandrogen, GelProductSpec, setCustomGelProducts,
-    TESTOSTERONE_MODEL, type TestosteroneModelOptions,
+    TESTOSTERONE_MODEL, type TestosteroneModelOptions, type TestosteroneSeries,
 } from '../../logic';
 import { pkWorker, PKWorkerCancelledError } from '../workers/pkWorkerClient';
 import { computeDataHash } from '../utils/dataHash';
@@ -43,6 +43,13 @@ interface SimCI {
     ci68Low: number[];
     ci68High: number[];
     antiandrogen: Partial<Record<string, CompoundCI>>;
+    /** Coupled E2/T result: T posterior driven by the personalised E2 (testosterone model on). */
+    testosterone?: TestosteroneSeries;
+    /** Personal-model state after the coupled E2/T iterations. */
+    model?: PersonalModelState;
+    couplingIterations?: number;
+    e2DrugPersonal?: number[];
+    endogenousMean?: number[];
 }
 
 interface AppDataContextType {
@@ -248,9 +255,11 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
                 // Only a fallback: pre-treatment T labs take precedence (pk.ts).
                 baselineNgdL: baselineTestosteroneNgdL ?? undefined,
                 observations: JSON.parse(tObservationsKey),
+                // T and E2 share one data cutoff: causal = forward filter only.
+                mode: calibrationMode,
             }
             : null,
-        [testosteroneModelEnabled, baselineTestosteroneNgdL, tObservationsKey]
+        [testosteroneModelEnabled, baselineTestosteroneNgdL, tObservationsKey, calibrationMode]
     );
 
     const suppressLocalUpdateRef = useRef({
@@ -669,7 +678,7 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
             trackCompute(pkWorker.run('ci', {
                 simulation, events, model: personalModel!, applyE2LearningToCPA,
                 labResults, calibrationModel, applyCPAInhibitionToE2,
-                calibrationMode, gelProducts,
+                calibrationMode, gelProducts, testosterone: testosteroneOpts,
             }))
                 .then(ci => {
                     if (seq !== ciSeqRef.current) return;
@@ -692,7 +701,7 @@ export const AppDataProvider: React.FC<{ children: ReactNode }> = ({ children })
         } else {
             setSimCI(null);
         }
-    }, [simulation, personalModel, events, applyE2LearningToCPA, labResults, calibrationModel, applyCPAInhibitionToE2, calibrationMode]);
+    }, [simulation, personalModel, events, applyE2LearningToCPA, labResults, calibrationModel, applyCPAInhibitionToE2, calibrationMode, testosteroneOpts]);
 
     // F07 review: on unmount, invalidate every pending compute and terminate
     // the workers so neither late setState calls nor worker callbacks can

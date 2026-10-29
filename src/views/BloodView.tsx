@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Droplet, Plus, TrendingUp } from 'lucide-react';
 import {
-    ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceArea, ReferenceLine,
+    ResponsiveContainer, ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceArea, ReferenceLine,
 } from 'recharts';
 import { useTranslation } from '../contexts/LanguageContext';
 import { useTheme } from '../contexts/ThemeContext';
@@ -44,8 +44,16 @@ const BloodView: React.FC<BloodViewProps> = ({ rows, onAdd, onEdit }) => {
 
     // For testosterone, overlay the (calibrated) model curve and the
     // uncalibrated population curve so the effect of the labs is visible.
-    const { simulation } = useAppData();
-    const tSeries = selected === 'testosterone' ? simulation?.testosterone : undefined;
+    const { simulation, simCI } = useAppData();
+    // Prefer the coupled E2/T posterior (personalised E2 input) when available.
+    const tSrc = useMemo(() => {
+        if (selected !== 'testosterone') return null;
+        if (simCI?.testosterone && simCI.testosterone.values.length === simCI.timeH.length) {
+            return { timeH: simCI.timeH, series: simCI.testosterone };
+        }
+        return simulation?.testosterone ? { timeH: simulation.timeH, series: simulation.testosterone } : null;
+    }, [selected, simCI, simulation]);
+    const tSeries = tSrc?.series;
     const xDomain = useMemo<[number, number] | null>(() => {
         if (series.length === 0) return null;
         const day = 86400000;
@@ -55,26 +63,28 @@ const BloodView: React.FC<BloodViewProps> = ({ rows, onAdd, onEdit }) => {
         return [lo - pad, hi + pad];
     }, [series, tSeries]);
     const modelData = useMemo(() => {
-        if (!tSeries || !simulation || !xDomain) return [];
-        const out: { time: number; model: number; pop: number }[] = [];
-        const step = Math.max(1, Math.floor(simulation.timeH.length / 400));
-        for (let i = 0; i < simulation.timeH.length; i += step) {
-            const time = simulation.timeH[i] * 3600000;
+        if (!tSrc || !xDomain) return [];
+        const { timeH: grid, series: ts } = tSrc;
+        const out: { time: number; model: number; pop: number; band: [number, number] }[] = [];
+        const step = Math.max(1, Math.floor(grid.length / 400));
+        const point = (i: number, time: number) => ({
+            time, model: ts.values[i], pop: ts.populationValues[i],
+            band: [ts.values[i] * Math.exp(-1.96 * ts.logSd[i]), ts.values[i] * Math.exp(1.96 * ts.logSd[i])] as [number, number],
+        });
+        for (let i = 0; i < grid.length; i += step) {
+            const time = grid[i] * 3600000;
             if (time < xDomain[0] || time > xDomain[1]) continue;
-            out.push({ time, model: tSeries.values[i], pop: tSeries.populationValues[i] });
+            out.push(point(i, time));
         }
         // Before the simulation grid starts (pre-treatment) T sits at its baseline.
-        const gridStart = simulation.timeH[0] * 3600000;
-        if (out.length > 0 && xDomain[0] < gridStart) {
-            out.unshift({ time: xDomain[0], model: tSeries.values[0], pop: tSeries.populationValues[0] });
-        }
+        if (out.length > 0 && xDomain[0] < grid[0] * 3600000) out.unshift(point(0, xDomain[0]));
         return out;
-    }, [tSeries, simulation, xDomain]);
+    }, [tSrc, xDomain]);
 
     const yDomain = useMemo<[number, number]>(() => {
         if (!spec || series.length === 0) return [0, 1];
         const vals = series.map(p => p.value);
-        for (const m of modelData) vals.push(m.model, m.pop);
+        for (const m of modelData) vals.push(m.model, m.pop, Math.min(m.band[1], m.model * 4));
         if (spec.refLow !== undefined) vals.push(spec.refLow);
         if (spec.refHigh !== undefined) vals.push(spec.refHigh);
         const max = Math.max(...vals);
@@ -139,7 +149,7 @@ const BloodView: React.FC<BloodViewProps> = ({ rows, onAdd, onEdit }) => {
                     </div>
                     <div className="h-56 w-full">
                         <ResponsiveContainer width="100%" height="100%">
-                            <LineChart margin={{ top: 8, right: 12, bottom: 0, left: -8 }}>
+                            <ComposedChart margin={{ top: 8, right: 12, bottom: 0, left: -8 }}>
                                 <CartesianGrid stroke={gridColor} strokeDasharray="3 3" />
                                 <XAxis
                                     dataKey="time" type="number" scale="time"
@@ -156,12 +166,17 @@ const BloodView: React.FC<BloodViewProps> = ({ rows, onAdd, onEdit }) => {
                                 {spec.refHigh !== undefined && <ReferenceLine y={spec.refHigh} stroke="#10b981" strokeDasharray="4 3" />}
                                 <Tooltip
                                     labelFormatter={(ms) => `${formatDate(new Date(ms as number), lang)} ${formatTime(new Date(ms as number))}`}
-                                    formatter={(v: number, name: string) => [
-                                        `${fmtNum(v)} ${spec.units[0].unit}`,
-                                        name === 'model' ? t('blood.t_model') : name === 'pop' ? t('blood.t_population') : spec.short,
+                                    formatter={(v: number | [number, number], name: string) => [
+                                        Array.isArray(v)
+                                            ? `${fmtNum(v[0])}–${fmtNum(v[1])} ${spec.units[0].unit}`
+                                            : `${fmtNum(v)} ${spec.units[0].unit}`,
+                                        name === 'model' ? t('blood.t_model') : name === 'pop' ? t('blood.t_population') : name === 'band' ? t('blood.t_band') : spec.short,
                                     ]}
                                     contentStyle={{ borderRadius: 12, fontSize: 12, background: 'var(--bg-card)', border: '1px solid var(--border-primary)', color: 'var(--text-primary)' }}
                                 />
+                                {modelData.length > 0 && (
+                                    <Area data={modelData} type="monotone" dataKey="band" stroke="none" fill={spec.color} fillOpacity={0.12} isAnimationActive={false} activeDot={false} />
+                                )}
                                 {modelData.length > 0 && (
                                     <Line data={modelData} type="monotone" dataKey="pop" stroke={axisColor} strokeWidth={1.2}
                                         strokeDasharray="4 4" dot={false} activeDot={false} isAnimationActive={false} />
@@ -172,7 +187,7 @@ const BloodView: React.FC<BloodViewProps> = ({ rows, onAdd, onEdit }) => {
                                 )}
                                 <Line data={series} type="linear" dataKey="value" stroke={spec.color} strokeWidth={modelData.length > 0 ? 0 : 2.5}
                                     dot={{ r: 4, fill: spec.color, stroke: '#fff', strokeWidth: 1.5 }} activeDot={{ r: 6 }} isAnimationActive={false} />
-                            </LineChart>
+                            </ComposedChart>
                         </ResponsiveContainer>
                     </div>
                     {modelData.length > 0 && (

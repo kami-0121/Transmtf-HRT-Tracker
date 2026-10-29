@@ -9,7 +9,7 @@ import { useAppData } from '../contexts/AppDataContext';
 import { regimenDisplayName, formatRegimenDose } from '../utils/regimenDisplay';
 import type { Regimen } from '../utils/regimens';
 import { formatTime, getRouteIcon } from '../utils/helpers';
-import { DoseEvent, SimulationResult, LabResult, Route, Ester, ExtraKey, SL_TIER_ORDER, interpolateConcentration_E2, interpolateCompoundConcentration, isAntiandrogen, pickPrimaryAntiandrogen, ANTIANDROGENS, formatAntiandrogenConc, convertToPgMl, PERSONAL_E2_CEILING_PGML, endogenousFractionAt, interpolateTestosterone } from '../../logic';
+import { DoseEvent, SimulationResult, LabResult, Route, Ester, ExtraKey, SL_TIER_ORDER, interpolateConcentration_E2, interpolateCompoundConcentration, isAntiandrogen, pickPrimaryAntiandrogen, ANTIANDROGENS, formatAntiandrogenConc, convertToPgMl, PERSONAL_E2_CEILING_PGML, endogenousFractionAt, type TestosteroneSeries } from '../../logic';
 
 /** Convert hex color string to "r,g,b" for use in rgba() */
 function hexToRgb(hex: string): string {
@@ -173,6 +173,7 @@ interface SimCI {
     ci68Low: number[];
     ci68High: number[];
     antiandrogen: Partial<Record<string, { adjusted: number[]; ci95Low: number[]; ci95High: number[] }>>;
+    testosterone?: TestosteroneSeries;
 }
 
 interface OverviewViewProps {
@@ -240,11 +241,24 @@ const OverviewView: React.FC<OverviewViewProps> = ({
     return baselineE2PGmL * endogenousFractionAt(simulation, h);
   }, [simulation, h, baselineE2PGmL]);
 
-  // Estimated endogenous testosterone (ng/dL); null when the model is off.
+  // Estimated endogenous testosterone (ng/dL) with its 95% posterior range;
+  // prefers the coupled E2/T posterior (personalised E2 input) when present.
+  const tSource = useMemo(() => {
+    if (simCI?.testosterone && simCI.testosterone.values.length === simCI.timeH.length) {
+      return { timeH: simCI.timeH, series: simCI.testosterone };
+    }
+    if (simulation?.testosterone) return { timeH: simulation.timeH, series: simulation.testosterone };
+    return null;
+  }, [simCI, simulation]);
   const testosteroneNow = useMemo(
-    () => (simulation ? interpolateTestosterone(simulation, h) : null),
-    [simulation, h]
+    () => (tSource ? interpAt(tSource.timeH, tSource.series.values, h) : null),
+    [tSource, h]
   );
+  const testosteroneRange = useMemo(() => {
+    if (!tSource || testosteroneNow === null) return null;
+    const sd = interpAt(tSource.timeH, tSource.series.logSd, h);
+    return { lo: testosteroneNow * Math.exp(-1.96 * sd), hi: testosteroneNow * Math.exp(1.96 * sd) };
+  }, [tSource, testosteroneNow, h]);
 
   const rawLevel = useMemo(() => {
     if (!simulation) return 0;
@@ -572,9 +586,14 @@ const OverviewView: React.FC<OverviewViewProps> = ({
                     <span className="text-[10px] font-semibold whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>
                       {testosteroneNow.toFixed(0)} ng/dL
                     </span>
-                    {(simulation?.testosterone?.observationCount ?? 0) > 0 && (
+                    {testosteroneRange && (
+                      <span className="text-[9px] whitespace-nowrap" style={{ color: 'var(--text-tertiary)' }}>
+                        (95% {testosteroneRange.lo.toFixed(0)}–{testosteroneRange.hi.toFixed(0)})
+                      </span>
+                    )}
+                    {(tSource?.series.observationCount ?? 0) > 0 && (
                       <span className="text-[9px] font-semibold whitespace-nowrap" style={{ color: 'var(--accent-400)' }}>
-                        {t('overview.testosterone_calibrated').replace('{n}', String(simulation!.testosterone!.observationCount))}
+                        {t('overview.testosterone_calibrated').replace('{n}', String(tSource!.series.observationCount))}
                       </span>
                     )}
                   </div>

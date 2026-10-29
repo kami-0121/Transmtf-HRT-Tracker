@@ -11,7 +11,7 @@ import {
     replayPersonalModel,
     ekfUpdatePersonalModel,
     initPersonalModel,
-    computeSimulationWithCI,
+    computeCoupledSimulationWithCI,
 } from '../../personalModel';
 import type { PKWorkerRequest, PKWorkerResponse } from './pkWorkerProtocol';
 
@@ -55,7 +55,9 @@ export function computePK(request: PKWorkerRequest): PKWorkerResponse {
             }
             case 'ci': {
                 if (request.gelProducts) setCustomGelProducts(request.gelProducts);
-                const simCI = computeSimulationWithCI(
+                // Coupled E2/T estimation when the testosterone model is on
+                // (degenerates to a single E2 pass otherwise).
+                const simCI = computeCoupledSimulationWithCI(
                     request.simulation,
                     request.events,
                     request.model,
@@ -63,7 +65,8 @@ export function computePK(request: PKWorkerRequest): PKWorkerResponse {
                     request.labResults,
                     request.calibrationModel,
                     request.applyCPAInhibitionToE2,
-                    request.calibrationMode
+                    request.calibrationMode,
+                    request.testosterone
                 );
                 return { type: 'ci', id, simCI };
             }

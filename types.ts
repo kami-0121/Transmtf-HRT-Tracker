@@ -168,14 +168,31 @@ export interface TestosteroneSeries {
     baselineNgdL: number;
     /** Where T0 came from: pre-treatment T lab(s), the user's setting, or the population default. */
     baselineSource: 'lab' | 'setting' | 'population';
-    /** Model T curve after calibration to measured T (== populationValues when uncalibrated). */
+    /** Data-cutoff semantics used (shared with the E2 calibration mode). */
+    mode: 'causal' | 'retrospective';
+    /** Posterior MEDIAN T after calibration to measured T. */
     values: number[];
-    /** Uncalibrated model T curve (population response, scaled by T0). */
+    /** Uncalibrated model T curve (population response, ηT = 0, scaled by T0). */
     populationValues: number[];
-    /** values / T0 — scales the pre-treatment endogenous E2 baseline. */
+    /** values / T0. */
+    tFraction: number[];
+    /** Posterior SD of log T (absolute: T0 offset + response deviation + ηT). */
+    logSd: number[];
+    /** Posterior SD of log(T/T0) — the part that drives endogenous E2 (0 before treatment). */
+    fractionLogSd: number[];
+    /**
+     * MEAN endogenous-E2 multiplier E[ρ·T/T0 + 1 − ρ] — scales the
+     * pre-treatment endogenous E2 baseline B (see ENDOGENOUS_E2 in pk.ts).
+     */
     endogenousFraction: number[];
     /** Number of measured T values that informed the calibration. */
     observationCount: number;
+    postDoseObservationCount: number;
+    /** Individual HPG-suppression sensitivity (log potency shift) and its posterior SD. */
+    etaT: number;
+    etaTSd: number;
+    /** False when sparse data kept ηT fixed at its prior (0). */
+    etaTEstimated: boolean;
 }
 
 /**

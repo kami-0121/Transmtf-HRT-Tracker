@@ -15,9 +15,11 @@ import {
     interpolateTestosterone,
     interpolateCompoundConcentration,
     interpolateConcentration_E2,
-    testosteroneLogCorrection,
+    testosteroneGP,
+    ENDOGENOUS_E2_RHO_MEAN,
+    POSTERIOR_DRAWS,
 } from './pk';
-import { replayPersonalModel, computeSimulationWithCI } from './personalModel';
+import { replayPersonalModel, computeSimulationWithCI, computeCoupledSimulationWithCI, initPersonalModel } from './personalModel';
 import { fitMipd } from './mipd';
 
 const DAY = 24;
@@ -84,50 +86,62 @@ describe('spironolactone (canrenone) PK', () => {
     });
 });
 
+const RHO = ENDOGENOUS_E2_RHO_MEAN;
+const weeklyEV = (weeks: number, dose = 5) => Array.from({ length: weeks }, (_, w) => evInjection(w * 7 * DAY, dose));
+
 describe('testosterone suppression model', () => {
     it('target fraction: no drug → 1; E2 dose-response matches the anchors', () => {
         expect(testosteroneTargetFraction(0)).toBe(1);
         const at = (e2: number) => testosteroneTargetFraction(e2) * TESTOSTERONE_MODEL.baselineNgdL;
-        expect(at(100)).toBeGreaterThan(250);   // ≈ 350 ng/dL
+        expect(at(100)).toBeGreaterThan(250);
         expect(at(100)).toBeLessThan(450);
-        expect(at(200)).toBeLessThan(200);      // ≈ 120 ng/dL
-        expect(at(300)).toBeLessThan(80);       // ≈ 50 ng/dL
-        expect(at(1000)).toBeGreaterThanOrEqual(TESTOSTERONE_MODEL.minFraction * TESTOSTERONE_MODEL.baselineNgdL);
+        expect(at(200)).toBeLessThan(200);
+        expect(at(300)).toBeLessThan(80);
+        // ηT > 0 → less suppressible
+        expect(testosteroneTargetFraction(200, {}, 0.5)).toBeGreaterThan(testosteroneTargetFraction(200));
     });
 
     it('anti-androgens: CPA suppresses strongly, SPL modestly, BICA raises T', () => {
-        const cpa = testosteroneTargetFraction(0, { [Ester.CPA]: 25 });
+        expect(testosteroneTargetFraction(0, { [Ester.CPA]: 25 })).toBeLessThan(0.35);
         const spl = testosteroneTargetFraction(0, { [Ester.SPL]: 135 });
-        const bica = testosteroneTargetFraction(0, { [Ester.BICA]: 9000 });
-        expect(cpa).toBeLessThan(0.35);
         expect(spl).toBeGreaterThan(0.65);
         expect(spl).toBeLessThan(0.9);
-        expect(bica).toBeGreaterThan(1.3);
+        expect(testosteroneTargetFraction(0, { [Ester.BICA]: 9000 })).toBeGreaterThan(1.3);
     });
 
     it('is only attached when requested and leaves the drug curves unchanged', () => {
-        const events = [evInjection(0, 5), evInjection(7 * DAY, 5)];
+        const events = weeklyEV(2);
         const off = runSimulation(events)!;
         const on = runSimulation(events, { testosterone: {} })!;
         expect(off.testosterone).toBeUndefined();
-        expect(on.testosterone).toBeTruthy();
         expect(on.concPGmL_E2).toEqual(off.concPGmL_E2);
-        expect(on.testosterone!.values.length).toBe(on.timeH.length);
         expect(endogenousFractionAt(off, 3 * DAY)).toBe(1);
         expect(makeEndogenousE2Context(off)).toBeUndefined();
     });
 
-    it('T starts at baseline and falls over days (not instantly) on suppressive E2', () => {
-        const events: DoseEvent[] = [];
-        for (let w = 0; w < 8; w++) events.push(evInjection(w * 7 * DAY, 5));
-        const sim = runSimulation(events, { testosterone: { baselineNgdL: 600 } })!;
+    it('before treatment T/T0 is exactly 1 with no uncertainty; it falls with a lag after', () => {
+        const sim = runSimulation(weeklyEV(8), { testosterone: { baselineNgdL: 600 } })!;
+        const T = sim.testosterone!;
+        expect(T.tFraction[0]).toBeCloseTo(1, 9);
+        expect(T.fractionLogSd[0]).toBeCloseTo(0, 9);
+        expect(T.endogenousFraction[0]).toBeCloseTo(1, 9);
         expect(interpolateTestosterone(sim, -12)).toBeCloseTo(600, 6);
         const day1 = interpolateTestosterone(sim, 1 * DAY)!;
         const day42 = interpolateTestosterone(sim, 42 * DAY)!;
-        expect(day1).toBeGreaterThan(200);       // lag: not yet at the new steady state
+        expect(day1).toBeGreaterThan(200);
         expect(day42).toBeLessThan(day1);
-        // Suppression is reflected in the endogenous-E2 fraction.
-        expect(endogenousFractionAt(sim, 42 * DAY)).toBeCloseTo(day42 / 600, 6);
+        // Under suppression the response is uncertain without labs.
+        const i = sim.timeH.findIndex(t => t >= 42 * DAY);
+        expect(T.fractionLogSd[i]).toBeGreaterThan(0.3);
+    });
+
+    it('endogenous multiplier keeps a non-T-coupled residual (1 − ρ) and stays ≥ it', () => {
+        const sim = runSimulation(daily(Ester.CPA, 25, 60), { testosterone: {} })!;
+        const f = endogenousFractionAt(sim, 50 * DAY);
+        expect(f).toBeGreaterThan(1 - RHO);
+        expect(f).toBeLessThan(1);
+        expect(RHO).toBeGreaterThan(0.6);
+        expect(RHO).toBeLessThan(0.8);
     });
 
     it('bicalutamide monotherapy raises T and therefore endogenous E2', () => {
@@ -138,53 +152,112 @@ describe('testosterone suppression model', () => {
     it('resolveEndogenousE2: legacy constant without context, scaled with context', () => {
         expect(resolveEndogenousE2(undefined, 0)).toBe(0);
         expect(resolveEndogenousE2(30, 0)).toBe(30);
-        const ctx = { fractionAt: () => 0.5, defaultBaselinePGmL: 25 };
+        const ctx = { fractionAt: () => 0.5, tFractionAt: () => 0.4, tLogSdAt: () => 0, defaultBaselinePGmL: 25 };
         expect(resolveEndogenousE2(30, 0, ctx)).toBe(15);
         expect(resolveEndogenousE2(undefined, 0, ctx)).toBe(12.5);
     });
 });
 
-describe('testosterone model in calibration', () => {
-    // Oral CPA + low-dose oral E2: T is strongly suppressed, so a pre-dose
-    // baseline of 30 pg/mL should mostly vanish from later predictions.
-    const events: DoseEvent[] = [
-        ...daily(Ester.CPA, 12.5, 60, 0),
-        ...daily(Ester.E2, 2, 60, 0),
-    ];
+describe('T calibration: data cutoff (causal vs retrospective)', () => {
+    const events = weeklyEV(10);
+    const plain = runSimulation(events, { testosterone: {} })!;
+    const labH = 40 * DAY;
+    const modelT = interpolateTestosterone(plain, labH)!;
+    const obs = [{ timeH: labH, ngdL: modelT * 4 }];
+
+    it('causal: a lab drawn 10 days later does not change today\'s T (or endogenous E2)', () => {
+        const cal = runSimulation(events, { testosterone: { observations: obs, mode: 'causal' } })!;
+        const before = labH - 10 * DAY;
+        expect(interpolateTestosterone(cal, before)! / interpolateTestosterone(plain, before)!).toBeCloseTo(1, 6);
+        expect(endogenousFractionAt(cal, before)).toBeCloseTo(endogenousFractionAt(plain, before), 6);
+        // …but it does from the lab onward.
+        expect(interpolateTestosterone(cal, labH + DAY)!).toBeGreaterThan(modelT * 2);
+    });
+
+    it('retrospective: the same lab reshapes the earlier estimate (smoothing)', () => {
+        const cal = runSimulation(events, { testosterone: { observations: obs, mode: 'retrospective' } })!;
+        const before = labH - 10 * DAY;
+        expect(interpolateTestosterone(cal, before)! / interpolateTestosterone(plain, before)!).toBeGreaterThan(1.5);
+    });
+
+    it('GP: posterior passes near a lab, variance shrinks there and relaxes far away', () => {
+        const r = testosteroneGP([0], [Math.log(0.5)], [1], [0, 10 * DAY, 400 * DAY], [1, 1, 1], 0.35, 'retrospective');
+        expect(Math.exp(r.totalMean[0])).toBeLessThan(0.62);
+        expect(r.totalVar[0]).toBeLessThan(0.1);
+        expect(Math.abs(r.totalMean[2])).toBeLessThan(Math.abs(r.totalMean[0]));
+        expect(r.rVar[2]).toBeGreaterThan(0.6);
+        // Causal at a time before the lab = prior.
+        const c = testosteroneGP([5], [1], [1], [0], [1], 0.35, 'causal');
+        expect(c.totalMean[0]).toBe(0);
+    });
+
+    it('pre-treatment labs inform the personal T0, not T/T0', () => {
+        const pre = [{ timeH: -10 * DAY, ngdL: 380 }, { timeH: -5 * DAY, ngdL: 400 }];
+        const sim = runSimulation(events, { testosterone: { observations: pre } })!;
+        const T = sim.testosterone!;
+        expect(T.baselineSource).toBe('lab');
+        expect(T.baselineNgdL).toBeGreaterThan(370);
+        expect(T.baselineNgdL).toBeLessThan(420);
+        expect(T.tFraction[0]).toBeCloseTo(1, 6);
+        expect(runSimulation(events, { testosterone: { baselineNgdL: 700 } })!.testosterone!.baselineSource).toBe('setting');
+    });
+
+    it('ηT is only estimated with ≥ 2 post-treatment labs', () => {
+        const one = runSimulation(events, { testosterone: { observations: obs } })!.testosterone!;
+        expect(one.etaTEstimated).toBe(false);
+        expect(one.etaT).toBe(0);
+        const two = runSimulation(events, { testosterone: { observations: [...obs, { timeH: 60 * DAY, ngdL: interpolateTestosterone(plain, 60 * DAY)! * 4 }] } })!.testosterone!;
+        expect(two.etaTEstimated).toBe(true);
+        expect(two.etaT).toBeGreaterThan(0); // labs above the model → less suppressible
+        expect(two.etaTSd).toBeLessThanOrEqual(T_CAL_PRIOR_SD);
+    });
+});
+const T_CAL_PRIOR_SD = 0.5;
+
+describe('endogenous E2 in the E2 calibration', () => {
+    const events: DoseEvent[] = [...daily(Ester.CPA, 12.5, 60, 0), ...daily(Ester.E2, 2, 60, 0)];
     const pre: LabResult = { id: 'pre', timeH: -2 * DAY, concValue: 30, unit: 'pg/ml' };
     const simOn = runSimulation(events, { testosterone: {}, endTimeH: 60 * DAY })!;
     const simOff = runSimulation(events, { endTimeH: 60 * DAY })!;
-    // Lab near the oral-E2 peak; "truth" = drug + suppressed endogenous part.
     const labH = 45 * DAY + 4;
     const drugAtLab = interpolateConcentration_E2(simOn, labH)!;
-    const truthEndo = 30 * makeEndogenousE2Context(simOn)!.fractionAt(labH);
-    const post: LabResult = { id: 'post', timeH: labH, concValue: drugAtLab + truthEndo, unit: 'pg/ml' };
+    const endo = makeEndogenousE2Context(simOn)!;
+    const post: LabResult = { id: 'post', timeH: labH, concValue: drugAtLab + 30 * endo.fractionAt(labH), unit: 'pg/ml' };
     const labs = [pre, post];
 
     it('EKF subtracts the suppressed (not the full) baseline from post-dose labs', () => {
-        const endo = makeEndogenousE2Context(simOn);
-        const frac = endo!.fractionAt(labH);
-        expect(frac).toBeLessThan(0.3);
+        expect(endo.tFractionAt(labH)).toBeLessThan(0.3);
         const withT = replayPersonalModel(events, labs, endo);
         const legacy = replayPersonalModel(events, labs);
         expect(withT.baselinePGmL).toBeCloseTo(30, 6);
-        // Legacy subtracts 30 pg/mL from a lab that is mostly drug → theta biased low.
         expect(withT.thetaMean[0]).toBeGreaterThan(legacy.thetaMean[0]);
     });
 
-    it('EKF personal curve adds baseline × T fraction instead of the constant baseline', () => {
-        const endo = makeEndogenousE2Context(simOn)!;
+    it('central line = drug + posterior-mean endogenous E2', () => {
         const state = replayPersonalModel(events, labs, endo);
-        // Same learned state on both sims isolates the endogenous term.
         const ciOn = computeSimulationWithCI(simOn, events, state, false, labs, 'ekf');
         const ciOff = computeSimulationWithCI(simOff, events, state, false, labs, 'ekf');
         const i = simOn.timeH.findIndex(t => t >= 50 * DAY);
-        const frac = endo.fractionAt(simOn.timeH[i]);
-        expect(ciOff.e2Adjusted[i] - ciOn.e2Adjusted[i]).toBeCloseTo(30 * (1 - frac), 6);
+        // Monte-Carlo mean of the endogenous part ≈ B·E[multiplier] (shared draws).
+        expect(ciOn.endogenousMean[i]).toBeGreaterThan(30 * (1 - RHO) * 0.9);
+        expect(ciOn.endogenousMean[i]).toBeLessThan(30 * 0.6);
+        expect(ciOn.e2Adjusted[i]).toBeCloseTo(ciOn.e2DrugPersonal[i] + ciOn.endogenousMean[i], 6);
+        expect(ciOff.e2Adjusted[i] - ciOff.e2DrugPersonal[i]).toBeCloseTo(30, 6);
+    });
+
+    it('T uncertainty widens the E2 band (propagated through shared draws)', () => {
+        const state = replayPersonalModel(events, labs, endo);
+        const ci = computeSimulationWithCI(simOn, events, state, false, labs, 'ekf');
+        // Same sim with T uncertainty removed.
+        const T = simOn.testosterone!;
+        const certain = { ...simOn, testosterone: { ...T, fractionLogSd: T.fractionLogSd.map(() => 0) } };
+        const ci0 = computeSimulationWithCI(certain, events, state, false, labs, 'ekf');
+        const i = simOn.timeH.findIndex(t => t >= 50 * DAY);
+        expect(ci.ci95High[i] - ci.ci95Low[i]).toBeGreaterThan(ci0.ci95High[i] - ci0.ci95Low[i]);
+        expect(POSTERIOR_DRAWS).toBeGreaterThanOrEqual(200);
     });
 
     it('OU-Kalman and Hybrid-MIPD stay finite and drop the suppressed baseline', () => {
-        const endo = makeEndogenousE2Context(simOn);
         for (const model of ['ou-kalman', 'hybrid-mipd'] as const) {
             const ciOn = computeSimulationWithCI(simOn, events, replayPersonalModel(events, labs, endo), false, labs, model);
             const ciOff = computeSimulationWithCI(simOff, events, replayPersonalModel(events, labs), false, labs, model);
@@ -195,62 +268,45 @@ describe('testosterone model in calibration', () => {
     });
 
     it('MIPD uses the population default baseline when there is no pre-dose lab', () => {
-        const endo = makeEndogenousE2Context(simOn);
         const fit = fitMipd(events, [post], undefined, Infinity, endo);
-        expect(fit.baselinePGmL).toBe(0); // no pre-dose lab → resolved via context default
+        expect(fit.baselinePGmL).toBe(0);
         expect(resolveEndogenousE2(fit.baselinePGmL, labH, endo))
-            .toBeCloseTo(TESTOSTERONE_MODEL.defaultBaselineE2PGmL * endo!.fractionAt(labH), 9);
+            .toBeCloseTo(TESTOSTERONE_MODEL.defaultBaselineE2PGmL * endo.fractionAt(labH), 9);
     });
 });
 
-describe('testosterone calibration to measured T', () => {
-    const evDosing: DoseEvent[] = [];
-    for (let w = 0; w < 12; w++) evDosing.push(evInjection(w * 7 * DAY, 5));
+describe('coupled E2/T estimation', () => {
+    const events: DoseEvent[] = weeklyEV(12, 5);
+    const tOpts = { observations: [] as { timeH: number; ngdL: number }[] };
+    const sim = runSimulation(events, { testosterone: tOpts, endTimeH: 90 * DAY })!;
+    // An E2 lab far above the population curve → personalised E2 exposure ↑ → T suppressed more.
+    const labH = 30 * DAY + 24;
+    const popE2 = interpolateConcentration_E2(sim, labH)!;
+    const labs: LabResult[] = [{ id: 'e', timeH: labH, concValue: popE2 * 2.5, unit: 'pg/ml' }];
+    const state = replayPersonalModel(events, labs, makeEndogenousE2Context(sim));
 
-    it('GP correction: passes near a measurement and relaxes far away', () => {
-        const corr = testosteroneLogCorrection([0], [Math.log(0.5)], [0, 10 * DAY, 400 * DAY]);
-        expect(Math.exp(corr[0])).toBeLessThan(0.6);
-        expect(Math.exp(corr[0])).toBeGreaterThan(0.45);
-        expect(Math.abs(corr[1])).toBeLessThan(Math.abs(corr[0]));
-        expect(Math.abs(corr[2])).toBeLessThan(0.01);
-        expect(testosteroneLogCorrection([], [], [1, 2])).toEqual([0, 0]);
+    it('drives the T model with the personalised E2 and converges', () => {
+        const res = computeCoupledSimulationWithCI(sim, events, state, false, labs, 'ekf', false, 'retrospective', tOpts);
+        expect(res.couplingIterations).toBeGreaterThan(0);
+        expect(res.couplingIterations).toBeLessThanOrEqual(3);
+        const i = sim.timeH.findIndex(t => t >= 60 * DAY);
+        expect(res.testosterone!.tFraction[i]).toBeLessThan(sim.testosterone!.tFraction[i]);
+        expect(res.model.postDoseObservationCount).toBe(1);
     });
 
-    it('pre-treatment T labs set T0; the setting is only a fallback', () => {
-        const fromLab = runSimulation(evDosing, { testosterone: { baselineNgdL: 700, observations: [{ timeH: -10 * DAY, ngdL: 400 }, { timeH: -5 * DAY, ngdL: 400 }] } })!;
-        expect(fromLab.testosterone!.baselineSource).toBe('lab');
-        expect(fromLab.testosterone!.baselineNgdL).toBeCloseTo(400, 6);
-        const fromSetting = runSimulation(evDosing, { testosterone: { baselineNgdL: 700 } })!;
-        expect(fromSetting.testosterone!.baselineSource).toBe('setting');
-        expect(runSimulation(evDosing, { testosterone: {} })!.testosterone!.baselineSource).toBe('population');
+    it('is a no-op without the testosterone model or post-dose E2 labs', () => {
+        const a = computeCoupledSimulationWithCI(sim, events, state, false, labs, 'ekf', false, 'retrospective', null);
+        expect(a.couplingIterations).toBe(0);
+        const b = computeCoupledSimulationWithCI(sim, events, initPersonalModel(), false, [], 'ekf', false, 'retrospective', tOpts);
+        expect(b.couplingIterations).toBe(0);
     });
 
-    it('a measured T above the model raises the curve and the endogenous E2 fraction there', () => {
-        const labH = 50 * DAY;
-        const plain = runSimulation(evDosing, { testosterone: {} })!;
-        const modelT = interpolateTestosterone(plain, labH)!;
-        const measured = modelT * 4; // poorly suppressed
-        const cal = runSimulation(evDosing, { testosterone: { observations: [{ timeH: labH, ngdL: measured }] } })!;
-        const calT = interpolateTestosterone(cal, labH)!;
-        expect(calT).toBeGreaterThan(modelT * 3);
-        expect(calT).toBeLessThan(measured * 1.05);
-        expect(cal.testosterone!.observationCount).toBe(1);
-        expect(endogenousFractionAt(cal, labH)).toBeGreaterThan(endogenousFractionAt(plain, labH) * 3);
-        // The uncalibrated curve is kept for display.
-        expect(cal.testosterone!.populationValues).toEqual(plain.testosterone!.values);
-        // Drug E2 is unchanged; only the endogenous part moves.
-        expect(cal.concPGmL_E2).toEqual(plain.concPGmL_E2);
-    });
-
-    it('flows into the personal E2 curve via the endogenous baseline', () => {
-        const labH = 50 * DAY;
-        const plain = runSimulation(evDosing, { testosterone: {} })!;
-        const cal = runSimulation(evDosing, { testosterone: { observations: [{ timeH: labH, ngdL: interpolateTestosterone(plain, labH)! * 4 }] } })!;
-        const state = replayPersonalModel(evDosing, []);
-        const i = cal.timeH.findIndex(t => t >= labH);
-        const a = computeSimulationWithCI(plain, evDosing, state, false, [], 'ekf');
-        const b = computeSimulationWithCI(cal, evDosing, state, false, [], 'ekf');
-        const expected = TESTOSTERONE_MODEL.defaultBaselineE2PGmL * (cal.testosterone!.endogenousFraction[i] - plain.testosterone!.endogenousFraction[i]);
-        expect(b.e2Adjusted[i] - a.e2Adjusted[i]).toBeCloseTo(expected, 6);
+    it('causal coupling: a later E2 lab does not move earlier T', () => {
+        const later: LabResult[] = [...labs, { id: 'late', timeH: 70 * DAY, concValue: popE2 * 5, unit: 'pg/ml' }];
+        const st2 = replayPersonalModel(events, later, makeEndogenousE2Context(sim));
+        const a = computeCoupledSimulationWithCI(sim, events, state, false, labs, 'ekf', false, 'causal', tOpts);
+        const b = computeCoupledSimulationWithCI(sim, events, st2, false, later, 'ekf', false, 'causal', tOpts);
+        const i = sim.timeH.findIndex(t => t >= 50 * DAY);
+        expect(b.testosterone!.tFraction[i]).toBeCloseTo(a.testosterone!.tFraction[i], 6);
     });
 });
