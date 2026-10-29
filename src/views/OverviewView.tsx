@@ -864,7 +864,7 @@ const OverviewView: React.FC<OverviewViewProps> = ({
         {(
           <div className="mt-4 glass-card rounded-2xl p-3 md:p-4">
             <div className="flex items-center justify-between gap-2 mb-2.5">
-              <span className="text-[10px] md:text-xs font-bold uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
+              <span className="text-sm md:text-base font-bold" style={{ color: 'var(--text-secondary)' }}>
                 {t('regimen.quick_title')}
               </span>
               <button onClick={onAddEvent}
@@ -888,16 +888,16 @@ const OverviewView: React.FC<OverviewViewProps> = ({
             <div className="flex gap-2 overflow-x-auto pb-1 -mx-1 px-1">
               {regimens.map(r => (
                 <button key={r.id} onClick={() => onAddRegimenDose(r)}
-                  className="shrink-0 flex items-center gap-2 pl-2 pr-3 py-2 rounded-xl border btn-press-glass transition hover:bg-[var(--bg-card-hover)]"
+                  className="shrink-0 flex items-center gap-2.5 pl-2.5 pr-3.5 py-2.5 rounded-xl border btn-press-glass transition hover:bg-[var(--bg-card-hover)]"
                   style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-card)' }}>
-                  <span className="w-7 h-7 rounded-lg flex items-center justify-center" style={{ background: 'var(--accent-50)' }}>
+                  <span className="w-9 h-9 rounded-lg flex items-center justify-center" style={{ background: 'var(--accent-50)' }}>
                     {getRouteIcon(r.route)}
                   </span>
                   <span className="text-left">
-                    <span className="flex items-center gap-1 text-xs font-bold whitespace-nowrap" style={{ color: 'var(--text-primary)' }}>
-                      <Plus size={11} style={{ color: 'var(--accent-500)' }} />{regimenDisplayName(r, t, gelProducts)}
+                    <span className="flex items-center gap-1 text-sm md:text-base font-bold whitespace-nowrap" style={{ color: 'var(--text-primary)' }}>
+                      <Plus size={14} style={{ color: 'var(--accent-500)' }} />{regimenDisplayName(r, t, gelProducts)}
                     </span>
-                    <span className="block text-[10px] whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>{formatRegimenDose(r, t, gelProducts)}</span>
+                    <span className="block text-xs md:text-sm whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>{formatRegimenDose(r, t, gelProducts)}</span>
                   </span>
                 </button>
               ))}
