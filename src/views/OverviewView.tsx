@@ -1,12 +1,12 @@
 import React, { useMemo, useState, useRef, useLayoutEffect } from 'react';
-import { Activity, Info, Camera, Syringe, Pill, Droplet, Sticker, Plus } from 'lucide-react';
+import { Activity, Info, Camera, Syringe, Pill, Droplet, Sticker, Plus, ListPlus } from 'lucide-react';
 import { useTranslation } from '../contexts/LanguageContext';
 import { useAuth } from '../contexts/AuthContext';
 import { CLOUD_BACKEND } from '../api/config';
 import { useTheme } from '../contexts/ThemeContext';
 import ResultChart from '../components/ResultChart';
 import ShareImageModal from '../components/ShareImageModal';
-import AddDoseMenu from '../components/AddDoseMenu';
+import { useNavigate } from 'react-router-dom';
 import { useAppData } from '../contexts/AppDataContext';
 import { regimenDisplayName, formatRegimenDose } from '../utils/regimenDisplay';
 import type { Regimen } from '../utils/regimens';
@@ -206,6 +206,7 @@ const OverviewView: React.FC<OverviewViewProps> = ({
   const { t, lang } = useTranslation();
   // Greet by name like AtDo (profile setting on this fork's own backend).
   const { user } = useAuth();
+  const navigate = useNavigate();
   const greetingName = CLOUD_BACKEND === 'd1' && user?.greet !== false ? user?.displayName : undefined;
   const { isDark, colors } = useTheme();
   const { regimens, gelProducts } = useAppData();
@@ -486,13 +487,6 @@ const OverviewView: React.FC<OverviewViewProps> = ({
                   </span>
                 )}
               </h1>
-              {/* Mobile add: offers saved regimens first, then the free-form form. */}
-              <AddDoseMenu
-                variant="compact"
-                className="md:hidden"
-                onAddCustom={onAddEvent}
-                onAddRegimen={onAddRegimenDose}
-              />
             </div>
             <div className="grid grid-cols-2 gap-4">
               {/* E2 Display */}
@@ -866,17 +860,31 @@ const OverviewView: React.FC<OverviewViewProps> = ({
           </div>
         </div>
 
-        {/* Quick log from saved regimens (藥物方案) */}
-        {regimens.length > 0 && (
+        {/* Quick log from saved regimens (藥物方案), plus the free-form entry. */}
+        {(
           <div className="mt-4 glass-card rounded-2xl p-3 md:p-4">
-            <div className="flex items-center justify-between gap-2 mb-2">
+            <div className="flex items-center justify-between gap-2 mb-2.5">
               <span className="text-[10px] md:text-xs font-bold uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
                 {t('regimen.quick_title')}
               </span>
-              <button onClick={onAddEvent} className="text-[11px] font-semibold" style={{ color: 'var(--accent-500)' }}>
-                {t('regimen.add_custom')}
+              <button onClick={onAddEvent}
+                className="inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-sm font-bold text-white glass-btn-primary btn-press-glass">
+                <Plus size={16} strokeWidth={2.5} /> {t('btn.add')}
               </button>
             </div>
+            {regimens.length === 0 ? (
+              <button onClick={() => navigate('/settings#regimens')}
+                className="flex w-full items-center gap-3 rounded-xl border border-dashed px-3 py-3 text-left btn-press-glass transition hover:bg-[var(--bg-card-hover)]"
+                style={{ borderColor: 'var(--border-primary)' }}>
+                <span className="w-8 h-8 shrink-0 rounded-lg flex items-center justify-center" style={{ background: 'var(--accent-50)', color: 'var(--accent-500)' }}>
+                  <ListPlus size={16} />
+                </span>
+                <span>
+                  <span className="block text-sm font-bold" style={{ color: 'var(--text-primary)' }}>{t('regimen.setup_quick')}</span>
+                  <span className="block text-xs" style={{ color: 'var(--text-secondary)' }}>{t('regimen.setup_quick_desc')}</span>
+                </span>
+              </button>
+            ) : (
             <div className="flex gap-2 overflow-x-auto pb-1 -mx-1 px-1">
               {regimens.map(r => (
                 <button key={r.id} onClick={() => onAddRegimenDose(r)}
@@ -894,6 +902,7 @@ const OverviewView: React.FC<OverviewViewProps> = ({
                 </button>
               ))}
             </div>
+            )}
           </div>
         )}
       </header>
